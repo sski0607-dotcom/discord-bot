@@ -14,7 +14,7 @@ def home():
 
 def run():
     # Render가 자동으로 할당하는 PORT 번호를 사용합니다 (기본값 8080)
-    port = int(os.environ.get('PORT', 8080))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():

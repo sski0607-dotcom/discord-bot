@@ -1,7 +1,26 @@
 import os
+import threading
+from flask import Flask
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# --- 0. Render 슬립 방지용 백그라운드 웹 서버 ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    # Render가 자동으로 할당하는 PORT 번호를 사용합니다 (기본값 8080)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
+# -----------------------------------------------
 
 # 1. 봇 권한 및 객체 설정
 intents = discord.Intents.default()
@@ -15,8 +34,8 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # 2. 기본 직업 목록 정의 (가변 리스트)
 JOBS = [
-    "검호","정식기사","추적자","암살자","위자드","창성","진혼자","바바리안"
-    "비스트테이머","클레릭","월영의 그림자","드루이드","백야기사"
+    "검호", "정식기사", "추적자", "암살자", "위자드", "창성", "진혼자", "바바리안",
+    "비스트테이머", "클레릭", "월영의 그림자", "드루이드", "백야기사"
 ]
 
 
@@ -228,6 +247,8 @@ async def on_ready():
     print(f"로그인 완료: {bot.user.name}")
 
 
-# Render 환경변수(DISCORD_TOKEN)로 토큰 불러와서 실행
-token = os.getenv("DISCORD_TOKEN")
-bot.run(token)
+# 실행부
+if __name__ == '__main__':
+    keep_alive()  # 백그라운드 웹 서버 실행
+    token = os.getenv("DISCORD_TOKEN")
+    bot.run(token)

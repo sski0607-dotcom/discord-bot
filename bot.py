@@ -13,7 +13,7 @@ def home():
     return "Bot is alive!"
 
 def run():
-    # Render가 자동으로 할당하는 PORT 번호를 사용합니다 (기본값 8080)
+    # Render가 자동으로 할당하는 PORT 번호를 사용합니다 (기본값 10000)
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
@@ -102,6 +102,9 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
         user = interaction.user
         current_nick = user.display_name
 
@@ -113,17 +116,31 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         # 결과 양식: [직업] 이름 / 마크닉네임 / 년생
         new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {self.birth_year.value}"
 
+        # 1. 닉네임 변경
         try:
             await user.edit(nick=new_nick)
-            await interaction.response.send_message(
-                f"✅ 닉네임이 성공적으로 변경되었습니다!\n**{new_nick}**",
-                ephemeral=True
-            )
+            nick_msg = f"✅ 닉네임이 변경되었습니다!\n**{new_nick}**"
         except discord.Forbidden:
-            await interaction.response.send_message(
-                "⚠️ 봇 권한 부족 또는 최고권한자 계정이라 닉네임을 수정할 수 없습니다.",
-                ephemeral=True
-            )
+            nick_msg = "⚠️ (봇 권한 부족 또는 최고권한자 계정이라 닉네임 수정은 건너뛰었습니다.)"
+
+        # 2. 수습주민 역할 자동 부여
+        ROLE_NAME = "수습주민"  # 부여할 역할 이름
+        role_msg = ""
+        
+        target_role = discord.utils.get(guild.roles, name=ROLE_NAME)
+        if target_role:
+            try:
+                await user.add_roles(target_role)
+                role_msg = f"\n🔰 **[{ROLE_NAME}]** 역할이 자동으로 부여되었습니다!"
+            except discord.Forbidden:
+                role_msg = f"\n⚠️ 봇의 역할 순위가 낮아 **[{ROLE_NAME}]** 역할을 부여하지 못했습니다."
+        else:
+            role_msg = f"\n⚠️ 서버에 **[{ROLE_NAME}]** 역할이 존재하지 않아 역할 부여를 건너뛰었습니다."
+
+        await interaction.followup.send(
+            f"{nick_msg}{role_msg}",
+            ephemeral=True
+        )
 
 
 # --- 직업 선택 버튼 UI ---

@@ -431,26 +431,21 @@ async def daily_gold_reminder():
 # --- 봇 준비 및 동기화 ---
 @bot.event
 async def on_ready():
-  bot.add_view(JobButtonView())
+    bot.add_view(JobButtonView())
+    
+    if not daily_gold_reminder.is_running():
+        daily_gold_reminder.start()
 
-  if not daily_gold_reminder.is_running():
-    daily_gold_reminder.start()
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"✅ 현재 서버에 {len(synced)}개의 명령어 동기화 완료!")
+    except Exception as e:
+        print(f"❌ 동기화 중 오류 발생: {e}")
 
-  try:
-    guild = discord.Object(id=GUILD_ID)
-
-    bot.tree.copy_global_to(guild=guild)
-    synced = await bot.tree.sync(guild=guild)
-    print(f'✅ 현재 서버에 {len(synced)}개의 새 명령어 동기화 완료!')
-
-    await bot.tree.sync(guild=None)
-    print('🧹 옛날 글로벌 유령 명령어 청소 완료!')
-
-  except Exception as e:
-    print(f'❌ 동기화 중 오류 발생: {e}')
-
-  print(f'로그인 완료: {bot.user.name}')
-
+    print(f"로그인 완료: {bot.user.name}")
 
 # 실행부
 if __name__ == '__main__':

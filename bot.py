@@ -368,19 +368,28 @@ async def ladder_game(
 
 # 8. 📢 일일 골드 기부 알림 채널 설정 명령어
 @bot.tree.command(
-    name='알림채널설정',
-    description='이 명령어를 입력한 채널을 매일 자정 골드 기부 알림 채널로 지정합니다.',
+    name="알림채널설정",
+    description="이 명령어를 입력한 채널을 매일 자정 골드 기부 알림 채널로 지정합니다."
 )
-@app_commands.checks.has_permissions(administrator=True)
 async def set_announce_channel(interaction: discord.Interaction):
-  global announce_channel_id
-  announce_channel_id = interaction.channel_id
-  await interaction.response.send_message(
-      f'📢 매일 자정 골드 기부 알림이 **{interaction.channel.mention}** 채널로 발송되도록'
-      ' 설정되었습니다!',
-      ephemeral=True,
-  )
+    # 3초 초과 응답 오류 방지
+    await interaction.response.defer(ephemeral=True)
 
+    # 관리자 권한 확인
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send(
+            "❌ 이 명령어는 **서버 관리자(Administrator)** 권한이 있는 멤버만 사용할 수 있습니다.",
+            ephemeral=True
+        )
+        return
+
+    global announce_channel_id
+    announce_channel_id = interaction.channel_id
+
+    await interaction.followup.send(
+        f"📢 매일 자정 골드 기부 알림이 {interaction.channel.mention} 채널로 발송되도록 설정되었습니다!",
+        ephemeral=True
+    )
 
 # --- ⏰ 매일 오전 12시(자정 00:00 KST) 일일 골드 기부 알림 태스크 ---
 midnight_kst = datetime.time(hour=0, minute=0, tzinfo=ZoneInfo('Asia/Seoul'))

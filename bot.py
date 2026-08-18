@@ -130,7 +130,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             nick_msg = "⚠️ (봇 권한 부족 또는 최고권한자 계정이라 닉네임 수정은 건너뛰었습니다.)"
 
         # 2. 수습주민 역할 자동 부여
-        ROLE_NAME = "수습 담이🐣""
+        ROLE_NAME = "수습 담이🐣"
         role_msg = ""
         
         target_role = discord.utils.get(guild.roles, name=ROLE_NAME)

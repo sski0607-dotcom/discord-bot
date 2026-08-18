@@ -379,7 +379,7 @@ async def set_announce_channel(interaction: discord.Interaction):
         f"📢 매일 자정 골드 기부 알림이 <#{interaction.channel_id}> 채널로 발송되도록 설정되었습니다!",
         ephemeral=True
     )
-    )
+    
 
 # --- ⏰ 매일 오전 12시(자정 00:00 KST) 일일 골드 기부 알림 태스크 ---
 midnight_kst = datetime.time(hour=0, minute=0, tzinfo=ZoneInfo('Asia/Seoul'))

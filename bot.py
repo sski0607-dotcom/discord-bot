@@ -248,11 +248,20 @@ async def remove_job(interaction: discord.Interaction, 직업명: str):
     )
 
 
-# 7. 🪜 통화방 인원 자동 사다리 타기
-@bot.tree.command(name="사다리", description="현재 참가 중인 음성 통화방 인원으로 사다리 타기를 진행합니다.")
-@app_commands.describe(결과="쉼표(,)로 구분하여 결과 항목 입력 (예: 당첨, 꽝)")
-async def ladder_game(interaction: discord.Interaction, 결과: str):
-    # 명령어를 친 유저가 음성 채널에 있는지 확인
+# 7. 🪜 통화방 인원 사다리 타기 (당첨 인원수 지정 지원)
+@bot.tree.command(name="사다리", description="현재 통화방 인원으로 당첨 인원수를 지정하여 사다리 타기를 진행합니다.")
+@app_commands.describe(
+    당첨인원="당첨될 인원수 (숫자로 입력)",
+    당첨항목="당첨 항목 이름 (기본값: 🎉 당첨)",
+    꽝항목="꽝 항목 이름 (기본값: ❌ 꽝)"
+)
+async def ladder_game(
+    interaction: discord.Interaction, 
+    당첨인원: int, 
+    당첨항목: str = "🎉 당첨", 
+    꽝항목: str = "❌ 꽝"
+):
+    # 음성 채널 접속 여부 확인
     if not interaction.user.voice or not interaction.user.voice.channel:
         await interaction.response.send_message(
             "❌ 음성 채널(통화방)에 먼저 접속한 뒤 명령어를 입력해 주세요!",
@@ -261,43 +270,56 @@ async def ladder_game(interaction: discord.Interaction, 결과: str):
         return
 
     voice_channel = interaction.user.voice.channel
-    # 통화방 멤버 중 봇을 제외한 실제 유저 닉네임 리스트
+    # 봇 제외 실제 멤버 리스트
     players = [m.display_name for m in voice_channel.members if not m.bot]
+    total_count = len(players)
 
-    if len(players) < 2:
+    if total_count < 2:
         await interaction.response.send_message(
             f"❌ **[{voice_channel.name}]** 통화방에 최소 2명 이상의 인원이 있어야 사다리를 탈 수 있습니다!",
             ephemeral=True
         )
         return
 
-    # 결과 항목 분리
-    results = [r.strip() for r in 결과.split(",") if r.strip()]
+    # 당첨 인원수 유효성 검사
+    if 당첨인원 <= 0:
+        await interaction.response.send_message("❌ 당첨 인원은 최소 1명 이상이어야 합니다!", ephemeral=True)
+        return
+    if 당첨인원 >= total_count:
+        await interaction.response.send_message(
+            f"❌ 당첨 인원({당첨인원}명)이 통화방 전체 인원({total_count}명)보다 많거나 같을 수 없습니다.",
+            ephemeral=True
+        )
+        return
 
-    # 결과 항목이 인원수보다 적으면 "통과"로 채우기
-    while len(results) < len(players):
-        results.append("통과")
-
-    # 결과 항목이 인원수보다 많으면 인원수에 맞추기
-    if len(results) > len(players):
-        results = results[:len(players)]
+    # 결과 리스트 생성 (지정한 당첨 수만큼 당첨항목 추가, 나머지는 꽝항목)
+    lose_count = total_count - 당첨인원
+    results = [당첨항목] * 당첨인원 + [꽝항목] * lose_count
 
     # 랜덤 셔플
-    shuffled_results = results.copy()
-    random.shuffle(shuffled_results)
+    random.shuffle(results)
 
+    # 결과 라인 생성 (당첨자는 굵게 강조)
     result_lines = []
-    for player, res in zip(players, shuffled_results):
-        result_lines.append(f"👤 **{player}** ➔ 🎁 **{res}**")
+    winners = []
+    for player, res in zip(players, results):
+        if res == 당첨항목:
+            result_lines.append(f"👑 **{player}** ➔ **{res}**")
+            winners.append(player)
+        else:
+            result_lines.append(f"👤 {player} ➔ {res}")
 
     embed = discord.Embed(
         title=f"🪜 [{voice_channel.name}] 사다리 타기 결과 🪜",
         description="\n".join(result_lines),
         color=discord.Color.purple()
     )
-    embed.set_footer(text=f"주최: {interaction.user.display_name} • 총 {len(players)}명 참여")
+    embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
+    embed.set_footer(text=f"주최: {interaction.user.display_name} • 총 {total_count}명 중 {당첨인원}명 당첨")
 
     await interaction.response.send_message(embed=embed)
+
+
 
 
 # --- ⏰ 매일 오전 12시(자정 00:00 KST) 일일 골드 기부 알림 태스크 ---

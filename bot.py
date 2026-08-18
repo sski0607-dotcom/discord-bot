@@ -1,9 +1,12 @@
 import os
+import random
 import threading
+import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # --- 0. Render 슬립 방지용 백그라운드 웹 서버 ---
 app = Flask('')
@@ -13,7 +16,6 @@ def home():
     return "Bot is alive!"
 
 def run():
-    # Render가 자동으로 할당하는 PORT 번호를 사용합니다 (기본값 10000)
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
@@ -26,11 +28,13 @@ def keep_alive():
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True  # 음성 채널 멤버 감지 권한
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Render 환경 변수 설정
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+ANNOUNCE_CHANNEL_ID = int(os.getenv("ANNOUNCE_CHANNEL_ID", "0"))
 
 # 2. 기본 직업 목록 정의 (가변 리스트)
 JOBS = [
@@ -124,7 +128,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             nick_msg = "⚠️ (봇 권한 부족 또는 최고권한자 계정이라 닉네임 수정은 건너뛰었습니다.)"
 
         # 2. 수습주민 역할 자동 부여
-        ROLE_NAME = "수습 담이🐣"  # 부여할 역할 이름
+        ROLE_NAME = "수습 담이🐣""
         role_msg = ""
         
         target_role = discord.utils.get(guild.roles, name=ROLE_NAME)
@@ -160,7 +164,6 @@ class JobButton(discord.ui.Button):
 class JobButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        # 디스코드 컴포넌트 제한(최대 25개) 방지 처리
         for job in JOBS[:25]:
             self.add_item(JobButton(job))
 
@@ -243,10 +246,98 @@ async def remove_job(interaction: discord.Interaction, 직업명: str):
     )
 
 
+# 7. 🪜 통화방 인원 자동 사다리 타기
+@bot.tree.command(name="사다리", description="현재 참가 중인 음성 통화방 인원으로 사다리 타기를 진행합니다.")
+@app_commands.describe(결과="쉼표(,)로 구분하여 결과 항목 입력 (예: 당첨, 꽝)")
+async def ladder_game(interaction: discord.Interaction, 결과: str):
+    # 명령어를 친 유저가 음성 채널에 있는지 확인
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            "❌ 음성 채널(통화방)에 먼저 접속한 뒤 명령어를 입력해 주세요!",
+            ephemeral=True
+        )
+        return
+
+    voice_channel = interaction.user.voice.channel
+    # 통화방 멤버 중 봇을 제외한 실제 유저 닉네임 리스트
+    players = [m.display_name for m in voice_channel.members if not m.bot]
+
+    if len(players) < 2:
+        await interaction.response.send_message(
+            f"❌ **[{voice_channel.name}]** 통화방에 최소 2명 이상의 인원이 있어야 사다리를 탈 수 있습니다!",
+            ephemeral=True
+        )
+        return
+
+    # 결과 항목 분리
+    results = [r.strip() for r in 결과.split(",") if r.strip()]
+
+    # 결과 항목이 인원수보다 적으면 "통과"로 채우기
+    while len(results) < len(players):
+        results.append("통과")
+
+    # 결과 항목이 인원수보다 많으면 인원수에 맞추기
+    if len(results) > len(players):
+        results = results[:len(players)]
+
+    # 랜덤 셔플
+    shuffled_results = results.copy()
+    random.shuffle(shuffled_results)
+
+    result_lines = []
+    for player, res in zip(players, shuffled_results):
+        result_lines.append(f"👤 **{player}** ➔ 🎁 **{res}**")
+
+    embed = discord.Embed(
+        title=f"🪜 [{voice_channel.name}] 사다리 타기 결과 🪜",
+        description="\n".join(result_lines),
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text=f"주최: {interaction.user.display_name} • 총 {len(players)}명 참여")
+
+    await interaction.response.send_message(embed=embed)
+
+
+# --- ⏰ 매일 오전 12시(자정 00:00 KST) 일일 골드 기부 알림 태스크 ---
+midnight_kst = datetime.time(hour=0, minute=0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+@tasks.loop(time=midnight_kst)
+async def daily_gold_reminder():
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+
+    channel = guild.get_channel(ANNOUNCE_CHANNEL_ID)
+    if not channel:
+        channel = guild.system_channel or guild.text_channels[0]
+
+    role_dami = discord.utils.get(guild.roles, name="담이 🐥")
+    role_trainee = discord.utils.get(guild.roles, name="수습 담이🐣")
+
+    mention_list = []
+    if role_dami:
+        mention_list.append(role_dami.mention)
+    if role_trainee:
+        mention_list.append(role_trainee.mention)
+
+    mentions_text = " ".join(mention_list) if mention_list else "@담이 🐥 @수습 담이🐣"
+
+    embed = discord.Embed(
+        title="💰 일일 골드 기부 안내",
+        description="새로운 하루가 시작되었습니다!\n\n길드 성장을 위해 일일 골드 기부를 꼭 부탁드립니다.",
+        color=discord.Color.gold()
+    )
+
+    await channel.send(content=mentions_text, embed=embed)
+
+
 # --- 봇 준비 및 동기화 ---
 @bot.event
 async def on_ready():
     bot.add_view(JobButtonView())
+
+    if not daily_gold_reminder.is_running():
+        daily_gold_reminder.start()
 
     try:
         guild = discord.Object(id=GUILD_ID)
@@ -266,6 +357,6 @@ async def on_ready():
 
 # 실행부
 if __name__ == '__main__':
-    keep_alive()  # 백그라운드 웹 서버 실행
+    keep_alive()
     token = os.getenv("DISCORD_TOKEN")
     bot.run(token)

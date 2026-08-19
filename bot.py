@@ -1,7 +1,9 @@
-import asyncio
 import os
+import json
 import random
 import threading
+import asyncio
+from datetime import datetime
 from typing import Optional, List, Dict
 from flask import Flask
 import discord
@@ -28,12 +30,33 @@ def keep_alive():
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.voice_states = True # 음성 채널 멤버 감지 권한
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Render 환경 변수 설정
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+# --- 경고 데이터 관리 (JSON 저장) ---
+WARNINGS_FILE = "warnings.json"
+
+def load_warnings() -> dict:
+    if os.path.exists(WARNINGS_FILE):
+        try:
+            with open(WARNINGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_warnings(data: dict):
+    with open(WARNINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def is_admin_or_mod(interaction: discord.Interaction) -> bool:
+    """관리자 권한 또는 멤버 관리 권한 확인"""
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
 
 # 2. 기본 직업 목록 정의
 JOBS = [
@@ -51,20 +74,17 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     member = interaction.user
     prefix = f"[{job_name}]"
     
-    # 1. 기존 직업 역할 제거
     for j in JOBS:
         role = discord.utils.get(guild.roles, name=j)
         if role and role in member.roles:
             await member.remove_roles(role)
             
-    # 2. 새 직업 역할 부여
     new_role = discord.utils.get(guild.roles, name=job_name)
     if not new_role:
         new_role = await guild.create_role(name=job_name)
         
     await member.add_roles(new_role)
     
-    # 3. 닉네임 변경 처리
     original_name = member.display_name
     for j in JOBS:
         tag = f"[{j}]"
@@ -83,28 +103,12 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
 
 # --- 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
-    name = discord.ui.TextInput(
-        label="이름 (또는 별명)",
-        placeholder="예: 쨈",
-        required=True,
-        max_length=15
-    )
-    mc_name = discord.ui.TextInput(
-        label="마인크래프트 닉네임",
-        placeholder="예: _s2_jammy",
-        required=True,
-        max_length=25
-    )
-    birth_year = discord.ui.TextInput(
-        label="출생 연도 (두 자리)",
-        placeholder="예: 06",
-        required=True,
-        max_length=4
-    )
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
+    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 06", required=True, max_length=4)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
         guild = interaction.guild
         user = interaction.user
         current_nick = user.display_name
@@ -137,35 +141,14 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
 
 # --- 공지사항 모달 UI ---
 class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
-    notice_title = discord.ui.TextInput(
-        label="공지 제목",
-        placeholder="예: 길드 레이드 일정 안내",
-        required=True,
-        max_length=50
-    )
-    notice_content = discord.ui.TextInput(
-        label="공지 본문",
-        placeholder="공지할 내용을 자세히 적어주세요.",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1500
-    )
-    notice_footer = discord.ui.TextInput(
-        label="추가 안내 / 태그 (선택)",
-        placeholder="예: @everyone 또는 필독 부탁드립니다!",
-        required=False,
-        max_length=100
-    )
+    notice_title = discord.ui.TextInput(label="공지 제목", placeholder="예: 길드 레이드 일정 안내", required=True, max_length=50)
+    notice_content = discord.ui.TextInput(label="공지 본문", placeholder="공지할 내용을 자세히 적어주세요.", style=discord.TextStyle.paragraph, required=True, max_length=1500)
+    notice_footer = discord.ui.TextInput(label="추가 안내 / 태그 (선택)", placeholder="예: @everyone 또는 필독 부탁드립니다!", required=False, max_length=100)
 
     async def on_submit(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title=f"📢 {self.notice_title.value}",
-            description=self.notice_content.value,
-            color=discord.Color.blue()
-        )
+        embed = discord.Embed(title=f"📢 {self.notice_title.value}", description=self.notice_content.value, color=discord.Color.blue())
         if self.notice_footer.value:
             embed.add_field(name="📌 전달사항", value=self.notice_footer.value, inline=False)
-            
         embed.set_footer(text=f"작성자: {interaction.user.display_name} • {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         await interaction.response.send_message(embed=embed)
 
@@ -195,8 +178,6 @@ class PollButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: PollView = self.view
         user_id = interaction.user.id
-        
-        # 투표 처리 (토글 또는 변경)
         view.votes[user_id] = self.index
         await interaction.response.edit_message(embed=view.make_embed(), view=view)
 
@@ -207,7 +188,7 @@ class PollView(discord.ui.View):
         self.question = question
         self.options = options
         self.author = author
-        self.votes: Dict[int, int] = {}  # {user_id: option_index}
+        self.votes: Dict[int, int] = {}
 
         for idx, opt in enumerate(options):
             self.add_item(PollButton(label=f"{idx+1}. {opt}", index=idx))
@@ -225,11 +206,7 @@ class PollView(discord.ui.View):
             bar = "█" * bar_len + "░" * (10 - bar_len)
             desc_lines.append(f"**{idx+1}. {opt}**\n`{bar}` **{count}표** ({pct:.1f}%)")
 
-        embed = discord.Embed(
-            title=f"📊 투표: {self.question}",
-            description="\n\n".join(desc_lines),
-            color=discord.Color.teal()
-        )
+        embed = discord.Embed(title=f"📊 투표: {self.question}", description="\n\n".join(desc_lines), color=discord.Color.teal())
         embed.set_footer(text=f"주최: {self.author.display_name} • 총 {total_votes}명 참여 (버튼을 눌러 투표/변경)")
         return embed
 
@@ -244,11 +221,7 @@ async def profile(interaction: discord.Interaction):
 # 2. 버튼 직업 선택 메뉴 출력
 @bot.tree.command(name="직업선택", description="버튼 형태의 직업 선택 메뉴를 출력합니다.")
 async def job_select_menu(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="⚔️ 직업 선택",
-        description="아래 버튼을 누르면 닉네임 앞에 `[직업]` 태그가 붙습니다!",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="⚔️ 직업 선택", description="아래 버튼을 누르면 닉네임 앞에 `[직업]` 태그가 붙습니다!", color=discord.Color.green())
     await interaction.response.send_message(embed=embed, view=JobButtonView())
 
 # 3. 직업 직접 입력 선택
@@ -264,11 +237,7 @@ async def choose_job(interaction: discord.Interaction, 직업명: str):
 @bot.tree.command(name="직업목록", description="선택 가능한 모든 직업 목록을 확인합니다.")
 async def job_list(interaction: discord.Interaction):
     job_text = "\n".join([f"• **{job}**" for job in JOBS])
-    embed = discord.Embed(
-        title="⚔️ 선택 가능한 직업 목록 ⚔️",
-        description="`/직업선택` 또는 `/직업 [직업명]`을 통해 고를 수 있습니다.\n\n" + job_text,
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title="⚔️ 선택 가능한 직업 목록 ⚔️", description="`/직업선택` 또는 `/직업 [직업명]`을 통해 고를 수 있습니다.\n\n" + job_text, color=discord.Color.blue())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # 5. 직업 추가
@@ -343,7 +312,7 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     
     await interaction.response.send_message(embed=embed)
 
-# 8. 💰 골드 기부 수동 호출 명령어 (선택한 유저만 멘션)
+# 8. 💰 골드 기부 수동 호출 명령어
 @bot.tree.command(name="기부알림", description="지정한 유저들에게 일일 골드 기부 요청 알림을 발송합니다.")
 @app_commands.describe(
     유저1="기부 요청할 멤버 (필수)",
@@ -398,7 +367,7 @@ async def manual_gold_reminder(
 async def create_notice(interaction: discord.Interaction):
     await interaction.response.send_modal(NoticeModal())
 
-# 10. 🧹 채팅 청소 (모든 유저 사용 가능)
+# 10. 🧹 채팅 청소 (누구나 사용 가능)
 @bot.tree.command(name="청소", description="지정한 개수만큼 현재 채널의 최근 메시지를 삭제합니다. (누구나 사용 가능)")
 @app_commands.describe(개수="삭제할 메시지 개수 (1~100개)")
 async def clear_messages(interaction: discord.Interaction, 개수: int):
@@ -442,6 +411,125 @@ async def create_poll(
     view = PollView(question=질문, options=options, author=interaction.user)
     embed = view.make_embed()
     await interaction.response.send_message(embed=embed, view=view)
+
+
+# --- 12. ⚠️ 경고 시스템 ---
+
+# 12-1. 경고 부여 (관리자 전용)
+@bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여하고 사유를 기록합니다.")
+@app_commands.describe(
+    유저="경고를 부여할 대상 멤버",
+    사유="경고 사유 (예: 규칙 위반, 비매너 등)"
+)
+async def warn_user(interaction: discord.Interaction, 유저: discord.Member, 사유: str):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 경고 부여는 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if 유저.bot:
+        await interaction.response.send_message("❌ 봇에게는 경고를 부여할 수 없습니다.", ephemeral=True)
+        return
+
+    warnings = load_warnings()
+    user_id_str = str(유저.id)
+    
+    if user_id_str not in warnings:
+        warnings[user_id_str] = []
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    warnings[user_id_str].append({
+        "reason": 사유,
+        "moderator": interaction.user.display_name,
+        "date": now_str
+    })
+    save_warnings(warnings)
+
+    count = len(warnings[user_id_str])
+
+    embed = discord.Embed(
+        title="⚠️ 경고가 부여되었습니다",
+        description=f"{유저.mention} 님에게 경고가 1회 누적되었습니다.\n규칙을 준수해 주시기 바랍니다.",
+        color=discord.Color.red()
+    )
+    embed.add_field(name="👤 대상자", value=유저.display_name, inline=True)
+    embed.add_field(name="🚨 누적 경고 횟수", value=f"**{count}회**", inline=True)
+    embed.add_field(name="📝 사유", value=사유, inline=False)
+    embed.set_footer(text=f"담당자: {interaction.user.display_name} • 일시: {now_str}")
+
+    await interaction.response.send_message(content=유저.mention, embed=embed)
+
+
+# 12-2. 경고 확인 (누구나 본인/타인 확인 가능)
+@bot.tree.command(name="경고확인", description="지정한 유저(또는 본인)의 누적 경고 횟수 및 내역을 확인합니다.")
+@app_commands.describe(유저="조회할 대상 멤버 (비워두면 본인의 경고 내역을 조회합니다)")
+async def check_warnings(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
+    target = 유저 if 유저 else interaction.user
+    warnings = load_warnings()
+    user_id_str = str(target.id)
+
+    records = warnings.get(user_id_str, [])
+    count = len(records)
+
+    if count == 0:
+        await interaction.response.send_message(f"✨ **{target.display_name}** 님은 받은 경고가 없습니다! (누적 0회)", ephemeral=True)
+        return
+
+    desc_lines = []
+    for idx, r in enumerate(records, 1):
+        desc_lines.append(f"**{idx}.** {r['reason']} *(by {r['moderator']} • {r['date']})*")
+
+    embed = discord.Embed(
+        title=f"📋 [{target.display_name}] 님의 경고 내역",
+        description=f"총 누적 경고: **{count}회**\n\n" + "\n".join(desc_lines),
+        color=discord.Color.orange()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# 12-3. 경고 차감 (관리자 전용)
+@bot.tree.command(name="경고차감", description="[관리자 전용] 유저의 경고를 지정한 횟수만큼 최근 기록부터 차감합니다.")
+@app_commands.describe(
+    유저="경고를 차감할 대상 멤버",
+    개수="차감할 경고 횟수 (기본 1개)"
+)
+async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 개수: Optional[int] = 1):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 경고 차감은 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    warnings = load_warnings()
+    user_id_str = str(유저.id)
+
+    if user_id_str not in warnings or len(warnings[user_id_str]) == 0:
+        await interaction.response.send_message(f"❌ **{유저.display_name}** 님은 차감할 경고가 없습니다.", ephemeral=True)
+        return
+
+    current_count = len(warnings[user_id_str])
+    deduct_count = min(개수, current_count)
+    
+    warnings[user_id_str] = warnings[user_id_str][:-deduct_count]
+    save_warnings(warnings)
+
+    new_count = len(warnings[user_id_str])
+    await interaction.response.send_message(f"✅ **{유저.display_name}** 님의 경고가 **{deduct_count}회** 차감되었습니다. (현재 누적: **{new_count}회**)")
+
+
+# 12-4. 경고 초기화 (관리자 전용)
+@bot.tree.command(name="경고초기화", description="[관리자 전용] 해당 유저의 모든 경고 기록을 완전히 초기화(0회)합니다.")
+@app_commands.describe(유저="경고를 전체 초기화할 대상 멤버")
+async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 경고 초기화는 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    warnings = load_warnings()
+    user_id_str = str(유저.id)
+
+    if user_id_str in warnings:
+        warnings[user_id_str] = []
+        save_warnings(warnings)
+
+    await interaction.response.send_message(f"🧹 **{유저.display_name}** 님의 모든 경고 기록이 초기화되었습니다. (누적 0회)")
 
 
 # --- 봇 준비 및 동기화 ---

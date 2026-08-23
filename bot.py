@@ -55,6 +55,24 @@ def is_admin_or_mod(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions
     return perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
 
+def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Member]:
+    query = query.strip()
+    if not query:
+        return None
+        
+    # 멘션 형태 (<@123456>) 체크
+    match = re.match(r'<@!?(\d+)>', query)
+    if match:
+        return guild.get_member(int(match.group(1)))
+        
+    # 닉네임, 이름, 별명 부분 일치 검색
+    for m in guild.members:
+        if m.bot:
+            continue
+        if query.lower() in m.display_name.lower() or query.lower() in m.name.lower():
+            return m
+    return None
+
 # --- 직업 목록 ---
 JOBS = [
     "검호", "정식기사", "추적자", "암살자", "위자드",
@@ -151,8 +169,8 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
     event_name = discord.ui.TextInput(label="이벤트명", placeholder="예: 균열석 기부자 추첨", required=True, max_length=50)
     winner_count = discord.ui.TextInput(label="당첨 인원수 (숫자만)", placeholder="예: 5", required=True, max_length=4)
     participants_input = discord.ui.TextInput(
-        label="참여자 멘션 목록 (복사해서 붙여넣기)", 
-        placeholder="@유저1 @유저2 @유저3 ... (줄바꿈 또는 띄어쓰기로 자유롭게 나열)",
+        label="참여자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)", 
+        placeholder="루트, 김민수, 우기\n또는 멘션 나열",
         style=discord.TextStyle.paragraph, 
         required=True, 
         max_length=4000
@@ -167,22 +185,16 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
             await interaction.followup.send("❌ 당첨 인원수에는 숫자만 입력해 주세요!", ephemeral=True)
             return
 
-        raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', self.participants_input.value)]))
-
+        raw_names = [name.strip() for name in re.split(r'[,\n]', self.participants_input.value) if name.strip()]
         participants = []
-        for uid in raw_ids:
-            member = interaction.guild.get_member(uid)
-            if not member:
-                try:
-                    member = await interaction.guild.fetch_member(uid)
-                except Exception:
-                    member = None
-            if member and not member.bot and member not in participants:
-                participants.append(member)
+        for name in raw_names:
+            mem = find_guild_member(interaction.guild, name)
+            if mem and mem not in participants:
+                participants.append(mem)
 
         total_count = len(participants)
         if total_count < 2:
-            await interaction.followup.send("❌ 최소 2명 이상의 유저를 `@유저` 형태로 입력해 주세요!", ephemeral=True)
+            await interaction.followup.send("❌ 최소 2명 이상의 유저를 입력해 주세요!", ephemeral=True)
             return
 
         if w_count <= 0 or w_count > total_count:
@@ -257,7 +269,7 @@ class PollView(discord.ui.View):
         return embed
 
 
-# --- 은행 대여 반납 버튼 UI (재부팅 후에도 작동) ---
+# --- 은행 대여 반납 버튼 UI ---
 class DynamicLoanButton(discord.ui.DynamicItem[discord.ui.Button], template=r'loan_return:(?P<lender_id>[0-9]+):(?P<borrower_id>[0-9]+)'):
     def __init__(self, lender_id: int, borrower_id: int):
         super().__init__(
@@ -356,6 +368,7 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
             await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
             return
 
+        # 뽑기 진행
         game["allowed_users"][user_id] -= 1
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         
@@ -434,8 +447,8 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
     )
     last_one = discord.ui.TextInput(label="라스트원상 (선택)", placeholder="예: 전설의 칭호권 (마지막 장 뽑은 사람)", required=False, max_length=50)
     allowed_donors = discord.ui.TextInput(
-        label="참여 가능 기부자 멘션 목록 (복붙)",
-        placeholder="@기부자1 @기부자2 @기부자3 ...",
+        label="참여 가능 기부자 목록 (닉네임/멘션 가능, 줄바꿈 또는 쉼표)",
+        placeholder="루트, 김민수, 우기\n또는 줄바꿈으로 나열",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=2000
@@ -445,9 +458,15 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
-        raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', self.allowed_donors.value)]))
-        if not raw_ids:
-            await interaction.followup.send("❌ 참여 가능한 기부자를 최소 1명 이상 `@유저` 형태로 멘션해 주세요!", ephemeral=True)
+        raw_names = [name.strip() for name in re.split(r'[,\n]', self.allowed_donors.value) if name.strip()]
+        matched_members = []
+        for name in raw_names:
+            mem = find_guild_member(interaction.guild, name)
+            if mem and mem not in matched_members:
+                matched_members.append(mem)
+
+        if not matched_members:
+            await interaction.followup.send("❌ 참여 가능한 기부자를 찾지 못했습니다. 닉네임이나 멘션을 확인해 주세요!", ephemeral=True)
             return
 
         try:
@@ -480,7 +499,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
             return
 
         game_id = f"kuji_{int(datetime.now().timestamp())}_{random.randint(100, 999)}"
-        allowed_users = {uid: default_tickets for uid in raw_ids}
+        allowed_users = {m.id: default_tickets for m in matched_members}
 
         KUJI_GAMES[game_id] = {
             "title": self.kuji_title.value,
@@ -497,7 +516,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
         view = discord.ui.View(timeout=None)
         view.add_item(DynamicKujiButton(game_id))
 
-        mention_pings = " ".join([f"<@{uid}>" for uid in raw_ids])
+        mention_pings = " ".join([m.mention for m in matched_members])
         await interaction.followup.send(content=f"📢 **균열석 기부자 쿠지 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
 
 
@@ -674,7 +693,7 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     view = LoanView(lender_id=interaction.user.id, borrower_id=빌린사람.id)
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
 
-# 🎯 대규모 인원 추첨 명령어 (팝업창 모달 호출)
+# 🎯 대규모 인원 추첨 명령어 (닉네임/멘션 지원)
 @bot.tree.command(name="추첨", description="팝업창을 열어 많은 인원을 복사/붙여넣기로 간편하게 추첨합니다.")
 async def open_lottery_modal(interaction: discord.Interaction):
     await interaction.response.send_modal(LotteryModal())
@@ -708,9 +727,9 @@ async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Memb
         ephemeral=True
     )
 
-# 📋 멤버 멘션 추출 명령어
-@bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 모든 멤버의 멘션을 복사용 텍스트로 출력합니다.")
-@app_commands.describe(역할="멘션을 추출할 역할")
+# 📋 멤버 닉네임 추출 명령어
+@bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 멤버들의 닉네임을 복사용 텍스트로 출력합니다.")
+@app_commands.describe(역할="목록을 추출할 역할")
 async def extract_role_mentions(interaction: discord.Interaction, 역할: discord.Role):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
@@ -721,10 +740,10 @@ async def extract_role_mentions(interaction: discord.Interaction, 역할: discor
         await interaction.response.send_message(f"❌ **{역할.name}** 역할을 가진 유저가 없습니다.", ephemeral=True)
         return
 
-    mention_list = " ".join([m.mention for m in members])
+    name_list = "\n".join([m.display_name for m in members])
     
-    msg = f"📋 **{역할.name}** 멤버 멘션 목록 (총 {len(members)}명):\n\n"
-    msg += f"```text\n{mention_list}\n```"
+    msg = f"📋 **{역할.name}** 멤버 닉네임 목록 (총 {len(members)}명):\n\n"
+    msg += f"```text\n{name_list}\n```"
     
     await interaction.response.send_message(msg, ephemeral=True)
 
@@ -828,7 +847,7 @@ async def manual_sync(ctx):
 async def on_ready():
     bot.add_view(JobButtonView())
     bot.add_dynamic_items(DynamicLoanButton)
-    bot.add_dynamic_items(DynamicKujiButton)  # 쿠지 버튼 동적 등록
+    bot.add_dynamic_items(DynamicKujiButton)
     
     try:
         synced = await bot.tree.sync()

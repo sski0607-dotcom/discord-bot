@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import os
 import random
+import re
 import threading
 from typing import Dict, List, Optional
 import discord
@@ -10,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 
-# --- 0. 백그라운드 웹 서버 (Render 슬립 방지) ---
+# --- 0. 백그라운드 웹 서버 ---
 app = Flask('')
 
 
@@ -119,7 +120,7 @@ async def process_job_selection(
     await member.edit(nick=new_nickname)
     nickname_msg = f'닉네임이 **{new_nickname}**(으)로 변경되었습니다!'
   except discord.Forbidden:
-    nickname_msg = '(⚠️ 닉네임 자동 변경 건너뜀)'
+    nickname_msg = '(⚠️ 닉네임 자동 변경 권한 부족)'
 
   await interaction.followup.send(
       f'✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}',
@@ -195,6 +196,7 @@ class NoticeModal(discord.ui.Modal, title='📢 공지사항 작성'):
   )
 
   async def on_submit(self, interaction: discord.Interaction):
+    await interaction.response.defer()
     embed = discord.Embed(
         title=f'📢 {self.notice_title.value}',
         description=self.notice_content.value,
@@ -210,7 +212,7 @@ class NoticeModal(discord.ui.Modal, title='📢 공지사항 작성'):
             f' {discord.utils.utcnow().strftime("%Y-%m-%d %H:%M")} UTC'
         )
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 class JobButton(discord.ui.Button):
@@ -382,8 +384,9 @@ async def job_select_menu(interaction: discord.Interaction):
 )
 @app_commands.describe(직업명='선택할 직업 이름')
 async def choose_job(interaction: discord.Interaction, 직업명: str):
+  await interaction.response.defer(ephemeral=True)
   if 직업명 not in JOBS:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"❌ 존재하지 않는 직업입니다. 선택 가능: {', '.join(JOBS)}",
         ephemeral=True,
     )
@@ -395,13 +398,14 @@ async def choose_job(interaction: discord.Interaction, 직업명: str):
     name='직업목록', description='선택 가능한 모든 직업 목록을 확인합니다.'
 )
 async def job_list(interaction: discord.Interaction):
+  await interaction.response.defer(ephemeral=True)
   job_text = '\n'.join([f'• **{job}**' for job in JOBS])
   embed = discord.Embed(
       title='⚔️ 선택 가능한 직업 목록 ⚔️',
       description=job_text,
       color=discord.Color.blue(),
   )
-  await interaction.response.send_message(embed=embed, ephemeral=True)
+  await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -452,8 +456,9 @@ async def ladder_game(
     당첨항목: str = '🎉 당첨',
     꽝항목: str = '❌ 꽝',
 ):
+  await interaction.response.defer()
   if not interaction.user.voice or not interaction.user.voice.channel:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 통화방에 먼저 접속한 뒤 입력해 주세요!', ephemeral=True
     )
     return
@@ -463,7 +468,7 @@ async def ladder_game(
   total_count = len(players)
 
   if total_count < 2 or 당첨인원 <= 0 or 당첨인원 >= total_count:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 인원수 및 당첨자 수를 확인해 주세요.', ephemeral=True
     )
     return
@@ -487,25 +492,32 @@ async def ladder_game(
       color=discord.Color.purple(),
   )
   embed.add_field(name='🏆 최종 당첨자', value=', '.join(winners), inline=False)
-  await interaction.response.send_message(embed=embed)
+  await interaction.followup.send(embed=embed)
 
 
+# --- 👥 인원 제한 없는 기부알림 (멘션 문자열 방식) ---
 @bot.tree.command(
     name='기부알림',
     description='지정한 유저들에게 골드 기부 요청 알림을 발송합니다.',
 )
+@app_commands.describe(
+    참여자='멘션할 유저들을 나열해 주세요 (예: @유저1 @유저2 @유저3 ...)',
+    추가메시지='알림에 덧붙일 내용 (선택)',
+)
 async def manual_gold_reminder(
-    interaction: discord.Interaction,
-    유저1: discord.Member,
-    유저2: Optional[discord.Member] = None,
-    유저3: Optional[discord.Member] = None,
-    유저4: Optional[discord.Member] = None,
-    유저5: Optional[discord.Member] = None,
-    추가메시지: Optional[str] = None,
+    interaction: discord.Interaction, 참여자: str, 추가메시지: Optional[str] = None
 ):
-  raw_users = [유저1, 유저2, 유저3, 유저4, 유저5]
-  target_users = [u for u in raw_users if u]
-  mentions_text = ' '.join([u.mention for u in target_users])
+  await interaction.response.defer()
+  raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
+
+  if not raw_ids:
+    await interaction.followup.send(
+        '❌ 멘션된 유저를 찾을 수 없습니다. `@유저` 형태로 입력해 주세요!',
+        ephemeral=True,
+    )
+    return
+
+  mentions_text = ' '.join([f'<@{uid}>' for uid in raw_ids])
   desc = '길드 성장을 위해 **일일 골드 기부**를 진행해 주세요! ✨'
   if 추가메시지:
     desc += f'\n\n💬 **전달사항:** {추가메시지}'
@@ -515,9 +527,8 @@ async def manual_gold_reminder(
       description=desc,
       color=discord.Color.gold(),
   )
-  await interaction.response.send_message(
-      content=mentions_text, embed=embed
-  )
+  embed.set_footer(text=f'발송자: {interaction.user.display_name}')
+  await interaction.followup.send(content=mentions_text, embed=embed)
 
 
 @bot.tree.command(
@@ -618,6 +629,68 @@ async def loan_card(
   )
 
 
+# --- 🎯 인원 무제한 추첨 명령어 ---
+@bot.tree.command(
+    name='추첨',
+    description=(
+        '멘션한 인원들 중에서 당첨자를 무작위 추첨합니다. (인원수 무제한)'
+    ),
+)
+@app_commands.describe(
+    이벤트명='추첨 이벤트 이름 (예: 균열석 기부자 추첨)',
+    당첨인원='당첨될 인원수 (숫자)',
+    참여자='추첨할 유저들을 모두 멘션하세요 (예: @유저1 @유저2 @유저3 ...)',
+)
+async def lottery_mention(
+    interaction: discord.Interaction, 이벤트명: str, 당첨인원: int, 참여자: str
+):
+  await interaction.response.defer()
+  raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
+
+  participants = []
+  for uid in raw_ids:
+    member = interaction.guild.get_member(uid)
+    if not member:
+      try:
+        member = await interaction.guild.fetch_member(uid)
+      except Exception:
+        member = None
+    if member and not member.bot and member not in participants:
+      participants.append(member)
+
+  total_count = len(participants)
+  if total_count < 2:
+    await interaction.followup.send(
+        '❌ 최소 2명 이상의 유저를 `@유저` 형태로 멘션해 주세요!', ephemeral=True
+    )
+    return
+
+  if 당첨인원 <= 0 or 당첨인원 > total_count:
+    await interaction.followup.send(
+        f'❌ 당첨 인원은 1명 이상, 전체 인원({total_count}명) 이하여야 합니다.',
+        ephemeral=True,
+    )
+    return
+
+  winners = random.sample(participants, 당첨인원)
+  winner_mentions = [w.mention for w in winners]
+
+  embed = discord.Embed(
+      title=f'🎉 [추첨 결과] {이벤트명}',
+      description=(
+          f'총 **{total_count}명** 중 **{당첨인원}명**이 당첨되었습니다!\n\n👑'
+          f' **당첨자 명단:**\n'
+          + '\n'.join([f'• {w.mention} ({w.display_name})' for w in winners])
+      ),
+      color=discord.Color.gold(),
+  )
+  embed.set_footer(text=f'주최자: {interaction.user.display_name}')
+
+  await interaction.followup.send(
+      content=' '.join(winner_mentions), embed=embed
+  )
+
+
 # --- 경고 시스템 ---
 @bot.tree.command(
     name='경고', description='[관리자 전용] 유저에게 경고를 부여합니다.'
@@ -626,13 +699,14 @@ async def loan_card(
 async def warn_user(
     interaction: discord.Interaction, 유저: discord.Member, 사유: str
 ):
+  await interaction.response.defer(ephemeral=True)
   if not is_admin_or_mod(interaction):
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 관리자만 사용할 수 있습니다.', ephemeral=True
     )
     return
   if 유저.bot:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 봇에게는 부여할 수 없습니다.', ephemeral=True
     )
     return
@@ -660,7 +734,10 @@ async def warn_user(
       name='🚨 누적 횟수', value=f'**{count}회**', inline=True
   )
   embed.add_field(name='📝 사유', value=사유, inline=False)
-  await interaction.response.send_message(content=유저.mention, embed=embed)
+  await interaction.channel.send(content=유저.mention, embed=embed)
+  await interaction.followup.send(
+      f'✅ {유저.display_name} 님에게 경고를 부여했습니다.', ephemeral=True
+  )
 
 
 @bot.tree.command(name='경고확인', description='경고 내역을 확인합니다.')
@@ -668,13 +745,14 @@ async def warn_user(
 async def check_warnings(
     interaction: discord.Interaction, 유저: Optional[discord.Member] = None
 ):
+  await interaction.response.defer(ephemeral=True)
   target = 유저 if 유저 else interaction.user
   warnings = load_warnings()
   records = warnings.get(str(target.id), [])
   count = len(records)
 
   if count == 0:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f'✨ **{target.display_name}** 님은 경고가 없습니다! (0회)',
         ephemeral=True,
     )
@@ -689,7 +767,7 @@ async def check_warnings(
       description=f'총 누적: **{count}회**\n\n' + '\n'.join(lines),
       color=discord.Color.orange(),
   )
-  await interaction.response.send_message(embed=embed, ephemeral=True)
+  await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -701,15 +779,16 @@ async def remove_warn(
     유저: discord.Member,
     개수: Optional[int] = 1,
 ):
+  await interaction.response.defer(ephemeral=True)
   if not is_admin_or_mod(interaction):
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 관리자만 사용할 수 있습니다.', ephemeral=True
     )
     return
   warnings = load_warnings()
   u_id = str(유저.id)
   if u_id not in warnings or len(warnings[u_id]) == 0:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f'❌ 차감할 경고가 없습니다.', ephemeral=True
     )
     return
@@ -717,9 +796,10 @@ async def remove_warn(
   deduct = min(개수, len(warnings[u_id]))
   warnings[u_id] = warnings[u_id][:-deduct]
   save_warnings(warnings)
-  await interaction.response.send_message(
+  await interaction.followup.send(
       f'✅ **{유저.display_name}** 님의 경고가 **{deduct}회** 차감되었습니다.'
-      f' (현재: **{len(warnings[u_id])}회**)'
+      f' (현재: **{len(warnings[u_id])}회**)',
+      ephemeral=True,
   )
 
 
@@ -728,8 +808,9 @@ async def remove_warn(
 )
 @app_commands.describe(유저='대상 멤버')
 async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
+  await interaction.response.defer(ephemeral=True)
   if not is_admin_or_mod(interaction):
-    await interaction.response.send_message(
+    await interaction.followup.send(
         '❌ 관리자만 사용할 수 있습니다.', ephemeral=True
     )
     return
@@ -738,8 +819,9 @@ async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
   if u_id in warnings:
     warnings[u_id] = []
     save_warnings(warnings)
-  await interaction.response.send_message(
-      f'🧹 **{유저.display_name}** 님의 모든 경고가 초기화되었습니다.'
+  await interaction.followup.send(
+      f'🧹 **{유저.display_name}** 님의 모든 경고가 초기화되었습니다.',
+      ephemeral=True,
   )
 
 

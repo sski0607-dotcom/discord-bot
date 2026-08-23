@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import random
 import threading
@@ -10,7 +11,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-# --- 0. 백그라운드 웹 서버 ---
+# --- 0. 백그라운드 웹 서버 (Render 슬립 방지) ---
 app = Flask('')
 
 @app.route('/')
@@ -591,7 +592,6 @@ async def manual_sync(ctx):
 async def on_ready():
     bot.add_view(JobButtonView())
     
-    # 봇이 참여해 있는 모든 서버에 즉시 강제 등록
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)

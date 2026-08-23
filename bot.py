@@ -3,7 +3,6 @@ import json
 import random
 import threading
 import asyncio
-import re
 from datetime import datetime
 from typing import Optional, List, Dict
 from flask import Flask
@@ -241,7 +240,7 @@ class LotteryView(discord.ui.View):
         self.winner_ids = winner_ids
         self.author = author
         self.participant_ids = [p.id for p in participants]
-        self.checked_users: Dict[int, bool] = {} # {user_id: is_winner}
+        self.checked_users: Dict[int, bool] = {}
 
     def make_embed(self) -> discord.Embed:
         desc = (
@@ -439,7 +438,6 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
     embed = discord.Embed(
         title="🏦 [은행] 대여 등록",
         description=f"{interaction.user.mention} ➔ {빌린사람.mention}",
@@ -457,54 +455,46 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
 
 
-# --- 🎰 복권 이벤트 생성 명령어 (멘션 파싱 방식) ---
-@bot.tree.command(name="복권생성", description="참여 대상자들을 한 번에 멘션하여 스크래치 복권 이벤트를 엽니다.")
+@bot.tree.command(name="복권생성", description="지정한 인원들을 대상으로 스크래치 복권 이벤트를 엽니다.")
 @app_commands.describe(
-    이벤트명="복권 이벤트 이름 (예: 길드 기부자 추첨)",
+    이벤트명="복권 이벤트 이름 (예: 균열석 기부자 추첨)",
     당첨인원="당첨될 인원수 (숫자)",
-    참여자목록="참여할 유저들을 @멘션으로 나열 (예: @유저1 @유저2 @유저3 ...)"
+    유저1="참여 대상자 (필수)",
+    유저2="참여 대상자 (선택)",
+    유저3="참여 대상자 (선택)",
+    유저4="참여 대상자 (선택)",
+    유저5="참여 대상자 (선택)"
 )
 async def create_lottery(
     interaction: discord.Interaction,
     이벤트명: str,
     당첨인원: int,
-    참여자목록: str
+    유저1: discord.Member,
+    유저2: Optional[discord.Member] = None,
+    유저3: Optional[discord.Member] = None,
+    유저4: Optional[discord.Member] = None,
+    유저5: Optional[discord.Member] = None,
 ):
-    # 멘션 문자열에서 Discord 유저 ID(<@123456...>) 추출 및 중복 제거
-    raw_user_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자목록)]))
-    
-    participants = []
-    for uid in raw_user_ids:
-        member = interaction.guild.get_member(uid)
-        # 캐시에 없으면 서버에서 직접 가져옴
-        if not member:
-            try:
-                member = await interaction.guild.fetch_member(uid)
-            except discord.NotFound:
-                member = None
-        if member and not member.bot and member not in participants:
-            participants.append(member)
+    raw_users = [유저1, 유저2, 유저3, 유저4, 유저5]
+    participants = [u for u in raw_users if u and not u.bot]
 
     total_count = len(participants)
     if total_count < 2:
-        await interaction.response.send_message("❌ 최소 2명 이상의 참여자를 @멘션 형태로 입력해 주세요!", ephemeral=True)
+        await interaction.response.send_message("❌ 최소 2명 이상의 참여자가 필요합니다!", ephemeral=True)
         return
 
     if 당첨인원 <= 0 or 당첨인원 >= total_count:
         await interaction.response.send_message(f"❌ 당첨 인원은 1명 이상, 전체 인원({total_count}명) 미만이어야 합니다.", ephemeral=True)
         return
 
-    # 당첨자 무작위 사전 추첨
     winners = random.sample(participants, 당첨인원)
     winner_ids = [w.id for w in winners]
-
     mentions = " ".join([p.mention for p in participants])
     view = LotteryView(title=이벤트명, participants=participants, winner_ids=winner_ids, author=interaction.user)
 
     await interaction.response.send_message(content=f"🎉 **[복권 도착]** {mentions}", embed=view.make_embed(), view=view)
 
 
-# --- 경고 시스템 ---
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")
 @app_commands.describe(유저="대상 멤버", 사유="경고 사유")
 async def warn_user(interaction: discord.Interaction, 유저: discord.Member, 사유: str):
@@ -584,18 +574,32 @@ async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
         save_warnings(warnings)
     await interaction.response.send_message(f"🧹 **{유저.display_name}** 님의 모든 경고가 초기화되었습니다.")
 
+
+# --- 백업용 즉시 동기화 일반 명령어 ---
+@bot.command(name="동기화")
+async def manual_sync(ctx):
+    try:
+        bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await bot.tree.sync(guild=ctx.guild)
+        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 즉시 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
+    except Exception as e:
+        await ctx.send(f"❌ 동기화 실패: {e}")
+
+
 # --- 봇 시작 및 동기화 ---
 @bot.event
 async def on_ready():
     bot.add_view(JobButtonView())
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
+    
+    # 봇이 참여해 있는 모든 서버에 즉시 강제 등록
+    for guild in bot.guilds:
+        try:
             bot.tree.copy_global_to(guild=guild)
             synced = await bot.tree.sync(guild=guild)
-            print(f"✅ {len(synced)}개의 명령어 동기화 완료!")
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+            print(f"✅ [{guild.name}] 서버에 {len(synced)}개 명령어 즉시 동기화 완료!")
+        except Exception as e:
+            print(f"❌ [{guild.name}] 동기화 오류: {e}")
+            
     print(f"로그인 완료: {bot.user.name}")
 
 if __name__ == "__main__":

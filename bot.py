@@ -199,7 +199,7 @@ class PollView(discord.ui.View):
         return embed
 
 
-# --- 🏦 은행 대여 반납 버튼 UI ---
+# --- 은행 대여 반납 버튼 UI ---
 class LoanView(discord.ui.View):
     def __init__(self, lender_id: int, borrower_id: int):
         super().__init__(timeout=None)
@@ -208,32 +208,92 @@ class LoanView(discord.ui.View):
 
     @discord.ui.button(label="반납 완료", style=discord.ButtonStyle.success, emoji="✅", custom_id="loan_return_btn")
     async def return_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 당사자 또는 관리자만 클릭 가능
         if interaction.user.id != self.lender_id and interaction.user.id != self.borrower_id and not is_admin_or_mod(interaction):
             await interaction.response.send_message("❌ 빌려준 사람, 빌린 사람 또는 관리자만 반납 처리를 할 수 있습니다.", ephemeral=True)
             return
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        
-        # 기존 메시지의 임베드 수정
         orig_embed = interaction.message.embeds[0]
         new_embed = orig_embed.copy()
         new_embed.color = discord.Color.green()
         new_embed.title = "🏦 [은행] 상환 완료"
         
-        # 상태 필드 업데이트
         for i, field in enumerate(new_embed.fields):
             if field.name == "📌 상태":
                 new_embed.set_field_at(i, name="📌 상태", value="✅ **반납 완료**", inline=True)
                 break
                 
         new_embed.add_field(name="🎉 반납 일시", value=f"{now_str} (확인: {interaction.user.display_name})", inline=False)
-        
         button.disabled = True
         button.label = "반납 완료됨"
         
         await interaction.response.edit_message(embed=new_embed, view=self)
         await interaction.followup.send(f"✅ **{interaction.user.display_name}** 님이 상환 완료 처리했습니다!", ephemeral=False)
+
+
+# --- 🎰 스크래치 복권 UI ---
+class LotteryView(discord.ui.View):
+    def __init__(self, title: str, participants: List[discord.Member], winner_ids: List[int], author: discord.Member):
+        super().__init__(timeout=None)
+        self.title = title
+        self.participants = participants
+        self.winner_ids = winner_ids
+        self.author = author
+        self.participant_ids = [p.id for p in participants]
+        self.checked_users: Dict[int, bool] = {} # {user_id: is_winner}
+
+    def make_embed(self) -> discord.Embed:
+        desc = (
+            f"🎁 **이벤트 명:** {self.title}\n"
+            f"👥 **참여 대상:** 총 {len(self.participants)}명\n"
+            f"👑 **당첨 인원:** {len(self.winner_ids)}명\n\n"
+            f"👇 아래 **[ 긁어서 결과 확인! ]** 버튼을 눌러 본인의 당첨 여부를 확인하세요!\n"
+            f"*(결과는 본인에게만 비공개로 즉시 표시됩니다)*\n\n"
+            f"**[ 📋 실시간 확인 현황 ]**\n"
+        )
+        status_lines = []
+        for p in self.participants:
+            if p.id in self.checked_users:
+                status_lines.append(f"• {p.display_name} ➔ 🔍 **확인 완료**")
+            else:
+                status_lines.append(f"• {p.display_name} ➔ ⏳ 미확인")
+        
+        desc += "\n".join(status_lines)
+
+        embed = discord.Embed(
+            title="🎰 스크래치 복권 이벤트",
+            description=desc,
+            color=discord.Color.purple()
+        )
+        embed.set_footer(text=f"주최자: {self.author.display_name} • 행운을 빕니다! ✨")
+        return embed
+
+    @discord.ui.button(label="긁어서 결과 확인!", style=discord.ButtonStyle.primary, emoji="🎫", custom_id="lottery_scratch_btn")
+    async def scratch_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        if user.id not in self.participant_ids:
+            await interaction.response.send_message("❌ 이번 복권 이벤트 대상자가 아닙니다!", ephemeral=True)
+            return
+
+        is_winner = user.id in self.winner_ids
+        self.checked_users[user.id] = is_winner
+
+        # 결과 메시지
+        if is_winner:
+            result_msg = (
+                f"🎉🎉 **[당첨 축하드립니다!]** 🎉🎉\n\n"
+                f"✨ **{self.title}** 복권에 **당첨**되셨습니다! 🎁\n"
+                f"관리자에게 보상을 요청하세요!"
+            )
+        else:
+            result_msg = (
+                f"💨 **[아쉽게도 꽝입니다!]** 💨\n\n"
+                f"아쉽게도 이번에는 당첨되지 않았습니다. 다음 기회에 도전해 보세요! 🍀"
+            )
+
+        await interaction.response.send_message(result_msg, ephemeral=True)
+        # 메인 메시지 실시간 확인 현황 업데이트
+        await interaction.message.edit(embed=self.make_embed(), view=self)
 
 
 # --- 슬래시 명령어 ---
@@ -368,8 +428,6 @@ async def create_poll(
     view = PollView(question=질문, options=options, author=interaction.user)
     await interaction.response.send_message(embed=view.make_embed(), view=view)
 
-
-# --- 🏦 은행 (네모칸 박스 + 체크 버튼 시스템) ---
 @bot.tree.command(name="대여", description="[은행] 돈이나 물건을 빌려준 내역 박스를 생성합니다.")
 @app_commands.describe(
     빌린사람="돈이나 물건을 빌려간 멤버",
@@ -398,6 +456,72 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
 
     view = LoanView(lender_id=interaction.user.id, borrower_id=빌린사람.id)
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
+
+
+# --- 🎰 복권 이벤트 생성 명령어 ---
+@bot.tree.command(name="복권생성", description="지정한 인원들을 대상으로 스크래치 복권 이벤트를 엽니다.")
+@app_commands.describe(
+    이벤트명="복권 이벤트 이름 (예: 균열석 기부자 추첨)",
+    당첨인원="당첨될 인원수 (숫자)",
+    유저1="참여 대상자 (필수)",
+    유저2="참여 대상자 (선택)",
+    유저3="참여 대상자 (선택)",
+    유저4="참여 대상자 (선택)",
+    유저5="참여 대상자 (선택)",
+    유저6="참여 대상자 (선택)",
+    유저7="참여 대상자 (선택)",
+    유저8="참여 대상자 (선택)",
+    유저9="참여 대상자 (선택)",
+    유저10="참여 대상자 (선택)",
+    유저11="참여 대상자 (선택)",
+    유저12="참여 대상자 (선택)",
+    유저13="참여 대상자 (선택)",
+    유저14="참여 대상자 (선택)",
+    유저15="참여 대상자 (선택)"
+)
+async def create_lottery(
+    interaction: discord.Interaction,
+    이벤트명: str,
+    당첨인원: int,
+    유저1: discord.Member,
+    유저2: Optional[discord.Member] = None,
+    유저3: Optional[discord.Member] = None,
+    유저4: Optional[discord.Member] = None,
+    유저5: Optional[discord.Member] = None,
+    유저6: Optional[discord.Member] = None,
+    유저7: Optional[discord.Member] = None,
+    유저8: Optional[discord.Member] = None,
+    유저9: Optional[discord.Member] = None,
+    유저10: Optional[discord.Member] = None,
+    유저11: Optional[discord.Member] = None,
+    유저12: Optional[discord.Member] = None,
+    유저13: Optional[discord.Member] = None,
+    유저14: Optional[discord.Member] = None,
+    유저15: Optional[discord.Member] = None,
+):
+    raw_users = [유저1, 유저2, 유저3, 유저4, 유저5, 유저6, 유저7, 유저8, 유저9, 유저10, 유저11, 유저12, 유저13, 유저14, 유저15]
+    participants = []
+    for u in raw_users:
+        if u and u not in participants and not u.bot:
+            participants.append(u)
+
+    total_count = len(participants)
+    if total_count < 2:
+        await interaction.response.send_message("❌ 최소 2명 이상의 참여자가 필요합니다!", ephemeral=True)
+        return
+
+    if 당첨인원 <= 0 or 당첨인원 >= total_count:
+        await interaction.response.send_message(f"❌ 당첨 인원은 1명 이상, 전체 인원({total_count}명) 미만이어야 합니다.", ephemeral=True)
+        return
+
+    # 당첨자 무작위 사전 추첨
+    winners = random.sample(participants, 당첨인원)
+    winner_ids = [w.id for w in winners]
+
+    mentions = " ".join([p.mention for p in participants])
+    view = LotteryView(title=이벤트명, participants=participants, winner_ids=winner_ids, author=interaction.user)
+
+    await interaction.response.send_message(content=f"🎉 **[복권 도착]** {mentions}", embed=view.make_embed(), view=view)
 
 
 # --- 경고 시스템 ---

@@ -343,37 +343,30 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
 
         user_id = interaction.user.id
 
-        # 1. 참여 자격 확인
         if user_id not in game["allowed_users"]:
             await interaction.response.send_message("❌ 오늘의 균열석 기부자 명단에 등록되지 않아 참여할 수 없습니다!", ephemeral=True)
             return
 
-        # 2. 남은 뽑기 횟수 확인
         remaining_tickets = game["allowed_users"][user_id]
         if remaining_tickets <= 0:
             await interaction.response.send_message("❌ 보유한 뽑기 티켓을 모두 사용하셨습니다!", ephemeral=True)
             return
 
-        # 3. 쿠지 판 잔여 수량 확인
         if len(game["box"]) == 0:
             await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
             return
 
-        # 뽑기 진행
         game["allowed_users"][user_id] -= 1
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         
-        # 라스트원상 체크
         is_last_one = len(game["box"]) == 0
         last_one_msg = ""
         if is_last_one and game.get("last_one"):
             last_one_msg = f"\n\n👑 **[축] 마지막 쿠지를 뽑으셨습니다!**\n🎁 **라스트원상 추가 획득: {game['last_one']}**"
 
-        # 당첨 기록
         now_time = datetime.now().strftime("%H:%M")
         game["history"].append(f"• **{interaction.user.display_name}** ➔ **{picked_prize}** ({now_time})")
 
-        # 현황판 임베드 갱신
         embed = self.build_embed(game)
         
         if is_last_one:
@@ -714,6 +707,26 @@ async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Memb
         f"✅ **{유저.display_name}** 님에게 쿠지 뽑기 티켓 **{횟수}장**을 지급했습니다! (현재 잔여: **{game['allowed_users'][유저.id]}장**)",
         ephemeral=True
     )
+
+# 📋 멤버 멘션 추출 명령어
+@bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 모든 멤버의 멘션을 복사용 텍스트로 출력합니다.")
+@app_commands.describe(역할="멘션을 추출할 역할")
+async def extract_role_mentions(interaction: discord.Interaction, 역할: discord.Role):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+        
+    members = [m for m in 역할.members if not m.bot]
+    if not members:
+        await interaction.response.send_message(f"❌ **{역할.name}** 역할을 가진 유저가 없습니다.", ephemeral=True)
+        return
+
+    mention_list = " ".join([m.mention for m in members])
+    
+    msg = f"📋 **{역할.name}** 멤버 멘션 목록 (총 {len(members)}명):\n\n"
+    msg += f"```text\n{mention_list}\n```"
+    
+    await interaction.response.send_message(msg, ephemeral=True)
 
 # --- 경고 시스템 ---
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")

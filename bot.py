@@ -3,6 +3,7 @@ import json
 import random
 import threading
 import asyncio
+import re
 from datetime import datetime
 from typing import Optional, List, Dict
 from flask import Flask
@@ -278,7 +279,6 @@ class LotteryView(discord.ui.View):
         is_winner = user.id in self.winner_ids
         self.checked_users[user.id] = is_winner
 
-        # 결과 메시지
         if is_winner:
             result_msg = (
                 f"🎉🎉 **[당첨 축하드립니다!]** 🎉🎉\n\n"
@@ -292,7 +292,6 @@ class LotteryView(discord.ui.View):
             )
 
         await interaction.response.send_message(result_msg, ephemeral=True)
-        # 메인 메시지 실시간 확인 현황 업데이트
         await interaction.message.edit(embed=self.make_embed(), view=self)
 
 
@@ -458,56 +457,37 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
 
 
-# --- 🎰 복권 이벤트 생성 명령어 ---
-@bot.tree.command(name="복권생성", description="지정한 인원들을 대상으로 스크래치 복권 이벤트를 엽니다.")
+# --- 🎰 복권 이벤트 생성 명령어 (멘션 파싱 방식) ---
+@bot.tree.command(name="복권생성", description="참여 대상자들을 한 번에 멘션하여 스크래치 복권 이벤트를 엽니다.")
 @app_commands.describe(
-    이벤트명="복권 이벤트 이름 (예: 균열석 기부자 추첨)",
+    이벤트명="복권 이벤트 이름 (예: 길드 기부자 추첨)",
     당첨인원="당첨될 인원수 (숫자)",
-    유저1="참여 대상자 (필수)",
-    유저2="참여 대상자 (선택)",
-    유저3="참여 대상자 (선택)",
-    유저4="참여 대상자 (선택)",
-    유저5="참여 대상자 (선택)",
-    유저6="참여 대상자 (선택)",
-    유저7="참여 대상자 (선택)",
-    유저8="참여 대상자 (선택)",
-    유저9="참여 대상자 (선택)",
-    유저10="참여 대상자 (선택)",
-    유저11="참여 대상자 (선택)",
-    유저12="참여 대상자 (선택)",
-    유저13="참여 대상자 (선택)",
-    유저14="참여 대상자 (선택)",
-    유저15="참여 대상자 (선택)"
+    참여자목록="참여할 유저들을 @멘션으로 나열 (예: @유저1 @유저2 @유저3 ...)"
 )
 async def create_lottery(
     interaction: discord.Interaction,
     이벤트명: str,
     당첨인원: int,
-    유저1: discord.Member,
-    유저2: Optional[discord.Member] = None,
-    유저3: Optional[discord.Member] = None,
-    유저4: Optional[discord.Member] = None,
-    유저5: Optional[discord.Member] = None,
-    유저6: Optional[discord.Member] = None,
-    유저7: Optional[discord.Member] = None,
-    유저8: Optional[discord.Member] = None,
-    유저9: Optional[discord.Member] = None,
-    유저10: Optional[discord.Member] = None,
-    유저11: Optional[discord.Member] = None,
-    유저12: Optional[discord.Member] = None,
-    유저13: Optional[discord.Member] = None,
-    유저14: Optional[discord.Member] = None,
-    유저15: Optional[discord.Member] = None,
+    참여자목록: str
 ):
-    raw_users = [유저1, 유저2, 유저3, 유저4, 유저5, 유저6, 유저7, 유저8, 유저9, 유저10, 유저11, 유저12, 유저13, 유저14, 유저15]
+    # 멘션 문자열에서 Discord 유저 ID(<@123456...>) 추출 및 중복 제거
+    raw_user_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자목록)]))
+    
     participants = []
-    for u in raw_users:
-        if u and u not in participants and not u.bot:
-            participants.append(u)
+    for uid in raw_user_ids:
+        member = interaction.guild.get_member(uid)
+        # 캐시에 없으면 서버에서 직접 가져옴
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except discord.NotFound:
+                member = None
+        if member and not member.bot and member not in participants:
+            participants.append(member)
 
     total_count = len(participants)
     if total_count < 2:
-        await interaction.response.send_message("❌ 최소 2명 이상의 참여자가 필요합니다!", ephemeral=True)
+        await interaction.response.send_message("❌ 최소 2명 이상의 참여자를 @멘션 형태로 입력해 주세요!", ephemeral=True)
         return
 
     if 당첨인원 <= 0 or 당첨인원 >= total_count:

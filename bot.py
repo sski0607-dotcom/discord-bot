@@ -170,7 +170,7 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
     winner_count = discord.ui.TextInput(label="당첨 인원수 (숫자만)", placeholder="예: 5", required=True, max_length=4)
     participants_input = discord.ui.TextInput(
         label="참여자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)", 
-        placeholder="루트, 김민수, 우기\n또는 멘션 나열",
+        placeholder="홍길동, 우랄라, 뽀삐\n또는 멘션 나열",
         style=discord.TextStyle.paragraph, 
         required=True, 
         max_length=4000
@@ -372,17 +372,14 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         game["allowed_users"][user_id] -= 1
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         
-        is_last_one = len(game["box"]) == 0
-        last_one_msg = ""
-        if is_last_one and game.get("last_one"):
-            last_one_msg = f"\n\n👑 **[축] 마지막 쿠지를 뽑으셨습니다!**\n🎁 **라스트원상 추가 획득: {game['last_one']}**"
+        is_finished = len(game["box"]) == 0
 
         now_time = datetime.now().strftime("%H:%M")
         game["history"].append(f"• **{interaction.user.display_name}** ➔ **{picked_prize}** ({now_time})")
 
         embed = self.build_embed(game)
         
-        if is_last_one:
+        if is_finished:
             self.item.disabled = True
             self.item.label = "쿠지 매진 (종료)"
             self.item.style = discord.ButtonStyle.secondary
@@ -391,8 +388,16 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         view.add_item(self.item)
 
         await interaction.response.edit_message(embed=embed, view=view)
+        
+        # 🎯 꽝 여부 판별하여 알림 멘트 다르게 출력
+        lose_name = game.get("lose_name", "❌ 꽝")
+        if picked_prize == lose_name or "꽝" in picked_prize:
+            result_comment = f"💨 아쉽네요... {interaction.user.mention} 님은 **[{picked_prize}]** (다음 기회에!)"
+        else:
+            result_comment = f"🎉 축하합니다! {interaction.user.mention} 님이 **[{picked_prize}]** 에 당첨되셨습니다!"
+
         await interaction.followup.send(
-            f"🎉 축하합니다! {interaction.user.mention} 님이 **[{picked_prize}]** 에 당첨되셨습니다! (남은 티켓: {game['allowed_users'][user_id]}장){last_one_msg}",
+            f"{result_comment} (남은 티켓: {game['allowed_users'][user_id]}장)",
             ephemeral=False
         )
 
@@ -411,8 +416,6 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
             f"균열석 기부자 전용 이치방쿠지 뽑기판입니다!\n\n"
             f"📊 **남은 수량:** `{total_left} / {total_init}`장\n"
         )
-        if game.get("last_one"):
-            desc += f"🏆 **라스트원상:** **{game['last_one']}** (마지막 1장 뽑을 시 증정)\n"
 
         embed = discord.Embed(
             title="🎪 [이치방쿠지] 균열석 기부자 뽑기판",
@@ -437,23 +440,22 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
 
 
 class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 생성"):
-    kuji_title = discord.ui.TextInput(label="쿠지 제목", placeholder="예: 8월 24일 균열석 기부 감사 쿠지", required=True, max_length=50)
+    kuji_title = discord.ui.TextInput(label="쿠지 제목", placeholder="예: 균열석 기부 감사 쿠지", required=True, max_length=50)
     prizes = discord.ui.TextInput(
-        label="상품 라인업 (상품명:수량 줄바꿈)",
-        placeholder="A상 10만골드:1\nB상 네더라이트 곡괭이:2\nC상 다이아 32개:5\n꽝상 포션 5개:10",
+        label="당첨 상품 라인업 (상품명:수량 줄바꿈)",
+        placeholder="A상 10만골드:1\nB상 네더라이트 곡괭이:2\nC상 다이아 32개:5\n(※ 꽝은 적지 않아도 총 인원에 맞춰 자동 생성)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1000
     )
-    last_one = discord.ui.TextInput(label="라스트원상 (선택)", placeholder="예: 전설의 칭호권 (마지막 장 뽑은 사람)", required=False, max_length=50)
     allowed_donors = discord.ui.TextInput(
-        label="참여 가능 기부자 목록 (닉네임/멘션 가능, 줄바꿈 또는 쉼표)",
+        label="참여 가능 기부자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)",
         placeholder="루트, 김민수, 우기\n또는 줄바꿈으로 나열",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=2000
     )
-    tickets_per_person = discord.ui.TextInput(label="기본 1인당 뽑기 횟수 (숫자)", placeholder="1", default="1", required=True, max_length=3)
+    default_lose_name = discord.ui.TextInput(label="꽝 상품 이름 (기본값: ❌ 꽝)", placeholder="❌ 꽝", default="❌ 꽝", required=False, max_length=30)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -469,11 +471,9 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
             await interaction.followup.send("❌ 참여 가능한 기부자를 찾지 못했습니다. 닉네임이나 멘션을 확인해 주세요!", ephemeral=True)
             return
 
-        try:
-            default_tickets = max(1, int(self.tickets_per_person.value.strip()))
-        except ValueError:
-            default_tickets = 1
+        total_required_tickets = len(matched_members)
 
+        # 당첨 상품 파싱
         box = []
         initial_prizes = {}
         for line in self.prizes.value.strip().split("\n"):
@@ -494,12 +494,23 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
             initial_prizes[p_name] = p_count
             box.extend([p_name] * p_count)
 
-        if not box:
-            await interaction.followup.send("❌ 등록된 상품이 없습니다. 형식을 확인해 주세요 (예: `A상:1`)", ephemeral=True)
+        # 🎯 부족한 수량은 꽝으로 자동 채움
+        current_prize_count = len(box)
+        lose_name = self.default_lose_name.value.strip() if self.default_lose_name.value else "❌ 꽝"
+
+        if current_prize_count < total_required_tickets:
+            remaining_lose_count = total_required_tickets - current_prize_count
+            initial_prizes[lose_name] = initial_prizes.get(lose_name, 0) + remaining_lose_count
+            box.extend([lose_name] * remaining_lose_count)
+        elif current_prize_count > total_required_tickets:
+            await interaction.followup.send(
+                f"⚠️ 입력한 당첨 상품 총 개수({current_prize_count}개)가 참여자 인원수({total_required_tickets}명)보다 많습니다! 수량을 조절해 주세요.",
+                ephemeral=True
+            )
             return
 
         game_id = f"kuji_{int(datetime.now().timestamp())}_{random.randint(100, 999)}"
-        allowed_users = {m.id: default_tickets for m in matched_members}
+        allowed_users = {m.id: 1 for m in matched_members}
 
         KUJI_GAMES[game_id] = {
             "title": self.kuji_title.value,
@@ -507,8 +518,8 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
             "box": box,
             "initial_prizes": initial_prizes,
             "total_initial": len(box),
-            "last_one": self.last_one.value.strip() if self.last_one.value else None,
             "allowed_users": allowed_users,
+            "lose_name": lose_name,
             "history": []
         }
 
@@ -693,7 +704,7 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     view = LoanView(lender_id=interaction.user.id, borrower_id=빌린사람.id)
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
 
-# 🎯 대규모 인원 추첨 명령어 (닉네임/멘션 지원)
+# 🎯 대규모 인원 추첨 명령어
 @bot.tree.command(name="추첨", description="팝업창을 열어 많은 인원을 복사/붙여넣기로 간편하게 추첨합니다.")
 async def open_lottery_modal(interaction: discord.Interaction):
     await interaction.response.send_modal(LotteryModal())

@@ -450,7 +450,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 �
     )
     allowed_donors = discord.ui.TextInput(
         label="참여 가능 기부자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)",
-        placeholder="루트, 김민수, 우기\n또는 줄바꿈으로 나열",
+        placeholder="홍길동, 알랄라, 뽀삐\n또는 줄바꿈으로 나열",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=2000

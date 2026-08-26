@@ -253,7 +253,7 @@ class LoanView(discord.ui.View):
         await interaction.followup.send(f"✅ **{interaction.user.display_name}** 님이 상환 완료 처리했습니다!", ephemeral=False)
 
 
-# --- 🎟️ 쿠지(뽑기판) 시스템 UI ---
+# --- 🎟️ 심플 쿠지(뽑기판) 시스템 UI ---
 class KujiButton(discord.ui.Button):
     def __init__(self, number: int):
         super().__init__(label=f"{number}번", style=discord.ButtonStyle.secondary, custom_id=f"kuji_btn_{number}")
@@ -269,12 +269,13 @@ class KujiButton(discord.ui.Button):
         view.picked_results[self.number] = (interaction.user, prize)
         
         self.disabled = True
-        self.style = discord.ButtonStyle.success if "꽝" not in prize else discord.ButtonStyle.danger
-        self.label = f"{self.number}번(완료)"
-
         if "꽝" in prize:
+            self.style = discord.ButtonStyle.danger
+            self.label = f"{self.number}번(꽝)"
             result_msg = f"💨 **{self.number}번**을 뽑으셨습니다!\n결과: **{prize}** (다음 기회에... 🍀)"
         else:
+            self.style = discord.ButtonStyle.success
+            self.label = f"{self.number}번(당첨)"
             result_msg = f"🎉🎉 **[축하합니다!]** 🎉🎉\n\n✨ **{self.number}번**을 뽑아 **[{prize}]**에 당첨되셨습니다! 🎁"
 
         await interaction.response.send_message(result_msg, ephemeral=True)
@@ -288,7 +289,7 @@ class KujiView(discord.ui.View):
         self.total_count = total_count
         self.rewards = rewards
         self.author = author
-        self.picked_results: Dict[int, tuple] = {} # {number: (user, prize)}
+        self.picked_results: Dict[int, tuple] = {}
 
         for num in range(1, total_count + 1):
             self.add_item(KujiButton(num))
@@ -305,7 +306,7 @@ class KujiView(discord.ui.View):
             desc += "• 아직 아무도 뽑지 않았습니다. 첫 행운의 주인공이 되어보세요!"
         else:
             history = [f"• **{num}번** ➔ {user.display_name} 님 선택 완료" for num, (user, _) in self.picked_results.items()]
-            desc += "\n".join(history[-10:]) # 최근 10개 표시
+            desc += "\n".join(history[-10:])
 
         embed = discord.Embed(title="🎟️ 실시간 쿠지(뽑기판) 이벤트", description=desc, color=discord.Color.purple())
         embed.set_footer(text=f"주최자: {self.author.display_name} • 행운을 빕니다! ✨")
@@ -519,30 +520,20 @@ async def lottery_mention(interaction: discord.Interaction, 이벤트명: str, �
 
     await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
-# 🎟️ 쿠지(뽑기판) 생성 명령어 (최대 25개 버튼 안전 지원)
-@bot.tree.command(name="쿠지생성", description="버튼식 실시간 쿠지(뽑기판) 이벤트를 생성합니다. (최대 25개)")
+# 🎟️ 심플 쿠지(뽑기판) 생성 명령어
+@bot.tree.command(name="쿠지생성", description="기본 꽝 기반의 심플한 버튼식 쿠지(뽑기판)를 생성합니다. (최대 25개)")
 @app_commands.describe(
-    이벤트명="쿠지 이벤트 이름 (예: 균열석 기부자 쿠지)",
-    총뽑기수="전체 뽑기 개수 (2~25 사이)",
-    _1등상품="1등 상품 이름",
-    _1등수량="1등 당첨 개수",
-    _2등상품="2등 상품 이름 (선택)",
-    _2등수량="2등 당첨 개수 (선택)",
-    _3등상품="3등 상품 이름 (선택)",
-    _3등수량="3등 당첨 개수 (선택)",
-    꽝항목="꽝 텍스트 (기본값: 꽝)"
+    이벤트명="쿠지 이벤트 이름 (예: 균열석 기부 쿠지)",
+    총뽑기수="전체 뽑기 버튼 개수 (2~25개)",
+    당첨수="당첨 수량 (숫자)",
+    당첨상품="당첨 시 표시될 상품명 (기본값: 🎉 당첨)"
 )
 async def create_kuji(
     interaction: discord.Interaction,
     이벤트명: str,
     총뽑기수: int,
-    _1등상품: str,
-    _1등수량: int,
-    _2등상품: Optional[str] = None,
-    _2등수량: Optional[int] = 0,
-    _3등상품: Optional[str] = None,
-    _3등수량: Optional[int] = 0,
-    꽝항목: str = "❌ 꽝"
+    당첨수: int,
+    당첨상품: str = "🎉 당첨"
 ):
     await interaction.response.defer()
 
@@ -550,22 +541,11 @@ async def create_kuji(
         await interaction.followup.send("❌ 디스코드 버튼 제한으로 인해 전체 뽑기 개수는 **2개 ~ 25개 사이**로 설정해 주세요!", ephemeral=True)
         return
 
-    q2 = _2등수량 if _2등수량 else 0
-    q3 = _3등수량 if _3등수량 else 0
-    total_winners = _1등수량 + q2 + q3
-
-    if total_winners > 총뽑기수:
-        await interaction.followup.send(f"❌ 당첨 상품의 총 수량({total_winners}개)이 전체 뽑기 수({총뽑기수}개)보다 많습니다.", ephemeral=True)
+    if 당첨수 <= 0 or 당첨수 >= 총뽑기수:
+        await interaction.followup.send(f"❌ 당첨 수는 1개 이상, 전체 뽑기 수({총뽑기수}개) 미만이어야 합니다.", ephemeral=True)
         return
 
-    rewards = [_1등상품] * _1등수량
-    if _2등상품 and q2 > 0:
-        rewards += [_2등상품] * q2
-    if _3등상품 and q3 > 0:
-        rewards += [_3등상품] * q3
-
-    lose_count = 총뽑기수 - len(rewards)
-    rewards += [꽝항목] * lose_count
+    rewards = [당첨상품] * 당첨수 + ["❌ 꽝"] * (총뽑기수 - 당첨수)
     random.shuffle(rewards)
 
     view = KujiView(title=이벤트명, total_count=총뽑기수, rewards=rewards, author=interaction.user)

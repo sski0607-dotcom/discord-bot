@@ -55,24 +55,6 @@ def is_admin_or_mod(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions
     return perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
 
-def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Member]:
-    query = query.strip()
-    if not query:
-        return None
-        
-    # 멘션 형태 (<@123456>) 체크
-    match = re.match(r'<@!?(\d+)>', query)
-    if match:
-        return guild.get_member(int(match.group(1)))
-        
-    # 닉네임, 이름, 별명 부분 일치 검색
-    for m in guild.members:
-        if m.bot:
-            continue
-        if query.lower() in m.display_name.lower() or query.lower() in m.name.lower():
-            return m
-    return None
-
 # --- 직업 목록 ---
 JOBS = [
     "검호", "정식기사", "추적자", "암살자", "위자드",
@@ -113,11 +95,12 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     await interaction.followup.send(f"✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}", ephemeral=True)
 
 
-# --- UI 컴포넌트 ---
+# --- 📝 자기소개 모달 UI (입력 후 채널에 자동 양식 출력) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
     birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 06", required=True, max_length=4)
+    gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -125,29 +108,57 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
+        # 1. 기존 직업 태그 추출
+        current_job = "미선택"
         prefix = ""
-        if "]" in current_nick and current_nick.startswith("["):
-            prefix = current_nick.split("]")[0] + "] "
-            
-        new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {self.birth_year.value}"
+        for j in JOBS:
+            if current_nick.startswith(f"[{j}]"):
+                current_job = j
+                prefix = f"[{j}] "
+                break
+
+        # 2. 나이 계산 (현재 연도 2026년 기준)
+        birth_str = self.birth_year.value.strip()
+        age_display = birth_str
+        try:
+            yy = int(birth_str)
+            full_year = 2000 + yy if yy < 50 else 1900 + yy
+            age = 2026 - full_year + 1
+            age_display = f"{age} ({birth_str})"
+        except Exception:
+            age_display = birth_str
+
+        # 3. 닉네임 변경
+        new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {birth_str}"
         try:
             await user.edit(nick=new_nick)
-            nick_msg = f"✅ 닉네임이 변경되었습니다!\n**{new_nick}**"
         except discord.Forbidden:
-            nick_msg = "⚠️ (닉네임 수정 권한 없음)"
+            pass
 
+        # 4. 수습 담이 역할 부여
         ROLE_NAME = "수습 담이🐣"
         target_role = discord.utils.get(guild.roles, name=ROLE_NAME)
         if target_role:
             try:
                 await user.add_roles(target_role)
-                role_msg = f"\n🔰 **[{ROLE_NAME}]** 역할이 부여되었습니다!"
             except discord.Forbidden:
-                role_msg = f"\n⚠️ 역할 부여 실패"
-        else:
-            role_msg = f"\n⚠️ **[{ROLE_NAME}]** 역할 없음"
+                pass
 
-        await interaction.followup.send(f"{nick_msg}{role_msg}", ephemeral=True)
+        # 5. 채팅방에 전송할 자기소개 텍스트 구성
+        gender_val = self.gender.value.strip() if self.gender.value else "미입력"
+        intro_text = (
+            f"**이름 :** {self.name.value}\n"
+            f"**마크닉 :** {self.mc_name.value}\n"
+            f"**나이 :** {age_display}\n"
+            f"**성별 :** {gender_val}\n"
+            f"**직업 :** {current_job}"
+        )
+
+        # 채널에 공개 전송
+        await interaction.channel.send(content=f"{user.mention} 님의 자기소개\n{intro_text}")
+        
+        # 본인에게만 완료 알림
+        await interaction.followup.send(f"✅ 자기소개가 등록되고 닉네임이 **{new_nick}**(으)로 변경되었습니다!", ephemeral=True)
 
 
 class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
@@ -162,56 +173,6 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
             embed.add_field(name="📌 전달사항", value=self.notice_footer.value, inline=False)
         embed.set_footer(text=f"작성자: {interaction.user.display_name} • {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
         await interaction.followup.send(embed=embed)
-
-
-# 🎯 대규모 인원 추첨 팝업창 모달
-class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
-    event_name = discord.ui.TextInput(label="이벤트명", placeholder="예: 균열석 기부자 추첨", required=True, max_length=50)
-    winner_count = discord.ui.TextInput(label="당첨 인원수 (숫자만)", placeholder="예: 5", required=True, max_length=4)
-    participants_input = discord.ui.TextInput(
-        label="참여자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)", 
-        placeholder="홍길동, 우랄라, 뽀삐\n또는 멘션 나열",
-        style=discord.TextStyle.paragraph, 
-        required=True, 
-        max_length=4000
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        
-        try:
-            w_count = int(self.winner_count.value.strip())
-        except ValueError:
-            await interaction.followup.send("❌ 당첨 인원수에는 숫자만 입력해 주세요!", ephemeral=True)
-            return
-
-        raw_names = [name.strip() for name in re.split(r'[,\n]', self.participants_input.value) if name.strip()]
-        participants = []
-        for name in raw_names:
-            mem = find_guild_member(interaction.guild, name)
-            if mem and mem not in participants:
-                participants.append(mem)
-
-        total_count = len(participants)
-        if total_count < 2:
-            await interaction.followup.send("❌ 최소 2명 이상의 유저를 입력해 주세요!", ephemeral=True)
-            return
-
-        if w_count <= 0 or w_count > total_count:
-            await interaction.followup.send(f"❌ 당첨 인원은 1명 이상, 입력된 총 인원({total_count}명) 이하여야 합니다.", ephemeral=True)
-            return
-
-        winners = random.sample(participants, w_count)
-        winner_mentions = [w.mention for w in winners]
-
-        embed = discord.Embed(
-            title=f"🎉 [추첨 결과] {self.event_name.value}",
-            description=f"총 **{total_count}명** 중 **{w_count}명**이 당첨되었습니다!\n\n👑 **당첨자 명단:**\n" + "\n".join([f"• {w.mention} ({w.display_name})" for w in winners]),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text=f"주최자: {interaction.user.display_name}")
-
-        await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
 
 class JobButton(discord.ui.Button):
@@ -270,32 +231,16 @@ class PollView(discord.ui.View):
 
 
 # --- 은행 대여 반납 버튼 UI ---
-class DynamicLoanButton(discord.ui.DynamicItem[discord.ui.Button], template=r'loan_return:(?P<lender_id>[0-9]+):(?P<borrower_id>[0-9]+)'):
+class LoanView(discord.ui.View):
     def __init__(self, lender_id: int, borrower_id: int):
-        super().__init__(
-            discord.ui.Button(
-                label="반납 완료",
-                style=discord.ButtonStyle.success,
-                emoji="✅",
-                custom_id=f"loan_return:{lender_id}:{borrower_id}"
-            )
-        )
+        super().__init__(timeout=None)
         self.lender_id = lender_id
         self.borrower_id = borrower_id
 
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str], /):
-        lender_id = int(match.group("lender_id"))
-        borrower_id = int(match.group("borrower_id"))
-        return cls(lender_id, borrower_id)
-
-    async def callback(self, interaction: discord.Interaction):
+    @discord.ui.button(label="반납 완료", style=discord.ButtonStyle.success, emoji="✅", custom_id="loan_return_btn")
+    async def return_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.lender_id and interaction.user.id != self.borrower_id and not is_admin_or_mod(interaction):
             await interaction.response.send_message("❌ 빌려준 사람, 빌린 사람 또는 관리자만 반납 처리를 할 수 있습니다.", ephemeral=True)
-            return
-
-        if not interaction.message.embeds:
-            await interaction.response.send_message("❌ 메시지 정보를 읽을 수 없습니다.", ephemeral=True)
             return
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -310,230 +255,16 @@ class DynamicLoanButton(discord.ui.DynamicItem[discord.ui.Button], template=r'lo
                 break
                 
         new_embed.add_field(name="🎉 반납 일시", value=f"{now_str} (확인: {interaction.user.display_name})", inline=False)
+        button.disabled = True
+        button.label = "반납 완료됨"
         
-        self.item.disabled = True
-        self.item.label = "반납 완료됨"
-        
-        view = discord.ui.View(timeout=None)
-        view.add_item(self.item)
-
-        await interaction.response.edit_message(embed=new_embed, view=view)
+        await interaction.response.edit_message(embed=new_embed, view=self)
         await interaction.followup.send(f"✅ **{interaction.user.display_name}** 님이 상환 완료 처리했습니다!", ephemeral=False)
-
-
-class LoanView(discord.ui.View):
-    def __init__(self, lender_id: int, borrower_id: int):
-        super().__init__(timeout=None)
-        self.add_item(DynamicLoanButton(lender_id, borrower_id))
-
-
-# --- 이치방쿠지 데이터 및 UI ---
-KUJI_GAMES: Dict[str, dict] = {}
-
-class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'kuji_draw:(?P<game_id>[a-zA-Z0-9_-]+)'):
-    def __init__(self, game_id: str):
-        super().__init__(
-            discord.ui.Button(
-                label="🎫 쿠지 뽑기!",
-                style=discord.ButtonStyle.primary,
-                emoji="🎁",
-                custom_id=f"kuji_draw:{game_id}"
-            )
-        )
-        self.game_id = game_id
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str], /):
-        game_id = match.group("game_id")
-        return cls(game_id)
-
-    async def callback(self, interaction: discord.Interaction):
-        game = KUJI_GAMES.get(self.game_id)
-        if not game:
-            await interaction.response.send_message("❌ 진행 중인 쿠지 판 정보를 찾을 수 없습니다. (종료되었거나 초기화됨)", ephemeral=True)
-            return
-
-        user_id = interaction.user.id
-
-        if user_id not in game["allowed_users"]:
-            await interaction.response.send_message("❌ 오늘의 균열석 기부자 명단에 등록되지 않아 참여할 수 없습니다!", ephemeral=True)
-            return
-
-        remaining_tickets = game["allowed_users"][user_id]
-        if remaining_tickets <= 0:
-            await interaction.response.send_message("❌ 보유한 뽑기 티켓을 모두 사용하셨습니다!", ephemeral=True)
-            return
-
-        if len(game["box"]) == 0:
-            await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
-            return
-
-        # 뽑기 진행
-        game["allowed_users"][user_id] -= 1
-        picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
-        
-        is_finished = len(game["box"]) == 0
-
-        now_time = datetime.now().strftime("%H:%M")
-        game["history"].append(f"• **{interaction.user.display_name}** ➔ **{picked_prize}** ({now_time})")
-
-        embed = self.build_embed(game)
-        
-        if is_finished:
-            self.item.disabled = True
-            self.item.label = "쿠지 매진 (종료)"
-            self.item.style = discord.ButtonStyle.secondary
-
-        view = discord.ui.View(timeout=None)
-        view.add_item(self.item)
-
-        await interaction.response.edit_message(embed=embed, view=view)
-        
-        # 🎯 꽝 여부 판별하여 알림 멘트 다르게 출력
-        lose_name = game.get("lose_name", "❌ 꽝")
-        if picked_prize == lose_name or "꽝" in picked_prize:
-            result_comment = f"💨 아쉽네요... {interaction.user.mention} 님은 **[{picked_prize}]** (다음 기회에!)"
-        else:
-            result_comment = f"🎉 축하합니다! {interaction.user.mention} 님이 **[{picked_prize}]** 에 당첨되셨습니다!"
-
-        await interaction.followup.send(
-            f"{result_comment} (남은 티켓: {game['allowed_users'][user_id]}장)",
-            ephemeral=False
-        )
-
-    @staticmethod
-    def build_embed(game: dict) -> discord.Embed:
-        total_left = len(game["box"])
-        total_init = game["total_initial"]
-        
-        prize_status = []
-        for prize, count in game["initial_prizes"].items():
-            left_count = game["box"].count(prize)
-            prize_status.append(f"• **{prize}**: `{left_count} / {count}`개 남음")
-
-        desc = (
-            f"**📢 {game['title']}**\n"
-            f"균열석 기부자 전용 이치방쿠지 뽑기판입니다!\n\n"
-            f"📊 **남은 수량:** `{total_left} / {total_init}`장\n"
-        )
-
-        embed = discord.Embed(
-            title="🎪 [이치방쿠지] 균열석 기부자 뽑기판",
-            description=desc,
-            color=discord.Color.gold() if total_left > 0 else discord.Color.dark_grey()
-        )
-
-        embed.add_field(name="🎁 상품 현황", value="\n".join(prize_status), inline=False)
-        
-        if game["history"]:
-            recent_history = game["history"][-5:]
-            embed.add_field(name="📜 최근 당첨 내역", value="\n".join(reversed(recent_history)), inline=False)
-
-        allowed_mentions = [f"<@{uid}>({cnt}회)" for uid, cnt in game["allowed_users"].items() if cnt > 0]
-        if allowed_mentions:
-            embed.add_field(name="🎫 참여 가능 기부자", value=" ".join(allowed_mentions), inline=False)
-        else:
-            embed.add_field(name="🎫 참여 가능 기부자", value="모든 기부자가 티켓을 사용했습니다.", inline=False)
-
-        embed.set_footer(text=f"주최: {game['host']} • 1회 뽑기당 티켓 1장 소모")
-        return embed
-
-
-class KujiCreateModal(discord.ui.Modal, title="🎪 이치방쿠지 뽑기판 생성"):
-    kuji_title = discord.ui.TextInput(label="쿠지 제목", placeholder="예: 균열석 기부 감사 쿠지", required=True, max_length=50)
-    prizes = discord.ui.TextInput(
-        label="당첨 상품 라인업 (상품명:수량 줄바꿈)",
-        placeholder="A상 10만골드:1\nB상 네더라이트 곡괭이:2\nC상 다이아 32개:5\n(※ 꽝은 적지 않아도 총 인원에 맞춰 자동 생성)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000
-    )
-    allowed_donors = discord.ui.TextInput(
-        label="참여 가능 기부자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)",
-        placeholder="홍길동, 알랄라, 뽀삐\n또는 줄바꿈으로 나열",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=2000
-    )
-    default_lose_name = discord.ui.TextInput(label="꽝 상품 이름 (기본값: ❌ 꽝)", placeholder="❌ 꽝", default="❌ 꽝", required=False, max_length=30)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-
-        raw_names = [name.strip() for name in re.split(r'[,\n]', self.allowed_donors.value) if name.strip()]
-        matched_members = []
-        for name in raw_names:
-            mem = find_guild_member(interaction.guild, name)
-            if mem and mem not in matched_members:
-                matched_members.append(mem)
-
-        if not matched_members:
-            await interaction.followup.send("❌ 참여 가능한 기부자를 찾지 못했습니다. 닉네임이나 멘션을 확인해 주세요!", ephemeral=True)
-            return
-
-        total_required_tickets = len(matched_members)
-
-        # 당첨 상품 파싱
-        box = []
-        initial_prizes = {}
-        for line in self.prizes.value.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if ":" in line:
-                parts = line.rsplit(":", 1)
-                p_name = parts[0].strip()
-                try:
-                    p_count = int(parts[1].strip())
-                except ValueError:
-                    p_count = 1
-            else:
-                p_name = line
-                p_count = 1
-
-            initial_prizes[p_name] = p_count
-            box.extend([p_name] * p_count)
-
-        # 🎯 부족한 수량은 꽝으로 자동 채움
-        current_prize_count = len(box)
-        lose_name = self.default_lose_name.value.strip() if self.default_lose_name.value else "❌ 꽝"
-
-        if current_prize_count < total_required_tickets:
-            remaining_lose_count = total_required_tickets - current_prize_count
-            initial_prizes[lose_name] = initial_prizes.get(lose_name, 0) + remaining_lose_count
-            box.extend([lose_name] * remaining_lose_count)
-        elif current_prize_count > total_required_tickets:
-            await interaction.followup.send(
-                f"⚠️ 입력한 당첨 상품 총 개수({current_prize_count}개)가 참여자 인원수({total_required_tickets}명)보다 많습니다! 수량을 조절해 주세요.",
-                ephemeral=True
-            )
-            return
-
-        game_id = f"kuji_{int(datetime.now().timestamp())}_{random.randint(100, 999)}"
-        allowed_users = {m.id: 1 for m in matched_members}
-
-        KUJI_GAMES[game_id] = {
-            "title": self.kuji_title.value,
-            "host": interaction.user.display_name,
-            "box": box,
-            "initial_prizes": initial_prizes,
-            "total_initial": len(box),
-            "allowed_users": allowed_users,
-            "lose_name": lose_name,
-            "history": []
-        }
-
-        embed = DynamicKujiButton.build_embed(KUJI_GAMES[game_id])
-        view = discord.ui.View(timeout=None)
-        view.add_item(DynamicKujiButton(game_id))
-
-        mention_pings = " ".join([m.mention for m in matched_members])
-        await interaction.followup.send(content=f"📢 **균열석 기부자 쿠지 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
 
 
 # --- 슬래시 명령어 ---
 
-@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 출생 연도를 입력하여 닉네임을 설정합니다.")
+@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 출생 연도를 입력하여 닉네임을 설정하고 양식을 출력합니다.")
 async def profile(interaction: discord.Interaction):
     await interaction.response.send_modal(ProfileModal())
 
@@ -590,12 +321,8 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     players = [m.display_name for m in voice_channel.members if not m.bot]
     total_count = len(players)
 
-    if total_count < 2:
-        await interaction.followup.send("❌ 음성 채널에 최소 2명 이상 있어야 합니다.", ephemeral=True)
-        return
-
-    if 당첨인원 <= 0 or 당첨인원 >= total_count:
-        await interaction.followup.send(f"❌ 당첨 인원은 1명 이상 {total_count - 1}명 이하여야 합니다.", ephemeral=True)
+    if total_count < 2 or 당첨인원 <= 0 or 당첨인원 >= total_count:
+        await interaction.followup.send("❌ 인원수 및 당첨자 수를 확인해 주세요.", ephemeral=True)
         return
 
     lose_count = total_count - 당첨인원
@@ -656,7 +383,7 @@ async def clear_messages(interaction: discord.Interaction, 개수: int):
         deleted = await interaction.channel.purge(limit=개수)
         await interaction.followup.send(f"🧹 메시지 **{len(deleted)}개**를 삭제했습니다.", ephemeral=True)
     except discord.Forbidden:
-        await interaction.followup.send("⚠️ 봇에 '메시지 관리' 권한이 없습니다.", ephemeral=True)
+        await interaction.followup.send("⚠️ 메시지 관리 권한이 없습니다.", ephemeral=True)
 
 @bot.tree.command(name="투표", description="버튼식 실시간 투표를 생성합니다. (최대 5개)")
 async def create_poll(
@@ -704,59 +431,52 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     view = LoanView(lender_id=interaction.user.id, borrower_id=빌린사람.id)
     await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
 
-# 🎯 대규모 인원 추첨 명령어
-@bot.tree.command(name="추첨", description="팝업창을 열어 많은 인원을 복사/붙여넣기로 간편하게 추첨합니다.")
-async def open_lottery_modal(interaction: discord.Interaction):
-    await interaction.response.send_modal(LotteryModal())
+@bot.tree.command(name="추첨", description="멘션한 인원들 중에서 당첨자를 무작위 추첨합니다. (인원수 무제한)")
+@app_commands.describe(
+    이벤트명="추첨 이벤트 이름 (예: 균열석 기부자 추첨)",
+    당첨인원="당첨될 인원수 (숫자)",
+    참여자="추첨할 유저들을 모두 멘션하세요 (예: @유저1 @유저2 @유저3 ...)"
+)
+async def lottery_mention(
+    interaction: discord.Interaction,
+    이벤트명: str,
+    당첨인원: int,
+    참여자: str
+):
+    await interaction.response.defer()
+    raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
 
-# 🎪 이치방쿠지 명령어
-@bot.tree.command(name="쿠지생성", description="[관리자] 균열석 기부자를 위한 이치방쿠지 뽑기판을 생성합니다.")
-async def create_kuji(interaction: discord.Interaction):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 쿠지 판을 생성할 수 있습니다.", ephemeral=True)
+    participants = []
+    for uid in raw_ids:
+        member = interaction.guild.get_member(uid)
+        if not member:
+            try:
+                member = await interaction.guild.fetch_member(uid)
+            except Exception:
+                member = None
+        if member and not member.bot and member not in participants:
+            participants.append(member)
+
+    total_count = len(participants)
+    if total_count < 2:
+        await interaction.followup.send("❌ 최소 2명 이상의 유저를 `@유저` 형태로 멘션해 주세요!", ephemeral=True)
         return
-    await interaction.response.send_modal(KujiCreateModal())
 
-@bot.tree.command(name="쿠지티켓지급", description="[관리자] 특정 유저에게 쿠지 뽑기 기회(티켓)를 추가 지급하거나 참여자로 등록합니다.")
-@app_commands.describe(유저="티켓을 지급할 대상", 횟수="추가할 뽑기 횟수 (기본 1회)")
-async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Member, 횟수: Optional[int] = 1):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+    if 당첨인원 <= 0 or 당첨인원 > total_count:
+        await interaction.followup.send(f"❌ 당첨 인원은 1명 이상, 전체 인원({total_count}명) 이하여야 합니다.", ephemeral=True)
         return
 
-    if not KUJI_GAMES:
-        await interaction.response.send_message("❌ 진행 중인 쿠지 판이 없습니다.", ephemeral=True)
-        return
+    winners = random.sample(participants, 당첨인원)
+    winner_mentions = [w.mention for w in winners]
 
-    latest_game_id = list(KUJI_GAMES.keys())[-1]
-    game = KUJI_GAMES[latest_game_id]
-
-    game["allowed_users"][유저.id] = game["allowed_users"].get(유저.id, 0) + (횟수 if 횟수 else 1)
-
-    await interaction.response.send_message(
-        f"✅ **{유저.display_name}** 님에게 쿠지 뽑기 티켓 **{횟수}장**을 지급했습니다! (현재 잔여: **{game['allowed_users'][유저.id]}장**)",
-        ephemeral=True
+    embed = discord.Embed(
+        title=f"🎉 [추첨 결과] {이벤트명}",
+        description=f"총 **{total_count}명** 중 **{당첨인원}명**이 당첨되었습니다!\n\n👑 **당첨자 명단:**\n" + "\n".join([f"• {w.mention} ({w.display_name})" for w in winners]),
+        color=discord.Color.gold()
     )
+    embed.set_footer(text=f"주최자: {interaction.user.display_name}")
 
-# 📋 멤버 닉네임 추출 명령어
-@bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 멤버들의 닉네임을 복사용 텍스트로 출력합니다.")
-@app_commands.describe(역할="목록을 추출할 역할")
-async def extract_role_mentions(interaction: discord.Interaction, 역할: discord.Role):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
-        
-    members = [m for m in 역할.members if not m.bot]
-    if not members:
-        await interaction.response.send_message(f"❌ **{역할.name}** 역할을 가진 유저가 없습니다.", ephemeral=True)
-        return
-
-    name_list = "\n".join([m.display_name for m in members])
-    
-    msg = f"📋 **{역할.name}** 멤버 닉네임 목록 (총 {len(members)}명):\n\n"
-    msg += f"```text\n{name_list}\n```"
-    
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
 # --- 경고 시스템 ---
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")
@@ -824,7 +544,7 @@ async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 
         await interaction.followup.send(f"❌ 차감할 경고가 없습니다.", ephemeral=True)
         return
 
-    deduct = min(개수 if 개수 else 1, len(warnings[u_id]))
+    deduct = min(개수, len(warnings[u_id]))
     warnings[u_id] = warnings[u_id][:-deduct]
     save_warnings(warnings)
     await interaction.followup.send(f"✅ **{유저.display_name}** 님의 경고가 **{deduct}회** 차감되었습니다. (현재: **{len(warnings[u_id])}회**)", ephemeral=True)
@@ -857,14 +577,14 @@ async def manual_sync(ctx):
 @bot.event
 async def on_ready():
     bot.add_view(JobButtonView())
-    bot.add_dynamic_items(DynamicLoanButton)
-    bot.add_dynamic_items(DynamicKujiButton)
     
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ 전역 명령어 {len(synced)}개 동기화 완료!")
-    except Exception as e:
-        print(f"❌ 동기화 오류: {e}")
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"✅ [{guild.name}] 서버에 {len(synced)}개 명령어 즉시 동기화 완료!")
+        except Exception as e:
+            print(f"❌ [{guild.name}] 동기화 오류: {e}")
             
     print(f"로그인 완료: {bot.user.name}")
 

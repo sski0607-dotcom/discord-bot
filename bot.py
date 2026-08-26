@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-# --- 0. 백그라운드 웹 서버 (Render 슬립 방지) ---
+# --- 0. 백그라운드 웹 서버 ---
 app = Flask('')
 
 @app.route('/')
@@ -33,7 +33,6 @@ intents.members = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # --- 경고 데이터 관리 ---
 WARNINGS_FILE = "warnings.json"
@@ -520,7 +519,6 @@ async def lottery_mention(interaction: discord.Interaction, 이벤트명: str, �
 
     await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
-# 🎟️ 심플 쿠지(뽑기판) 생성 명령어
 @bot.tree.command(name="쿠지생성", description="기본 꽝 기반의 심플한 버튼식 쿠지(뽑기판)를 생성합니다. (최대 25개)")
 @app_commands.describe(
     이벤트명="쿠지 이벤트 이름 (예: 균열석 기부 쿠지)",
@@ -538,7 +536,7 @@ async def create_kuji(
     await interaction.response.defer()
 
     if 총뽑기수 < 2 or 총뽑기수 > 25:
-        await interaction.followup.send("❌ 디스코드 버튼 제한으로 인해 전체 뽑기 개수는 **2개 ~ 25개 사이**로 설정해 주세요!", ephemeral=True)
+        await interaction.followup.send("❌ 전체 뽑기 개수는 **2개 ~ 25개 사이**로 설정해 주세요!", ephemeral=True)
         return
 
     if 당첨수 <= 0 or 당첨수 >= 총뽑기수:
@@ -650,12 +648,17 @@ async def manual_sync(ctx):
 @bot.event
 async def on_ready():
     bot.add_view(JobButtonView())
-    
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ 글로벌 명령어 {len(synced)}개 동기화 완료!")
+    except Exception as e:
+        print(f"❌ 글로벌 동기화 오류: {e}")
+
     for guild in bot.guilds:
         try:
             bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"✅ [{guild.name}] 서버에 {len(synced)}개 명령어 즉시 동기화 완료!")
+            synced_guild = await bot.tree.sync(guild=guild)
+            print(f"✅ [{guild.name}] 서버에 {len(synced_guild)}개 명령어 동기화 완료!")
         except Exception as e:
             print(f"❌ [{guild.name}] 동기화 오류: {e}")
             

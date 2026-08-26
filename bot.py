@@ -60,7 +60,7 @@ JOBS = [
     "검호", "정식기사", "추적자", "암살자", "위자드",
     "창성", "진혼자", "바바리안", "비스트테이머", "클레릭",
     "월영의 그림자", "드루이드", "백야기사", "근위대장",
-    "중급 대장장이", "검성", "광부"
+    "중급 대장장이", "검성", "광부", "메이지"
 ]
 
 async def process_job_selection(interaction: discord.Interaction, job_name: str):
@@ -95,11 +95,11 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     await interaction.followup.send(f"✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}", ephemeral=True)
 
 
-# --- 📝 자기소개 모달 UI (입력 후 채널에 자동 양식 출력) ---
+# --- 📝 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
-    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
-    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
-    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 06", required=True, max_length=4)
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 준성", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: Jun_S14", required=True, max_length=25)
+    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 05", required=True, max_length=4)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -108,7 +108,6 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
-        # 1. 기존 직업 태그 추출
         current_job = "미선택"
         prefix = ""
         for j in JOBS:
@@ -117,9 +116,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
                 prefix = f"[{j}] "
                 break
 
-        # 2. 나이 계산 (현재 연도 2026년 기준)
         birth_str = self.birth_year.value.strip()
-        age_display = birth_str
         try:
             yy = int(birth_str)
             full_year = 2000 + yy if yy < 50 else 1900 + yy
@@ -128,14 +125,12 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         except Exception:
             age_display = birth_str
 
-        # 3. 닉네임 변경
         new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {birth_str}"
         try:
             await user.edit(nick=new_nick)
         except discord.Forbidden:
             pass
 
-        # 4. 수습 담이 역할 부여
         ROLE_NAME = "수습 담이🐣"
         target_role = discord.utils.get(guild.roles, name=ROLE_NAME)
         if target_role:
@@ -144,7 +139,6 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             except discord.Forbidden:
                 pass
 
-        # 5. 채팅방에 전송할 자기소개 텍스트 구성
         gender_val = self.gender.value.strip() if self.gender.value else "미입력"
         intro_text = (
             f"**이름 :** {self.name.value}\n"
@@ -154,10 +148,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             f"**직업 :** {current_job}"
         )
 
-        # 채널에 공개 전송
         await interaction.channel.send(content=f"{user.mention} 님의 자기소개\n{intro_text}")
-        
-        # 본인에게만 완료 알림
         await interaction.followup.send(f"✅ 자기소개가 등록되고 닉네임이 **{new_nick}**(으)로 변경되었습니다!", ephemeral=True)
 
 
@@ -262,6 +253,65 @@ class LoanView(discord.ui.View):
         await interaction.followup.send(f"✅ **{interaction.user.display_name}** 님이 상환 완료 처리했습니다!", ephemeral=False)
 
 
+# --- 🎟️ 쿠지(뽑기판) 시스템 UI ---
+class KujiButton(discord.ui.Button):
+    def __init__(self, number: int):
+        super().__init__(label=f"{number}번", style=discord.ButtonStyle.secondary, custom_id=f"kuji_btn_{number}")
+        self.number = number
+
+    async def callback(self, interaction: discord.Interaction):
+        view: KujiView = self.view
+        if self.number in view.picked_results:
+            await interaction.response.send_message("❌ 이미 뽑힌 번호입니다!", ephemeral=True)
+            return
+
+        prize = view.rewards[self.number - 1]
+        view.picked_results[self.number] = (interaction.user, prize)
+        
+        self.disabled = True
+        self.style = discord.ButtonStyle.success if "꽝" not in prize else discord.ButtonStyle.danger
+        self.label = f"{self.number}번(완료)"
+
+        if "꽝" in prize:
+            result_msg = f"💨 **{self.number}번**을 뽑으셨습니다!\n결과: **{prize}** (다음 기회에... 🍀)"
+        else:
+            result_msg = f"🎉🎉 **[축하합니다!]** 🎉🎉\n\n✨ **{self.number}번**을 뽑아 **[{prize}]**에 당첨되셨습니다! 🎁"
+
+        await interaction.response.send_message(result_msg, ephemeral=True)
+        await interaction.message.edit(embed=view.make_embed(), view=view)
+
+
+class KujiView(discord.ui.View):
+    def __init__(self, title: str, total_count: int, rewards: List[str], author: discord.Member):
+        super().__init__(timeout=None)
+        self.title = title
+        self.total_count = total_count
+        self.rewards = rewards
+        self.author = author
+        self.picked_results: Dict[int, tuple] = {} # {number: (user, prize)}
+
+        for num in range(1, total_count + 1):
+            self.add_item(KujiButton(num))
+
+    def make_embed(self) -> discord.Embed:
+        remain_count = self.total_count - len(self.picked_results)
+        desc = (
+            f"🎁 **이벤트:** {self.title}\n"
+            f"🎟️ **남은 뽑기:** {remain_count} / {self.total_count}개\n\n"
+            f"👇 아래 번호 버튼을 눌러 뽑기를 진행하세요! *(결과는 본인에게 즉시 비공개 표시)*\n\n"
+            f"**[ 📋 실시간 진행 현황 ]**\n"
+        )
+        if not self.picked_results:
+            desc += "• 아직 아무도 뽑지 않았습니다. 첫 행운의 주인공이 되어보세요!"
+        else:
+            history = [f"• **{num}번** ➔ {user.display_name} 님 선택 완료" for num, (user, _) in self.picked_results.items()]
+            desc += "\n".join(history[-10:]) # 최근 10개 표시
+
+        embed = discord.Embed(title="🎟️ 실시간 쿠지(뽑기판) 이벤트", description=desc, color=discord.Color.purple())
+        embed.set_footer(text=f"주최자: {self.author.display_name} • 행운을 빕니다! ✨")
+        return embed
+
+
 # --- 슬래시 명령어 ---
 
 @bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 출생 연도를 입력하여 닉네임을 설정하고 양식을 출력합니다.")
@@ -347,11 +397,7 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     참여자="멘션할 유저들을 나열해 주세요 (예: @유저1 @유저2 @유저3 ...)",
     추가메시지="알림에 덧붙일 내용 (선택)"
 )
-async def manual_gold_reminder(
-    interaction: discord.Interaction,
-    참여자: str,
-    추가메시지: Optional[str] = None
-):
+async def manual_gold_reminder(interaction: discord.Interaction, 참여자: str, 추가메시지: Optional[str] = None):
     await interaction.response.defer()
     raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
     
@@ -437,12 +483,7 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
     당첨인원="당첨될 인원수 (숫자)",
     참여자="추첨할 유저들을 모두 멘션하세요 (예: @유저1 @유저2 @유저3 ...)"
 )
-async def lottery_mention(
-    interaction: discord.Interaction,
-    이벤트명: str,
-    당첨인원: int,
-    참여자: str
-):
+async def lottery_mention(interaction: discord.Interaction, 이벤트명: str, 당첨인원: int, 참여자: str):
     await interaction.response.defer()
     raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
 
@@ -477,6 +518,58 @@ async def lottery_mention(
     embed.set_footer(text=f"주최자: {interaction.user.display_name}")
 
     await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
+
+# 🎟️ 쿠지(뽑기판) 생성 명령어 (최대 25개 버튼 안전 지원)
+@bot.tree.command(name="쿠지생성", description="버튼식 실시간 쿠지(뽑기판) 이벤트를 생성합니다. (최대 25개)")
+@app_commands.describe(
+    이벤트명="쿠지 이벤트 이름 (예: 균열석 기부자 쿠지)",
+    총뽑기수="전체 뽑기 개수 (2~25 사이)",
+    _1등상품="1등 상품 이름",
+    _1등수량="1등 당첨 개수",
+    _2등상품="2등 상품 이름 (선택)",
+    _2등수량="2등 당첨 개수 (선택)",
+    _3등상품="3등 상품 이름 (선택)",
+    _3등수량="3등 당첨 개수 (선택)",
+    꽝항목="꽝 텍스트 (기본값: 꽝)"
+)
+async def create_kuji(
+    interaction: discord.Interaction,
+    이벤트명: str,
+    총뽑기수: int,
+    _1등상품: str,
+    _1등수량: int,
+    _2등상품: Optional[str] = None,
+    _2등수량: Optional[int] = 0,
+    _3등상품: Optional[str] = None,
+    _3등수량: Optional[int] = 0,
+    꽝항목: str = "❌ 꽝"
+):
+    await interaction.response.defer()
+
+    if 총뽑기수 < 2 or 총뽑기수 > 25:
+        await interaction.followup.send("❌ 디스코드 버튼 제한으로 인해 전체 뽑기 개수는 **2개 ~ 25개 사이**로 설정해 주세요!", ephemeral=True)
+        return
+
+    q2 = _2등수량 if _2등수량 else 0
+    q3 = _3등수량 if _3등수량 else 0
+    total_winners = _1등수량 + q2 + q3
+
+    if total_winners > 총뽑기수:
+        await interaction.followup.send(f"❌ 당첨 상품의 총 수량({total_winners}개)이 전체 뽑기 수({총뽑기수}개)보다 많습니다.", ephemeral=True)
+        return
+
+    rewards = [_1등상품] * _1등수량
+    if _2등상품 and q2 > 0:
+        rewards += [_2등상품] * q2
+    if _3등상품 and q3 > 0:
+        rewards += [_3등상품] * q3
+
+    lose_count = 총뽑기수 - len(rewards)
+    rewards += [꽝항목] * lose_count
+    random.shuffle(rewards)
+
+    view = KujiView(title=이벤트명, total_count=총뽑기수, rewards=rewards, author=interaction.user)
+    await interaction.followup.send(embed=view.make_embed(), view=view)
 
 # --- 경고 시스템 ---
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")

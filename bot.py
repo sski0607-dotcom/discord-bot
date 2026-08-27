@@ -66,10 +66,11 @@ def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Memb
         return guild.get_member(int(match.group(1)))
         
     # 닉네임, 이름, 별명 부분 일치 검색
+    query_lower = query.lower()
     for m in guild.members:
         if m.bot:
             continue
-        if query.lower() in m.display_name.lower() or query.lower() in m.name.lower():
+        if query_lower in m.display_name.lower() or query_lower in m.name.lower():
             return m
     return None
 
@@ -347,7 +348,9 @@ class LoanView(discord.ui.View):
         self.add_item(DynamicLoanButton(lender_id, borrower_id))
 
 
-# --- 정해진 수량만큼만 뽑히는 이치방쿠지 제비뽑기 UI ---
+# --- 정해진 수량만큼 뽑히는 쿠지 데이터 및 UI ---
+KUJI_GAMES: Dict[str, dict] = {}
+
 class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'kuji_draw:(?P<game_id>[a-zA-Z0-9_-]+)'):
     def __init__(self, game_id: str):
         super().__init__(
@@ -422,7 +425,6 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         total_left = len(game["box"])
         total_init = game["total_initial"]
         
-        # 각 상품별 남은 수량 표시
         prize_status = []
         for prize, count in game["initial_prizes"].items():
             left_count = game["box"].count(prize)
@@ -510,7 +512,6 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
             initial_prizes[p_name] = p_count
             box.extend([p_name] * p_count)
 
-        # 🎯 부족한 수량만큼 꽝으로 채워 총 수량 일치
         current_prize_count = len(box)
         lose_name = self.default_lose_name.value.strip() if self.default_lose_name.value else "❌ 꽝"
 
@@ -545,6 +546,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
         mention_pings = " ".join([m.mention for m in matched_members])
         await interaction.followup.send(content=f"📢 **균열석 기부자 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
+
 
 # --- 슬래시 명령어 ---
 
@@ -724,8 +726,8 @@ async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Memb
 async def open_lottery_modal(interaction: discord.Interaction):
     await interaction.response.send_modal(LotteryModal())
 
-# 🎪 독립확률형 쿠지 명령어
-@bot.tree.command(name="쿠지생성", description="[관리자] 균열석 기부자를 위한 독립확률 뽑기판을 생성합니다.")
+# 🎪 쿠지 명령어
+@bot.tree.command(name="쿠지생성", description="[관리자] 균열석 기부자를 위한 뽑기판을 생성합니다.")
 async def create_kuji(interaction: discord.Interaction):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 쿠지 판을 생성할 수 있습니다.", ephemeral=True)

@@ -347,9 +347,7 @@ class LoanView(discord.ui.View):
         self.add_item(DynamicLoanButton(lender_id, borrower_id))
 
 
-# --- 독립 확률형 쿠지 데이터 및 UI ---
-KUJI_GAMES: Dict[str, dict] = {}
-
+# --- 정해진 수량만큼만 뽑히는 이치방쿠지 제비뽑기 UI ---
 class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'kuji_draw:(?P<game_id>[a-zA-Z0-9_-]+)'):
     def __init__(self, game_id: str):
         super().__init__(
@@ -370,13 +368,12 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
     async def callback(self, interaction: discord.Interaction):
         game = KUJI_GAMES.get(self.game_id)
         if not game:
-            await interaction.response.send_message("❌ 진행 중인 쿠지 판 정보를 찾을 수 없습니다. (종료되었거나 초기화됨)", ephemeral=True)
+            await interaction.response.send_message("❌ 진행 중인 쿠지 판 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
         user_id = interaction.user.id
-
         if user_id not in game["allowed_users"]:
-            await interaction.response.send_message("❌ 오늘의 균열석 기부자 명단에 등록되지 않아 참여할 수 없습니다!", ephemeral=True)
+            await interaction.response.send_message("❌ 참여 대상자가 아닙니다!", ephemeral=True)
             return
 
         remaining_tickets = game["allowed_users"][user_id]
@@ -384,31 +381,31 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
             await interaction.response.send_message("❌ 보유한 뽑기 티켓을 모두 사용하셨습니다!", ephemeral=True)
             return
 
-        # 🎯 [독립 확률 뽑기] 상자에서 빼지 않고, 언제 뽑든 항상 동일한 독립 확률로 추첨!
+        if len(game["box"]) == 0:
+            await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
+            return
+
+        # 🎯 상자에서 1장을 실제로 꺼내 소진 (정해진 수량 초과 방지)
         game["allowed_users"][user_id] -= 1
-        picked_prize = random.choice(game["prize_pool"])
-
-        # 당첨 횟수 통계 업데이트
-        game["win_stats"][picked_prize] = game["win_stats"].get(picked_prize, 0) + 1
-
-        # 당첨 히스토리 기록
+        picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
+        
+        is_finished = len(game["box"]) == 0
         now_time = datetime.now().strftime("%H:%M")
         game["history"].append(f"• **{interaction.user.display_name}** ➔ **{picked_prize}** ({now_time})")
 
-        # 모든 유저가 티켓을 다 썼는지 체크
-        all_done = all(cnt <= 0 for cnt in game["allowed_users"].values())
-        if all_done:
+        embed = self.build_embed(game)
+        
+        if is_finished:
             self.item.disabled = True
-            self.item.label = "쿠지 마감 (전원 참여 완료)"
+            self.item.label = "쿠지 매진 (종료)"
             self.item.style = discord.ButtonStyle.secondary
 
-        embed = self.build_embed(game)
         view = discord.ui.View(timeout=None)
         view.add_item(self.item)
 
         await interaction.response.edit_message(embed=embed, view=view)
         
-        # 멘트 분기 (꽝 vs 당첨)
+        # 꽝 판별 및 멘트 출력
         lose_name = game.get("lose_name", "❌ 꽝")
         if picked_prize == lose_name or "꽝" in picked_prize:
             result_comment = f"💨 아쉽네요... {interaction.user.mention} 님은 **[{picked_prize}]** (다음 기회에!)"
@@ -422,28 +419,28 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
 
     @staticmethod
     def build_embed(game: dict) -> discord.Embed:
-        total_pool = len(game["prize_pool"])
+        total_left = len(game["box"])
+        total_init = game["total_initial"]
         
-        # 상품별 독립 확률 및 총 당첨 횟수 표시
+        # 각 상품별 남은 수량 표시
         prize_status = []
         for prize, count in game["initial_prizes"].items():
-            prob = (count / total_pool) * 100
-            won = game["win_stats"].get(prize, 0)
-            prize_status.append(f"• **{prize}**: 확률 `{prob:.1f}%` (현재 총 {won}회 당첨)")
+            left_count = game["box"].count(prize)
+            prize_status.append(f"• **{prize}**: 남은 수량 `{left_count} / {count}`개")
 
         desc = (
             f"**📢 {game['title']}**\n"
-            f"균열석 기부자 전용 독립확률형 뽑기판입니다!\n"
-            f"누가 언제 뽑든 **항상 공평한 고정 독립 확률**로 추첨됩니다. ✨\n"
+            f"균열석 기부자 전용 뽑기판입니다!\n\n"
+            f"📊 **전체 잔여 쿠지:** `{total_left} / {total_init}`장\n"
         )
 
         embed = discord.Embed(
-            title="🎪 [균열석 기부자] 럭키 뽑기판",
+            title="🎪 [균열석 기부자] 뽑기판",
             description=desc,
-            color=discord.Color.gold()
+            color=discord.Color.gold() if total_left > 0 else discord.Color.dark_grey()
         )
 
-        embed.add_field(name="🎁 상품 및 확률 안내", value="\n".join(prize_status), inline=False)
+        embed.add_field(name="🎁 상품 잔여 현황", value="\n".join(prize_status), inline=False)
         
         if game["history"]:
             recent_history = game["history"][-5:]
@@ -451,11 +448,11 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
 
         allowed_mentions = [f"<@{uid}>({cnt}회)" for uid, cnt in game["allowed_users"].items() if cnt > 0]
         if allowed_mentions:
-            embed.add_field(name="🎫 참여 대기 중인 기부자", value=" ".join(allowed_mentions), inline=False)
+            embed.add_field(name="🎫 참여 가능 기부자", value=" ".join(allowed_mentions), inline=False)
         else:
             embed.add_field(name="🎫 참여 상태", value="✅ 모든 기부자가 참여를 완료했습니다!", inline=False)
 
-        embed.set_footer(text=f"주최: {game['host']} • 독립 확률 적용 (공평 추첨)")
+        embed.set_footer(text=f"주최: {game['host']} • 1회 뽑기당 티켓 1장 소모")
         return embed
 
 
@@ -463,7 +460,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
     kuji_title = discord.ui.TextInput(label="뽑기 제목", placeholder="예: 균열석 기부 감사 뽑기", required=True, max_length=50)
     prizes = discord.ui.TextInput(
         label="당첨 상품 라인업 (상품명:수량 줄바꿈)",
-        placeholder="A상 10만골드:1\nB상 네더라이트 곡괭이:2\nC상 다이아 32개:5\n(※ 꽝은 적지 않아도 총 인원에 맞춰 자동 생성)",
+        placeholder="기어 4개:2\n기어 2개:2\n(※ 꽝은 적지 않아도 총 인원에 맞춰 자동 생성)",
         style=discord.TextStyle.paragraph,
         required=True,
         max_length=1000
@@ -493,7 +490,6 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
         total_required_tickets = len(matched_members)
 
-        # 당첨 상품 파싱
         box = []
         initial_prizes = {}
         for line in self.prizes.value.strip().split("\n"):
@@ -514,7 +510,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
             initial_prizes[p_name] = p_count
             box.extend([p_name] * p_count)
 
-        # 부족한 개수는 꽝으로 채워 총 인원수 기준 확률 구성
+        # 🎯 부족한 수량만큼 꽝으로 채워 총 수량 일치
         current_prize_count = len(box)
         lose_name = self.default_lose_name.value.strip() if self.default_lose_name.value else "❌ 꽝"
 
@@ -524,7 +520,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
             box.extend([lose_name] * remaining_lose_count)
         elif current_prize_count > total_required_tickets:
             await interaction.followup.send(
-                f"⚠️ 입력한 당첨 상품 총 개수({current_prize_count}개)가 참여자 인원수({total_required_tickets}명)보다 많습니다! 수량을 조절해 주세요.",
+                f"⚠️ 입력한 당첨 상품 총 개수({current_prize_count}개)가 참여자 인원수({total_required_tickets}명)보다 많습니다!",
                 ephemeral=True
             )
             return
@@ -535,11 +531,11 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
         KUJI_GAMES[game_id] = {
             "title": self.kuji_title.value,
             "host": interaction.user.display_name,
-            "prize_pool": box,
+            "box": box,
             "initial_prizes": initial_prizes,
+            "total_initial": len(box),
             "allowed_users": allowed_users,
             "lose_name": lose_name,
-            "win_stats": {p: 0 for p in initial_prizes.keys()},
             "history": []
         }
 
@@ -549,7 +545,6 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
         mention_pings = " ".join([m.mention for m in matched_members])
         await interaction.followup.send(content=f"📢 **균열석 기부자 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
-
 
 # --- 슬래시 명령어 ---
 

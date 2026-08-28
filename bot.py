@@ -88,28 +88,42 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     member = interaction.user
     prefix = f"[{job_name}]"
     
+    # 1. 기존 직업 역할들 모두 안전하게 제거
     for j in JOBS:
         role = discord.utils.get(guild.roles, name=j)
         if role and role in member.roles:
-            await member.remove_roles(role)
+            try:
+                await member.remove_roles(role)
+            except discord.Forbidden:
+                pass
             
+    # 2. 새 직업 역할 부여
     new_role = discord.utils.get(guild.roles, name=job_name)
     if not new_role:
-        new_role = await guild.create_role(name=job_name)
-    await member.add_roles(new_role)
-    
-    original_name = member.display_name
-    for j in JOBS:
-        tag = f"[{j}]"
-        if original_name.startswith(tag):
-            original_name = original_name.replace(tag, "").strip()
+        try:
+            new_role = await guild.create_role(name=job_name)
+        except discord.Forbidden:
+            new_role = None
             
-    new_nickname = f"{prefix} {original_name}"
+    if new_role:
+        try:
+            await member.add_roles(new_role)
+        except discord.Forbidden:
+            pass
+    
+    # 3. 닉네임 앞의 기존 직업 태그([xxx]) 완벽 제거 후 1개만 부착
+    original_name = member.display_name
+    cleaned_name = re.sub(r'^\[.*?\]\s*', '', original_name).strip()
+    new_nickname = f"{prefix} {cleaned_name}"
+    
+    if len(new_nickname) > 32:
+        new_nickname = new_nickname[:32]
+
     try:
         await member.edit(nick=new_nickname)
         nickname_msg = f"닉네임이 **{new_nickname}**(으)로 변경되었습니다!"
     except discord.Forbidden:
-        nickname_msg = "(⚠️ 닉네임 자동 변경 권한 부족)"
+        nickname_msg = "(⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경 불가)"
 
     await interaction.followup.send(f"✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}", ephemeral=True)
 
@@ -235,9 +249,15 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
         await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
 
+# --- 직업 버튼 UI (5개씩 한 줄로 배치) ---
 class JobButton(discord.ui.Button):
-    def __init__(self, job_name: str):
-        super().__init__(label=job_name, style=discord.ButtonStyle.primary, custom_id=f"job_button_{job_name}")
+    def __init__(self, job_name: str, row: int):
+        super().__init__(
+            label=job_name, 
+            style=discord.ButtonStyle.primary, 
+            custom_id=f"job_button_{job_name}",
+            row=row
+        )
         self.job_name = job_name
 
     async def callback(self, interaction: discord.Interaction):
@@ -246,8 +266,9 @@ class JobButton(discord.ui.Button):
 class JobButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        for job in JOBS[:25]:
-            self.add_item(JobButton(job))
+        for idx, job in enumerate(JOBS[:25]):
+            row_num = idx // 5
+            self.add_item(JobButton(job, row=row_num))
 
 
 class PollButton(discord.ui.Button):
@@ -388,7 +409,7 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
             await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
             return
 
-        # 🎯 상자에서 1장을 실제로 꺼내 소진 (정해진 수량 초과 방지)
+        # 상자에서 1장을 실제로 꺼내 소진 (정해진 수량 초과 방지)
         game["allowed_users"][user_id] -= 1
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         

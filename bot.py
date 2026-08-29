@@ -415,7 +415,15 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         
         is_finished = len(game["box"]) == 0
         now_time = datetime.now().strftime("%H:%M")
-        game["history"].append(f"• **{interaction.user.display_name}** ➔ **{picked_prize}** ({now_time})")
+        
+        # 전체 히스토리 기록
+        record = {
+            "user_id": user_id,
+            "user_name": interaction.user.display_name,
+            "prize": picked_prize,
+            "time": now_time
+        }
+        game["history"].append(record)
 
         embed = self.build_embed(game)
         
@@ -466,8 +474,8 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         embed.add_field(name="🎁 상품 잔여 현황", value="\n".join(prize_status), inline=False)
         
         if game["history"]:
-            recent_history = game["history"][-5:]
-            embed.add_field(name="📜 최근 당첨 내역", value="\n".join(reversed(recent_history)), inline=False)
+            recent_lines = [f"• **{r['user_name']}** ➔ **{r['prize']}** ({r['time']})" for r in game["history"][-5:]]
+            embed.add_field(name="📜 최근 당첨 내역", value="\n".join(reversed(recent_lines)), inline=False)
 
         allowed_mentions = [f"<@{uid}>({cnt}회)" for uid, cnt in game["allowed_users"].items() if cnt > 0]
         if allowed_mentions:
@@ -775,6 +783,54 @@ async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Memb
         f"✅ **{유저.display_name}** 님에게 뽑기 티켓 **{횟수}장**을 지급했습니다! (현재 잔여: **{game['allowed_users'][유저.id]}장**)",
         ephemeral=True
     )
+
+# 🏆 [추가] 쿠지 당첨자 전체 명단 조회 명령어
+@bot.tree.command(name="쿠지당첨자", description="진행 중인 쿠지의 전체 당첨자 명단 및 결과를 확인합니다.")
+async def show_kuji_winners(interaction: discord.Interaction):
+    await interaction.response.defer()
+    if not KUJI_GAMES:
+        await interaction.followup.send("❌ 진행 중이거나 등록된 쿠지 판이 없습니다.")
+        return
+
+    latest_game_id = list(KUJI_GAMES.keys())[-1]
+    game = KUJI_GAMES[latest_game_id]
+    history = game.get("history", [])
+    lose_name = game.get("lose_name", "❌ 꽝")
+
+    if not history:
+        await interaction.followup.send(f"📢 **{game['title']}**\n아직 아무도 뽑기를 진행하지 않았습니다.")
+        return
+
+    # 당첨자(꽝 제외)와 꽝 목록 분류
+    winners_list = []
+    losers_list = []
+    for r in history:
+        line = f"• <@{r['user_id']}> ({r['user_name']}) ➔ **{r['prize']}** *({r['time']})*"
+        if r['prize'] == lose_name or "꽝" in r['prize']:
+            losers_list.append(line)
+        else:
+            winners_list.append(line)
+
+    embed = discord.Embed(
+        title=f"🏆 [{game['title']}] 당첨 결과 목록",
+        description=f"총 `{len(history)}회` 뽑기가 진행되었습니다.",
+        color=discord.Color.gold()
+    )
+
+    if winners_list:
+        embed.add_field(name="🎁 당첨자 명단", value="\n".join(winners_list), inline=False)
+    else:
+        embed.add_field(name="🎁 당첨자 명단", value="아직 당첨자가 없습니다.", inline=False)
+
+    if losers_list:
+        embed.add_field(name="💨 꽝 명단", value="\n".join(losers_list), inline=False)
+
+    # 아직 뽑지 않은 인원 확인
+    not_played = [f"<@{uid}>" for uid, count in game["allowed_users"].items() if count > 0]
+    if not_played:
+        embed.add_field(name="⏳ 미참여 인원", value=" ".join(not_played), inline=False)
+
+    await interaction.followup.send(embed=embed)
 
 # 📋 멤버 닉네임 추출 명령어
 @bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 멤버들의 닉네임을 복사용 텍스트로 출력합니다.")

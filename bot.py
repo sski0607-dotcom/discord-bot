@@ -60,12 +60,10 @@ def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Memb
     if not query:
         return None
         
-    # 멘션 형태 (<@123456>) 체크
     match = re.match(r'<@!?(\d+)>', query)
     if match:
         return guild.get_member(int(match.group(1)))
         
-    # 닉네임, 이름, 별명 부분 일치 검색
     query_lower = query.lower()
     for m in guild.members:
         if m.bot:
@@ -88,7 +86,6 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     member = interaction.user
     prefix = f"[{job_name}]"
     
-    # 1. 기존 직업 역할들 모두 안전하게 제거
     for j in JOBS:
         role = discord.utils.get(guild.roles, name=j)
         if role and role in member.roles:
@@ -97,7 +94,6 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
             except discord.Forbidden:
                 pass
             
-    # 2. 새 직업 역할 부여
     new_role = discord.utils.get(guild.roles, name=job_name)
     if not new_role:
         try:
@@ -111,7 +107,6 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
         except discord.Forbidden:
             pass
     
-    # 3. 닉네임 앞의 기존 직업 태그([xxx]) 완벽 제거 후 1개만 부착
     original_name = member.display_name
     cleaned_name = re.sub(r'^\[.*?\]\s*', '', original_name).strip()
     new_nickname = f"{prefix} {cleaned_name}"
@@ -249,7 +244,7 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
         await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
 
 
-# --- 직업 버튼 UI (5개씩 한 줄로 배치) ---
+# --- 직업 버튼 UI ---
 class JobButton(discord.ui.Button):
     def __init__(self, job_name: str, row: int):
         super().__init__(
@@ -409,14 +404,12 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
             await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
             return
 
-        # 상자에서 1장을 실제로 꺼내 소진 (정해진 수량 초과 방지)
         game["allowed_users"][user_id] -= 1
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         
         is_finished = len(game["box"]) == 0
         now_time = datetime.now().strftime("%H:%M")
         
-        # 전체 히스토리 기록
         record = {
             "user_id": user_id,
             "user_name": interaction.user.display_name,
@@ -437,7 +430,6 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
 
         await interaction.response.edit_message(embed=embed, view=view)
         
-        # 꽝 판별 및 멘트 출력
         lose_name = game.get("lose_name", "❌ 꽝")
         if picked_prize == lose_name or "꽝" in picked_prize:
             result_comment = f"💨 아쉽네요... {interaction.user.mention} 님은 **[{picked_prize}]** (다음 기회에!)"
@@ -784,8 +776,8 @@ async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Memb
         ephemeral=True
     )
 
-# 🏆 [추가] 쿠지 당첨자 전체 명단 조회 명령어
-@bot.tree.command(name="쿠지당첨자", description="진행 중인 쿠지의 전체 당첨자 명단 및 결과를 확인합니다.")
+# 🏆 가장 최근 쿠지 당첨자 명단 조회 명령어
+@bot.tree.command(name="쿠지당첨자", description="가장 최근에 진행된 쿠지의 당첨자 명단 및 결과를 확인합니다.")
 async def show_kuji_winners(interaction: discord.Interaction):
     await interaction.response.defer()
     if not KUJI_GAMES:
@@ -801,7 +793,6 @@ async def show_kuji_winners(interaction: discord.Interaction):
         await interaction.followup.send(f"📢 **{game['title']}**\n아직 아무도 뽑기를 진행하지 않았습니다.")
         return
 
-    # 당첨자(꽝 제외)와 꽝 목록 분류
     winners_list = []
     losers_list = []
     for r in history:
@@ -812,7 +803,7 @@ async def show_kuji_winners(interaction: discord.Interaction):
             winners_list.append(line)
 
     embed = discord.Embed(
-        title=f"🏆 [{game['title']}] 당첨 결과 목록",
+        title=f"🏆 [최근 뽑기 결과] {game['title']}",
         description=f"총 `{len(history)}회` 뽑기가 진행되었습니다.",
         color=discord.Color.gold()
     )
@@ -825,7 +816,6 @@ async def show_kuji_winners(interaction: discord.Interaction):
     if losers_list:
         embed.add_field(name="💨 꽝 명단", value="\n".join(losers_list), inline=False)
 
-    # 아직 뽑지 않은 인원 확인
     not_played = [f"<@{uid}>" for uid, count in game["allowed_users"].items() if count > 0]
     if not_played:
         embed.add_field(name="⏳ 미참여 인원", value=" ".join(not_played), inline=False)
@@ -902,6 +892,34 @@ async def check_warnings(interaction: discord.Interaction, 유저: Optional[disc
         title=f"📋 [{target.display_name}] 님의 경고 내역",
         description=f"총 누적: **{count}회**\n\n" + "\n".join(lines),
         color=discord.Color.orange()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 📋 [추가] 서버 전체 경고 보유자 목록 조회 명령어
+@bot.tree.command(name="경고목록", description="[관리자 전용] 현재 경고를 보유 중인 모든 유저의 목록을 확인합니다.")
+async def show_all_warnings(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    warnings = load_warnings()
+    active_warns = {uid: recs for uid, recs in warnings.items() if len(recs) > 0}
+
+    if not active_warns:
+        await interaction.followup.send("✨ 현재 서버에 경고를 받은 유저가 한 명도 없습니다!", ephemeral=True)
+        return
+
+    warn_lines = []
+    for uid, records in active_warns.items():
+        member = interaction.guild.get_member(int(uid))
+        name = member.display_name if member else f"(서버 탈퇴/ID: {uid})"
+        warn_lines.append(f"• <@{uid}> (**{name}**) : **{len(records)}회**")
+
+    embed = discord.Embed(
+        title="🚨 [관리자] 서버 경고 누적 유저 목록",
+        description=f"총 **{len(warn_lines)}명**의 유저가 경고를 보유 중입니다.\n\n" + "\n".join(warn_lines),
+        color=discord.Color.red()
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 

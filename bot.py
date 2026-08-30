@@ -35,21 +35,70 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# --- 경고 데이터 관리 ---
-WARNINGS_FILE = "warnings.json"
+# 🚨 [중요] 경고 데이터를 영구 보관할 비공개 채널 ID를 입력하세요!
+WARN_LOG_CHANNEL_ID = 1542004718606487672  # 👈 여기에 복사한 채널 ID 숫자를 넣어주세요
 
-def load_warnings() -> dict:
-    if os.path.exists(WARNINGS_FILE):
+# --- 채널 기반 영구 경고 데이터 관리 ---
+async def fetch_warnings_from_channel(guild: discord.Guild) -> dict:
+    if WARN_LOG_CHANNEL_ID == 0:
+        return {}
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
         try:
-            with open(WARNINGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
         except Exception:
             return {}
-    return {}
 
-def save_warnings(data: dict):
-    with open(WARNINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    warnings = {}
+    async for message in channel.history(limit=500, oldest_first=True):
+        if message.author == bot.user and message.embeds:
+            for embed in message.embeds:
+                if embed.footer and embed.footer.text and embed.footer.text.startswith("WARN_DATA:"):
+                    try:
+                        raw_data = embed.footer.text.replace("WARN_DATA:", "").strip()
+                        data = json.loads(raw_data)
+                        u_id = str(data["user_id"])
+                        action = data.get("action", "add")
+                        
+                        if action == "add":
+                            if u_id not in warnings:
+                                warnings[u_id] = []
+                            warnings[u_id].append({
+                                "reason": data["reason"],
+                                "moderator": data["moderator"],
+                                "date": data["date"]
+                            })
+                        elif action == "remove":
+                            deduct = data.get("count", 1)
+                            if u_id in warnings:
+                                warnings[u_id] = warnings[u_id][:-deduct]
+                        elif action == "clear":
+                            if u_id in warnings:
+                                warnings[u_id] = []
+                    except Exception:
+                        continue
+    return warnings
+
+async def log_warning_action(guild: discord.Guild, user_id: int, action: str, data: dict):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    embed = discord.Embed(
+        title=f"🔒 [경고 DB 로그] {action.upper()}",
+        color=discord.Color.dark_grey()
+    )
+    embed.add_field(name="Target User ID", value=str(user_id), inline=True)
+    embed.add_field(name="Action", value=action, inline=True)
+    
+    payload = {"user_id": user_id, "action": action, **data}
+    embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
 
 def is_admin_or_mod(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions
@@ -842,7 +891,7 @@ async def extract_role_mentions(interaction: discord.Interaction, 역할: discor
     
     await interaction.response.send_message(msg, ephemeral=True)
 
-# --- 경고 시스템 ---
+# --- 영구 보존 경고 시스템 ---
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")
 @app_commands.describe(유저="대상 멤버", 사유="경고 사유")
 async def warn_user(interaction: discord.Interaction, 유저: discord.Member, 사유: str):
@@ -854,15 +903,14 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
         await interaction.followup.send("❌ 봇에게는 부여할 수 없습니다.", ephemeral=True)
         return
 
-    warnings = load_warnings()
-    u_id = str(유저.id)
-    if u_id not in warnings:
-        warnings[u_id] = []
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    warnings[u_id].append({"reason": 사유, "moderator": interaction.user.display_name, "date": now_str})
-    save_warnings(warnings)
+    warn_entry = {"reason": 사유, "moderator": interaction.user.display_name, "date": now_str}
+    
+    await log_warning_action(interaction.guild, 유저.id, "add", warn_entry)
+    
+    warnings = await fetch_warnings_from_channel(interaction.guild)
+    count = len(warnings.get(str(유저.id), []))
 
-    count = len(warnings[u_id])
     embed = discord.Embed(
         title="⚠️ 경고가 부여되었습니다",
         description=f"{유저.mention} 님에게 경고가 1회 누적되었습니다.",
@@ -871,15 +919,17 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
     embed.add_field(name="👤 대상자", value=유저.display_name, inline=True)
     embed.add_field(name="🚨 누적 횟수", value=f"**{count}회**", inline=True)
     embed.add_field(name="📝 사유", value=사유, inline=False)
+    
     await interaction.channel.send(content=유저.mention, embed=embed)
-    await interaction.followup.send(f"✅ {유저.display_name} 님에게 경고를 부여했습니다.", ephemeral=True)
+    await interaction.followup.send(f"✅ {유저.display_name} 님에게 경고를 부여했습니다. (누적: {count}회)", ephemeral=True)
 
 @bot.tree.command(name="경고확인", description="경고 내역을 확인합니다.")
 @app_commands.describe(유저="조회할 대상 멤버 (비워두면 본인)")
 async def check_warnings(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
     await interaction.response.defer(ephemeral=True)
     target = 유저 if 유저 else interaction.user
-    warnings = load_warnings()
+    
+    warnings = await fetch_warnings_from_channel(interaction.guild)
     records = warnings.get(str(target.id), [])
     count = len(records)
 
@@ -895,7 +945,6 @@ async def check_warnings(interaction: discord.Interaction, 유저: Optional[disc
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 📋 [추가] 서버 전체 경고 보유자 목록 조회 명령어
 @bot.tree.command(name="경고목록", description="[관리자 전용] 현재 경고를 보유 중인 모든 유저의 목록을 확인합니다.")
 async def show_all_warnings(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -903,7 +952,7 @@ async def show_all_warnings(interaction: discord.Interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    warnings = load_warnings()
+    warnings = await fetch_warnings_from_channel(interaction.guild)
     active_warns = {uid: recs for uid, recs in warnings.items() if len(recs) > 0}
 
     if not active_warns:
@@ -930,16 +979,18 @@ async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 
     if not is_admin_or_mod(interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
-    warnings = load_warnings()
+        
+    warnings = await fetch_warnings_from_channel(interaction.guild)
     u_id = str(유저.id)
     if u_id not in warnings or len(warnings[u_id]) == 0:
-        await interaction.followup.send(f"❌ 차감할 경고가 없습니다.", ephemeral=True)
+        await interaction.followup.send("❌ 차감할 경고가 없습니다.", ephemeral=True)
         return
 
     deduct = min(개수 if 개수 else 1, len(warnings[u_id]))
-    warnings[u_id] = warnings[u_id][:-deduct]
-    save_warnings(warnings)
-    await interaction.followup.send(f"✅ **{유저.display_name}** 님의 경고가 **{deduct}회** 차감되었습니다. (현재: **{len(warnings[u_id])}회**)", ephemeral=True)
+    await log_warning_action(interaction.guild, 유저.id, "remove", {"count": deduct})
+    
+    new_count = len(warnings[u_id]) - deduct
+    await interaction.followup.send(f"✅ **{유저.display_name}** 님의 경고가 **{deduct}회** 차감되었습니다. (현재: **{new_count}회**)", ephemeral=True)
 
 @bot.tree.command(name="경고초기화", description="[관리자 전용] 경고를 초기화합니다.")
 @app_commands.describe(유저="대상 멤버")
@@ -948,11 +999,8 @@ async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
     if not is_admin_or_mod(interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
-    warnings = load_warnings()
-    u_id = str(유저.id)
-    if u_id in warnings:
-        warnings[u_id] = []
-        save_warnings(warnings)
+        
+    await log_warning_action(interaction.guild, 유저.id, "clear", {})
     await interaction.followup.send(f"🧹 **{유저.display_name}** 님의 모든 경고가 초기화되었습니다.", ephemeral=True)
 
 # --- 백업용 즉시 동기화 일반 명령어 ---

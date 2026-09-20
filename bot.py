@@ -35,8 +35,8 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# 🚨 [중요] 경고 데이터를 영구 보관할 비공개 채널 ID를 입력하세요!
-WARN_LOG_CHANNEL_ID = 1542004718606487672  # 👈 여기에 복사한 채널 ID 숫자를 넣어주세요
+# 🚨 [중요] 경고 데이터를 영구 보관할 비공개 채널 ID
+WARN_LOG_CHANNEL_ID = 1542004718606487672
 
 # --- 채널 기반 영구 경고 데이터 관리 ---
 async def fetch_warnings_from_channel(guild: discord.Guild) -> dict:
@@ -172,11 +172,11 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     await interaction.followup.send(f"✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}", ephemeral=True)
 
 
-# --- 📝 자기소개 모달 UI ---
+# --- 📝 자기소개 모달 UI (외부인 보호 로직 적용) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
-    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 준성", required=True, max_length=15)
-    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: Jun_S14", required=True, max_length=25)
-    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 05", required=True, max_length=4)
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 루트", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: RoOT_21", required=True, max_length=25)
+    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 09", required=True, max_length=4)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -185,6 +185,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
+        # 1. 기존 직업 태그 유지
         current_job = "미선택"
         prefix = ""
         for j in JOBS:
@@ -193,6 +194,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
                 prefix = f"[{j}] "
                 break
 
+        # 2. 나이 계산 (2026년 기준)
         birth_str = self.birth_year.value.strip()
         try:
             yy = int(birth_str)
@@ -202,20 +204,34 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         except Exception:
             age_display = birth_str
 
+        # 3. 닉네임 변경
         new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {birth_str}"
+        if len(new_nick) > 32:
+            new_nick = new_nick[:32]
+
         try:
             await user.edit(nick=new_nick)
         except discord.Forbidden:
             pass
 
-        ROLE_NAME = "수습 담이🐣"
-        target_role = discord.utils.get(guild.roles, name=ROLE_NAME)
-        if target_role:
-            try:
-                await user.add_roles(target_role)
-            except discord.Forbidden:
-                pass
+        # 4. 🛡️ 역할 분기: '외부인' 역할을 가지고 있으면 수습길드원을 절대 주지 않음!
+        external_role = discord.utils.get(guild.roles, name="외부인")
+        trainee_role = discord.utils.get(guild.roles, name="수습길드원")
 
+        is_external = external_role and (external_role in user.roles)
+        role_result_msg = ""
+
+        if is_external:
+            role_result_msg = " (외부인 역할 유지)"
+        else:
+            if trainee_role:
+                try:
+                    await user.add_roles(trainee_role)
+                    role_result_msg = " ('수습길드원' 역할 지급 완료)"
+                except discord.Forbidden:
+                    pass
+
+        # 5. 소개 메시지 전송
         gender_val = self.gender.value.strip() if self.gender.value else "미입력"
         intro_text = (
             f"**이름 :** {self.name.value}\n"
@@ -226,7 +242,10 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         )
 
         await interaction.channel.send(content=f"{user.mention} 님의 자기소개\n{intro_text}")
-        await interaction.followup.send(f"✅ 자기소개가 등록되고 닉네임이 **{new_nick}**(으)로 변경되었습니다!", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ 자기소개가 등록되었습니다!{role_result_msg}\n닉네임: **{new_nick}**", 
+            ephemeral=True
+        )
 
 
 class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):

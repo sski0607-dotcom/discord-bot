@@ -207,7 +207,7 @@ def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Memb
 
 # --- 무기 및 직업 목록 ---
 WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
-JOBS = ["요리사", "대장장이", "낚시꾼"]
+JOBS = ["요리사", "대장장이", "낚시꾼", "연금술사"]
 
 async def process_loadout_selection(interaction: discord.Interaction, weapon_name: Optional[str], job_name: Optional[str]):
     await interaction.response.defer(ephemeral=True)
@@ -874,14 +874,13 @@ def fetch_weather_sync(city_query: str) -> Optional[dict]:
 
 # --- 슬래시 명령어 ---
 
-# ⛅ [신규] 날씨 조회 명령어
+# ⛅ 날씨 조회 명령어
 @bot.tree.command(name="날씨", description="전국 주요 지역 또는 지정한 도시의 현재 날씨 정보를 확인합니다.")
 @app_commands.describe(지역="확인할 지역 이름 (비워두면 전국 주요 거점 요약)")
 async def check_weather(interaction: discord.Interaction, 지역: Optional[str] = None):
     await interaction.response.defer()
     loop = asyncio.get_running_loop()
 
-    # 특정 도시 상세 조회
     if 지역:
         data = await loop.run_in_executor(None, fetch_weather_sync, 지역)
         if not data:
@@ -899,7 +898,6 @@ async def check_weather(interaction: discord.Interaction, 지역: Optional[str] 
         await interaction.followup.send(embed=embed)
         return
 
-    # 전국 주요 거점 요약
     cities = [
         ("서울", "Seoul"),
         ("수원/경기", "Suwon"),
@@ -928,7 +926,7 @@ async def check_weather(interaction: discord.Interaction, 지역: Optional[str] 
     await interaction.followup.send(embed=embed)
 
 
-# 🍽️ [신규] 밥 메뉴 추천 명령어
+# 🍽️ 밥 메뉴 추천 명령어
 @bot.tree.command(name="메뉴추천", description="오늘 뭐 먹을지 고민될 때 식사 메뉴를 추천해 줍니다.")
 @app_commands.describe(카테고리="원하는 음식 분류 (비워두면 전체 무작위)")
 @app_commands.choices(카테고리=[
@@ -1528,6 +1526,20 @@ async def manual_sync(ctx):
         await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어 및 생일 캐시를 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
+
+# --- 🧹 중복 명령어 정리 명령어 ---
+@bot.command(name="초기화")
+async def clean_sync(ctx):
+    try:
+        # 1. 현재 서버에 등록된 개별 명령어 싹 비우기
+        ctx.bot.tree.clear_commands(guild=ctx.guild)
+        await ctx.bot.tree.sync(guild=ctx.guild)
+        
+        # 2. 전역 명령어로 깔끔하게 재등록
+        synced = await ctx.bot.tree.sync()
+        await ctx.send(f"🧹 중복 명령어를 정리하고 최신 명령어 **{len(synced)}개**로 맞췄습니다! 디스코드를 재실행(Ctrl+R)해 보세요.")
+    except Exception as e:
+        await ctx.send(f"❌ 초기화 실패: {e}")
 
 # --- 봇 시작 및 동기화 ---
 @bot.event

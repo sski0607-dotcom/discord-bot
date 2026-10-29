@@ -83,7 +83,7 @@ MENU_DATA = {
     ]
 }
 
-# --- 채널 기반 영구 데이터 관리 (안정화 적용) ---
+# --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
@@ -1010,7 +1010,6 @@ async def register_birthday(interaction: discord.Interaction, 월: int, 일: int
 async def list_birthdays(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     
-    # 캐시가 비어있다면 즉시 DB 로그 채널에서 불러오기
     if interaction.guild.id not in BIRTHDAY_CACHE or not BIRTHDAY_CACHE[interaction.guild.id]:
         _, bdays = await fetch_database_from_channel(interaction.guild)
         BIRTHDAY_CACHE[interaction.guild.id] = bdays
@@ -1132,34 +1131,6 @@ async def register_merchant(
     embed.set_footer(text=f"등록자: {interaction.user.display_name}")
 
     await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="보부상목록", description="현재 대기 중인 보부상 등장 예정 목록을 확인합니다.")
-async def list_merchants(interaction: discord.Interaction):
-    if not MERCHANT_DATA:
-        await interaction.response.send_message("🧭 현재 등록된 보부상 알림이 없습니다.", ephemeral=True)
-        return
-
-    now = datetime.now()
-    lines = []
-    for loc, info in MERCHANT_DATA.items():
-        diff = info["target_time"] - now
-        total_sec = int(diff.total_seconds())
-        if total_sec > 0:
-            hrs = total_sec // 3600
-            mins = (total_sec % 3600) // 60
-            time_left = f"{hrs}시간 {mins}분 남음" if hrs > 0 else f"{mins}분 남음"
-            lines.append(f"• **{loc}**: <#{info['channel_id']}> | {info['target_time'].strftime('%H:%M')} 도착 예정 (`{time_left}` / 등록: {info['registrant']})")
-
-    if not lines:
-        await interaction.response.send_message("🧭 현재 대기 중인 보부상이 없습니다.", ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🧭 대기 중인 보부상 목록",
-        description="\n".join(lines),
-        color=discord.Color.blue()
-    )
-    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="보부상취소", description="등록되어 있는 특정 지역의 보부상 알림을 취소합니다.")
 @app_commands.describe(지역="취소할 지역 이름")
@@ -1566,7 +1537,6 @@ async def on_ready():
     if not daily_birthday_check.is_running():
         daily_birthday_check.start()
 
-    # 봇이 완전히 로그인된 후 캐시 적재를 위해 잠시 대기
     await asyncio.sleep(2)
     for guild in bot.guilds:
         try:

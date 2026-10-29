@@ -259,7 +259,7 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 📝 자기소개 모달 UI (이름 / 마크닉 / 길드이름) ---
+# --- 📝 자기소개 모달 UI (소개글 전송 X, 역할 자동부여 X, 닉네임만 변경) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
@@ -268,52 +268,27 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
         user = interaction.user
         current_nick = user.display_name
         
-        # 기존 [태그] 감지 및 보존
+        # 1. 기존 [무기/직업] 태그 감지 및 유지
         prefix_match = re.match(r'^(\[.*?\])\s*', current_nick)
         prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
-        # 닉네임 구성 (이름 / 마크닉 / 길드이름)
+        # 2. 닉네임 구성 ([태그] 이름 / 마크닉 / 길드이름)
         new_nick = f"{prefix}{self.name.value.strip()} / {self.mc_name.value.strip()} / {self.guild_name.value.strip()}"
         if len(new_nick) > 32:
             new_nick = new_nick[:32]
 
         try:
             await user.edit(nick=new_nick)
+            nickname_msg = f"닉네임이 **{new_nick}**(으)로 설정되었습니다!"
         except discord.Forbidden:
-            pass
+            nickname_msg = "⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경이 불가능합니다."
 
-        # 역할 분기 처리 ('외부인' 역할을 가지고 있으면 수습길드원 지급 제외)
-        external_role = discord.utils.get(guild.roles, name="외부인")
-        trainee_role = discord.utils.get(guild.roles, name="수습길드원")
-
-        is_external = external_role and (external_role in user.roles)
-        role_result_msg = ""
-
-        if is_external:
-            role_result_msg = " (외부인 역할 유지)"
-        else:
-            if trainee_role:
-                try:
-                    await user.add_roles(trainee_role)
-                    role_result_msg = " ('수습길드원' 역할 지급 완료)"
-                except discord.Forbidden:
-                    pass
-
-        gender_val = self.gender.value.strip() if self.gender.value else "미입력"
-        intro_text = (
-            f"**이름 :** {self.name.value.strip()}\n"
-            f"**마크닉 :** {self.mc_name.value.strip()}\n"
-            f"**길드 :** {self.guild_name.value.strip()}\n"
-            f"**성별 :** {gender_val}"
-        )
-
-        await interaction.channel.send(content=f"{user.mention} 님의 자기소개\n{intro_text}")
+        # 3. 본인에게만 비공개 완료 안내 전송
         await interaction.followup.send(
-            f"✅ 자기소개가 등록되었습니다!{role_result_msg}\n닉네임: **{new_nick}**", 
+            f"✅ 등록이 완료되었습니다!\n{nickname_msg}", 
             ephemeral=True
         )
 

@@ -261,9 +261,9 @@ class LoadoutSelectView(discord.ui.View):
 
 # --- 📝 자기소개 모달 UI (이름 / 마크닉 / 길드이름) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
-    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 준성", required=True, max_length=15)
-    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: Jun_S14", required=True, max_length=25)
-    guild_name = discord.ui.TextInput(label="길드 이름", placeholder="예: 도담도담 / 무소속", required=True, max_length=20)
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
+    guild_name = discord.ui.TextInput(label="길드 이름", placeholder="예: 월영", required=True, max_length=20)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):

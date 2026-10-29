@@ -83,62 +83,67 @@ MENU_DATA = {
     ]
 }
 
-# --- 채널 기반 영구 데이터 관리 ---
+# --- 채널 기반 영구 데이터 관리 (안정화 적용) ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
+    
     channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
     if not channel:
         try:
-            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
-        except Exception:
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception as e:
+            print(f"⚠️ DB 로그 채널 탐색 실패: {e}")
             return {}, {}
 
     warnings = {}
     birthdays = {}
 
-    async for message in channel.history(limit=1000, oldest_first=True):
-        if message.author == bot.user and message.embeds:
-            for embed in message.embeds:
-                if not (embed.footer and embed.footer.text):
-                    continue
-                footer_text = embed.footer.text
-
-                # 경고 데이터 복원
-                if footer_text.startswith("WARN_DATA:"):
-                    try:
-                        raw_data = footer_text.replace("WARN_DATA:", "").strip()
-                        data = json.loads(raw_data)
-                        u_id = str(data["user_id"])
-                        action = data.get("action", "add")
-                        
-                        if action == "add":
-                            if u_id not in warnings:
-                                warnings[u_id] = []
-                            warnings[u_id].append({
-                                "reason": data["reason"],
-                                "moderator": data["moderator"],
-                                "date": data["date"]
-                            })
-                        elif action == "remove":
-                            deduct = data.get("count", 1)
-                            if u_id in warnings:
-                                warnings[u_id] = warnings[u_id][:-deduct]
-                        elif action == "clear":
-                            if u_id in warnings:
-                                warnings[u_id] = []
-                    except Exception:
+    try:
+        async for message in channel.history(limit=1000, oldest_first=True):
+            if message.author.id == bot.user.id and message.embeds:
+                for embed in message.embeds:
+                    if not (embed.footer and embed.footer.text):
                         continue
+                    footer_text = embed.footer.text
 
-                # 생일 데이터 복원
-                elif footer_text.startswith("BIRTHDAY_DATA:"):
-                    try:
-                        raw_data = footer_text.replace("BIRTHDAY_DATA:", "").strip()
-                        data = json.loads(raw_data)
-                        u_id = str(data["user_id"])
-                        birthdays[u_id] = data["birthday"]
-                    except Exception:
-                        continue
+                    # 경고 데이터 복원
+                    if footer_text.startswith("WARN_DATA:"):
+                        try:
+                            raw_data = footer_text.replace("WARN_DATA:", "").strip()
+                            data = json.loads(raw_data)
+                            u_id = str(data["user_id"])
+                            action = data.get("action", "add")
+                            
+                            if action == "add":
+                                if u_id not in warnings:
+                                    warnings[u_id] = []
+                                warnings[u_id].append({
+                                    "reason": data["reason"],
+                                    "moderator": data["moderator"],
+                                    "date": data["date"]
+                                })
+                            elif action == "remove":
+                                deduct = data.get("count", 1)
+                                if u_id in warnings:
+                                    warnings[u_id] = warnings[u_id][:-deduct]
+                            elif action == "clear":
+                                if u_id in warnings:
+                                    warnings[u_id] = []
+                        except Exception:
+                            continue
+
+                    # 생일 데이터 복원
+                    elif footer_text.startswith("BIRTHDAY_DATA:"):
+                        try:
+                            raw_data = footer_text.replace("BIRTHDAY_DATA:", "").strip()
+                            data = json.loads(raw_data)
+                            u_id = str(data["user_id"])
+                            birthdays[u_id] = data["birthday"]
+                        except Exception:
+                            continue
+    except Exception as e:
+        print(f"⚠️ 히스토리 탐색 중 오류: {e}")
 
     return warnings, birthdays
 
@@ -148,7 +153,7 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
     if not channel:
         try:
-            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
         except Exception:
             return
 
@@ -169,7 +174,7 @@ async def log_birthday_action(guild: discord.Guild, user_id: int, birthday_str: 
     channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
     if not channel:
         try:
-            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
         except Exception:
             return
 
@@ -806,7 +811,7 @@ async def daily_birthday_check():
         today_mmdd = now_kst.strftime("%m%d")
         
         for guild in bot.guilds:
-            if guild.id not in BIRTHDAY_CACHE:
+            if guild.id not in BIRTHDAY_CACHE or not BIRTHDAY_CACHE[guild.id]:
                 _, bdays = await fetch_database_from_channel(guild)
                 BIRTHDAY_CACHE[guild.id] = bdays
 
@@ -1004,7 +1009,9 @@ async def register_birthday(interaction: discord.Interaction, 월: int, 일: int
 @bot.tree.command(name="생일목록", description="서버 멤버들의 등록된 생일 목록을 확인합니다.")
 async def list_birthdays(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    if interaction.guild.id not in BIRTHDAY_CACHE:
+    
+    # 캐시가 비어있다면 즉시 DB 로그 채널에서 불러오기
+    if interaction.guild.id not in BIRTHDAY_CACHE or not BIRTHDAY_CACHE[interaction.guild.id]:
         _, bdays = await fetch_database_from_channel(interaction.guild)
         BIRTHDAY_CACHE[interaction.guild.id] = bdays
 
@@ -1045,7 +1052,7 @@ async def select_weapon_and_job(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView(), ephemeral=True)
 
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
-@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 또는 전투직)")
+@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 연금술사, 또는 전투직)")
 async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[str] = None, 직업: Optional[str] = None):
     if not 무기 and not 직업:
         await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 입력해 주세요!", ephemeral=True)
@@ -1527,15 +1534,23 @@ async def manual_sync(ctx):
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
 
+# --- 🎂 생일 데이터 강제 수동 복구 명령어 ---
+@bot.command(name="생일복구")
+async def manual_bday_reload(ctx):
+    try:
+        _, bdays = await fetch_database_from_channel(ctx.guild)
+        BIRTHDAY_CACHE[ctx.guild.id] = bdays
+        await ctx.send(f"🎂 로그 채널에서 총 **{len(bdays)}명**의 생일 데이터를 성공적으로 복구했습니다! `/생일목록`을 확인해 보세요.")
+    except Exception as e:
+        await ctx.send(f"❌ 생일 복구 실패: {e}")
+
 # --- 🧹 중복 명령어 정리 명령어 ---
 @bot.command(name="초기화")
 async def clean_sync(ctx):
     try:
-        # 1. 현재 서버에 등록된 개별 명령어 싹 비우기
         ctx.bot.tree.clear_commands(guild=ctx.guild)
         await ctx.bot.tree.sync(guild=ctx.guild)
         
-        # 2. 전역 명령어로 깔끔하게 재등록
         synced = await ctx.bot.tree.sync()
         await ctx.send(f"🧹 중복 명령어를 정리하고 최신 명령어 **{len(synced)}개**로 맞췄습니다! 디스코드를 재실행(Ctrl+R)해 보세요.")
     except Exception as e:
@@ -1551,6 +1566,8 @@ async def on_ready():
     if not daily_birthday_check.is_running():
         daily_birthday_check.start()
 
+    # 봇이 완전히 로그인된 후 캐시 적재를 위해 잠시 대기
+    await asyncio.sleep(2)
     for guild in bot.guilds:
         try:
             _, bdays = await fetch_database_from_channel(guild)

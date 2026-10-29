@@ -4,11 +4,11 @@ import json
 import random
 import threading
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from flask import Flask
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # --- 0. 백그라운드 웹 서버 (Render 슬립 방지) ---
@@ -35,32 +35,44 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# 🚨 [중요] 경고 데이터를 영구 보관할 비공개 채널 ID
+# 🚨 [중요] 경고 및 생일 데이터를 영구 보관할 비공개 채널 ID
 WARN_LOG_CHANNEL_ID = 1542004718606487672
 
-# --- 보부상 타이머 메모리 관리 ---
+# --- 보부상 및 생일 메모리 관리 ---
 MERCHANT_TASKS: Dict[str, asyncio.Task] = {}
 MERCHANT_DATA: Dict[str, dict] = {}
 DEFAULT_MERCHANT_CHANNEL_ID: Optional[int] = None
+DEFAULT_BIRTHDAY_CHANNEL_ID: Optional[int] = None
+BIRTHDAY_CACHE: Dict[int, Dict[str, str]] = {}  # guild_id -> {user_id_str: "MMDD"}
 
-# --- 채널 기반 영구 경고 데이터 관리 ---
-async def fetch_warnings_from_channel(guild: discord.Guild) -> dict:
+# 한국 표준시(KST)
+KST = timezone(timedelta(hours=9))
+
+# --- 채널 기반 영구 데이터 관리 ---
+async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
-        return {}
+        return {}, {}
     channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
     if not channel:
         try:
             channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
         except Exception:
-            return {}
+            return {}, {}
 
     warnings = {}
-    async for message in channel.history(limit=500, oldest_first=True):
+    birthdays = {}
+
+    async for message in channel.history(limit=1000, oldest_first=True):
         if message.author == bot.user and message.embeds:
             for embed in message.embeds:
-                if embed.footer and embed.footer.text and embed.footer.text.startswith("WARN_DATA:"):
+                if not (embed.footer and embed.footer.text):
+                    continue
+                footer_text = embed.footer.text
+
+                # 경고 데이터 복원
+                if footer_text.startswith("WARN_DATA:"):
                     try:
-                        raw_data = embed.footer.text.replace("WARN_DATA:", "").strip()
+                        raw_data = footer_text.replace("WARN_DATA:", "").strip()
                         data = json.loads(raw_data)
                         u_id = str(data["user_id"])
                         action = data.get("action", "add")
@@ -82,7 +94,18 @@ async def fetch_warnings_from_channel(guild: discord.Guild) -> dict:
                                 warnings[u_id] = []
                     except Exception:
                         continue
-    return warnings
+
+                # 생일 데이터 복원
+                elif footer_text.startswith("BIRTHDAY_DATA:"):
+                    try:
+                        raw_data = footer_text.replace("BIRTHDAY_DATA:", "").strip()
+                        data = json.loads(raw_data)
+                        u_id = str(data["user_id"])
+                        birthdays[u_id] = data["birthday"]
+                    except Exception:
+                        continue
+
+    return warnings, birthdays
 
 async def log_warning_action(guild: discord.Guild, user_id: int, action: str, data: dict):
     if WARN_LOG_CHANNEL_ID == 0:
@@ -103,6 +126,27 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     
     payload = {"user_id": user_id, "action": action, **data}
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+async def log_birthday_action(guild: discord.Guild, user_id: int, birthday_str: str):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await guild.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    embed = discord.Embed(
+        title="🎂 [생일 DB 로그] UPDATE",
+        color=discord.Color.pink()
+    )
+    embed.add_field(name="Target User ID", value=str(user_id), inline=True)
+    embed.add_field(name="Birthday", value=birthday_str, inline=True)
+    
+    payload = {"user_id": user_id, "birthday": birthday_str}
+    embed.set_footer(text=f"BIRTHDAY_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
 def is_admin_or_mod(interaction: discord.Interaction) -> bool:
@@ -135,7 +179,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
     guild = interaction.guild
     member = interaction.user
 
-    # 1. 무기 역할 갱신
     if weapon_name:
         for w in WEAPONS:
             r = discord.utils.get(guild.roles, name=w)
@@ -156,7 +199,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
             except discord.Forbidden:
                 pass
 
-    # 2. 직업 역할 갱신
     if job_name:
         for j in JOBS:
             r = discord.utils.get(guild.roles, name=j)
@@ -166,7 +208,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 except discord.Forbidden:
                     pass
         
-        # '없음 (전투직)'이 아닌 경우에만 새 역할 부여
         if job_name in JOBS:
             new_j_role = discord.utils.get(guild.roles, name=job_name)
             if not new_j_role:
@@ -180,7 +221,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 except discord.Forbidden:
                     pass
 
-    # 3. 현재 무기/직업 상태 파악
     active_weapon = weapon_name
     if not active_weapon:
         for w in WEAPONS:
@@ -197,7 +237,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 active_job = j
                 break
 
-    # 4. 닉네임 태그 우선순위 판별 (직업 우선 -> 직업 없으면 무기)
     chosen_tag = None
     if active_job and active_job in JOBS:
         chosen_tag = active_job
@@ -206,7 +245,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
 
     prefix = f"[{chosen_tag}] " if chosen_tag else ""
 
-    # 기존 닉네임에서 앞의 [태그] 부분만 안전하게 교체
     original_name = member.display_name
     cleaned_name = re.sub(r'^\[.*?\]\s*', '', original_name).strip()
     new_nickname = f"{prefix}{cleaned_name}"
@@ -276,11 +314,12 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 📝 자기소개 모달 UI ---
+# --- 📝 자기소개 모달 UI (생일 입력 추가) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
     guild_name = discord.ui.TextInput(label="길드 이름", placeholder="예: 월영", required=True, max_length=20)
+    birthday = discord.ui.TextInput(label="생일 (월일 4자리 숫자)", placeholder="예: 0607 또는 1029", required=True, max_length=6)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -288,6 +327,21 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
+        # 1. 생일 포맷 정제 (숫자 4자리 추출)
+        raw_bday = re.sub(r'[^0-9]', '', self.birthday.value.strip())
+        bday_saved_msg = ""
+        if len(raw_bday) == 4:
+            month = int(raw_bday[:2])
+            day = int(raw_bday[2:])
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                clean_bday = f"{month:02d}{day:02d}"
+                await log_birthday_action(interaction.guild, user.id, clean_bday)
+                if interaction.guild.id not in BIRTHDAY_CACHE:
+                    BIRTHDAY_CACHE[interaction.guild.id] = {}
+                BIRTHDAY_CACHE[interaction.guild.id][str(user.id)] = clean_bday
+                bday_saved_msg = f"\n🎂 생일 등록: **{month}월 {day}일** (당일 알림 예약)"
+
+        # 2. 닉네임 태그 유지 및 적용
         prefix_match = re.match(r'^(\[.*?\])\s*', current_nick)
         prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
@@ -302,7 +356,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             nickname_msg = "⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경이 불가능합니다."
 
         await interaction.followup.send(
-            f"✅ 등록이 완료되었습니다!\n{nickname_msg}", 
+            f"✅ 등록이 완료되었습니다!\n{nickname_msg}{bday_saved_msg}", 
             ephemeral=True
         )
 
@@ -676,7 +730,6 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
 # --- 보부상 알림 비동기 태스크 ---
 async def merchant_timer_task(channel: discord.TextChannel, location: str, target_time: datetime):
-    # 1. 5분 전 알림 대기
     pre_notify_time = target_time - timedelta(minutes=5)
     now = datetime.now()
     wait_pre = (pre_notify_time - now).total_seconds()
@@ -693,7 +746,6 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
         except Exception:
             pass
 
-    # 2. 정각 알림 대기
     now = datetime.now()
     wait_final = (target_time - now).total_seconds()
     if wait_final > 0:
@@ -713,13 +765,128 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
     MERCHANT_DATA.pop(location, None)
 
 
+# --- 🎂 매일 오전 9시(KST) 생일 알림 백그라운드 태스크 ---
+@tasks.loop(minutes=1)
+async def daily_birthday_check():
+    now_kst = datetime.now(KST)
+    # 오전 09시 00분에만 발송
+    if now_kst.hour == 9 and now_kst.minute == 0:
+        today_mmdd = now_kst.strftime("%m%d")
+        
+        for guild in bot.guilds:
+            # 캐시가 없으면 동기화 시도
+            if guild.id not in BIRTHDAY_CACHE:
+                _, bdays = await fetch_database_from_channel(guild)
+                BIRTHDAY_CACHE[guild.id] = bdays
+
+            cached_bdays = BIRTHDAY_CACHE.get(guild.id, {})
+            birthday_users = []
+
+            for u_id_str, bday_str in cached_bdays.items():
+                if bday_str == today_mmdd:
+                    member = guild.get_member(int(u_id_str))
+                    if member:
+                        birthday_users.append(member)
+
+            if birthday_users:
+                # 알림 채널 결정
+                channel = None
+                if DEFAULT_BIRTHDAY_CHANNEL_ID:
+                    channel = guild.get_channel(DEFAULT_BIRTHDAY_CHANNEL_ID)
+                if not channel:
+                    channel = guild.system_channel
+                if not channel:
+                    for ch in guild.text_channels:
+                        if ch.permissions_for(guild.me).send_messages:
+                            channel = ch
+                            break
+
+                if channel:
+                    mentions = " ".join([m.mention for m in birthday_users])
+                    names = ", ".join([f"**{m.display_name}**" for m in birthday_users])
+                    
+                    embed = discord.Embed(
+                        title="🎉 Happy Birthday! 오늘은 특별한 날이에요 🎂",
+                        description=(
+                            f"오늘 생일을 맞이한 멤버가 있습니다!\n\n"
+                            f"✨ 주인공: {names}\n\n"
+                            f"모두 따뜻한 축하의 한마디를 건네주세요! 🥳🎁"
+                        ),
+                        color=discord.Color.fabulous()
+                    )
+                    embed.set_footer(text=f"오늘의 날짜: {now_kst.strftime('%m월 %d일')}")
+                    try:
+                        await channel.send(content=f"🎊 {mentions} 님의 생일을 진심으로 축하합니다! 🎊", embed=embed)
+                    except Exception as e:
+                        print(f"생일 알림 발송 실패: {e}")
+
+
 # --- 슬래시 명령어 ---
 
-@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 길드 이름을 입력하여 닉네임을 설정합니다.")
+@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 길드 이름, 생일을 입력하여 닉네임을 설정합니다.")
 async def profile(interaction: discord.Interaction):
     await interaction.response.send_modal(ProfileModal())
 
-# ⚔️ [개선] 무기 및 직업 선택 드롭다운 메뉴 (직업 우선 / 전투직은 무기 적용)
+# 🎂 [생일 축하 채널 설정]
+@bot.tree.command(name="생일채널설정", description="[관리자] 매일 오전 9시 생일 축하 메시지가 올라갈 채널을 설정합니다.")
+@app_commands.describe(채널="생일 축하 알림이 울릴 텍스트 채널")
+async def set_birthday_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    global DEFAULT_BIRTHDAY_CHANNEL_ID
+    DEFAULT_BIRTHDAY_CHANNEL_ID = 채널.id
+    await interaction.response.send_message(f"✅ 앞으로 매일 오전 9시 생일 축하 알림이 {채널.mention} 채널로 전송됩니다!")
+
+# 🎂 [생일 등록/수정]
+@bot.tree.command(name="생일등록", description="본인의 생일을 수동으로 등록하거나 수정합니다.")
+@app_commands.describe(월="태어난 월 (1~12)", 일="태어난 일 (1~31)")
+async def register_birthday(interaction: discord.Interaction, 월: int, 일: int):
+    if not (1 <= 월 <= 12 and 1 <= 일 <= 31):
+        await interaction.response.send_message("❌ 올바른 월과 일을 입력해 주세요! (예: 6월 7일 -> 6, 7)", ephemeral=True)
+        return
+    
+    clean_bday = f"{월:02d}{일:02d}"
+    await log_birthday_action(interaction.guild, interaction.user.id, clean_bday)
+    
+    if interaction.guild.id not in BIRTHDAY_CACHE:
+        BIRTHDAY_CACHE[interaction.guild.id] = {}
+    BIRTHDAY_CACHE[interaction.guild.id][str(interaction.user.id)] = clean_bday
+
+    await interaction.response.send_message(
+        f"🎂 **{interaction.user.display_name}** 님의 생일이 **{월}월 {일}일**로 저장되었습니다! 당일 오전 9시에 축하 알림이 울립니다. 🎉",
+        ephemeral=True
+    )
+
+# 🎂 [생일 목록 확인]
+@bot.tree.command(name="생일목록", description="서버 멤버들의 등록된 생일 목록을 확인합니다.")
+async def list_birthdays(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild.id not in BIRTHDAY_CACHE:
+        _, bdays = await fetch_database_from_channel(interaction.guild)
+        BIRTHDAY_CACHE[interaction.guild.id] = bdays
+
+    cached_bdays = BIRTHDAY_CACHE.get(interaction.guild.id, {})
+    if not cached_bdays:
+        await interaction.followup.send("🎂 등록된 생일 정보가 없습니다. `/자기소개` 또는 `/생일등록`으로 등록해 보세요!", ephemeral=True)
+        return
+
+    # 월/일 순으로 정렬
+    sorted_bdays = sorted(cached_bdays.items(), key=lambda x: x[1])
+    lines = []
+    for uid_str, bday_code in sorted_bdays:
+        member = interaction.guild.get_member(int(uid_str))
+        name = member.display_name if member else f"(퇴장/ID: {uid_str})"
+        m_val, d_val = int(bday_code[:2]), int(bday_code[2:])
+        lines.append(f"• **{m_val:02d}월 {d_val:02d}일** : {name}")
+
+    embed = discord.Embed(
+        title="🎂 서버 멤버 생일 캘린더",
+        description="\n".join(lines),
+        color=discord.Color.pink()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -735,7 +902,6 @@ async def select_weapon_and_job(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
-# ⚔️ 직접 입력용 명령어
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
 @app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 또는 전투직)")
 async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[str] = None, 직업: Optional[str] = None):
@@ -1100,7 +1266,7 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
     
     await log_warning_action(interaction.guild, 유저.id, "add", warn_entry)
     
-    warnings = await fetch_warnings_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     count = len(warnings.get(str(유저.id), []))
 
     embed = discord.Embed(
@@ -1121,7 +1287,7 @@ async def check_warnings(interaction: discord.Interaction, 유저: Optional[disc
     await interaction.response.defer(ephemeral=True)
     target = 유저 if 유저 else interaction.user
     
-    warnings = await fetch_warnings_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     records = warnings.get(str(target.id), [])
     count = len(records)
 
@@ -1144,7 +1310,7 @@ async def show_all_warnings(interaction: discord.Interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    warnings = await fetch_warnings_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     active_warns = {uid: recs for uid, recs in warnings.items() if len(recs) > 0}
 
     if not active_warns:
@@ -1172,7 +1338,7 @@ async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
         
-    warnings = await fetch_warnings_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     u_id = str(유저.id)
     if u_id not in warnings or len(warnings[u_id]) == 0:
         await interaction.followup.send("❌ 차감할 경고가 없습니다.", ephemeral=True)
@@ -1201,7 +1367,12 @@ async def manual_sync(ctx):
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 즉시 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
+        
+        # 생일 캐시 사전 로드
+        _, bdays = await fetch_database_from_channel(ctx.guild)
+        BIRTHDAY_CACHE[ctx.guild.id] = bdays
+
+        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어 및 생일 캐시를 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
 
@@ -1212,6 +1383,18 @@ async def on_ready():
     bot.add_dynamic_items(DynamicLoanButton)
     bot.add_dynamic_items(DynamicKujiButton)
     
+    # 생일 체크 백그라운드 루프 시작
+    if not daily_birthday_check.is_running():
+        daily_birthday_check.start()
+
+    # 생일 캐시 사전 적재
+    for guild in bot.guilds:
+        try:
+            _, bdays = await fetch_database_from_channel(guild)
+            BIRTHDAY_CACHE[guild.id] = bdays
+        except Exception:
+            pass
+
     try:
         synced = await bot.tree.sync()
         print(f"✅ 전역 명령어 {len(synced)}개 동기화 완료!")

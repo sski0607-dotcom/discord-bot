@@ -121,45 +121,83 @@ def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Memb
             return m
     return None
 
-# --- 직업 목록 ---
-JOBS = [
-    "검호", "정식기사", "추적자", "암살자", "위자드",
-    "창성", "진혼자", "바바리안", "비스트테이머", "클레릭",
-    "월영의 그림자", "드루이드", "백야기사", "근위대장",
-    "중급 대장장이", "검성", "광부"
-]
+# --- 무기 및 직업 목록 ---
+WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
+JOBS = ["요리사", "대장장이", "낚시꾼"]
 
-async def process_job_selection(interaction: discord.Interaction, job_name: str):
+async def process_loadout_selection(interaction: discord.Interaction, weapon_name: Optional[str], job_name: Optional[str]):
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     member = interaction.user
-    prefix = f"[{job_name}]"
-    
-    for j in JOBS:
-        role = discord.utils.get(guild.roles, name=j)
-        if role and role in member.roles:
+
+    # 1. 역할 교체 처리
+    if weapon_name:
+        for w in WEAPONS:
+            r = discord.utils.get(guild.roles, name=w)
+            if r and r in member.roles:
+                try:
+                    await member.remove_roles(r)
+                except discord.Forbidden:
+                    pass
+        new_w_role = discord.utils.get(guild.roles, name=weapon_name)
+        if not new_w_role:
             try:
-                await member.remove_roles(role)
+                new_w_role = await guild.create_role(name=weapon_name)
+            except discord.Forbidden:
+                new_w_role = None
+        if new_w_role:
+            try:
+                await member.add_roles(new_w_role)
             except discord.Forbidden:
                 pass
-            
-    new_role = discord.utils.get(guild.roles, name=job_name)
-    if not new_role:
-        try:
-            new_role = await guild.create_role(name=job_name)
-        except discord.Forbidden:
-            new_role = None
-            
-    if new_role:
-        try:
-            await member.add_roles(new_role)
-        except discord.Forbidden:
-            pass
-    
+
+    if job_name:
+        for j in JOBS:
+            r = discord.utils.get(guild.roles, name=j)
+            if r and r in member.roles:
+                try:
+                    await member.remove_roles(r)
+                except discord.Forbidden:
+                    pass
+        new_j_role = discord.utils.get(guild.roles, name=job_name)
+        if not new_j_role:
+            try:
+                new_j_role = await guild.create_role(name=job_name)
+            except discord.Forbidden:
+                new_j_role = None
+        if new_j_role:
+            try:
+                await member.add_roles(new_j_role)
+            except discord.Forbidden:
+                pass
+
+    # 2. 닉네임 앞 태그 구성 ([무기/직업] 형태)
+    current_weapon = weapon_name
+    current_job = job_name
+
+    # 선택 안 된 항목은 기존 역할에서 파악
+    if not current_weapon:
+        for w in WEAPONS:
+            r = discord.utils.get(guild.roles, name=w)
+            if r and r in member.roles:
+                current_weapon = w
+                break
+
+    if not current_job:
+        for j in JOBS:
+            r = discord.utils.get(guild.roles, name=j)
+            if r and r in member.roles:
+                current_job = j
+                break
+
+    tag_parts = [p for p in [current_weapon, current_job] if p]
+    prefix = f"[{'/'.join(tag_parts)}] " if tag_parts else ""
+
+    # 닉네임 맨 앞 기존 [태그] 제거 후 새 태그 부착
     original_name = member.display_name
     cleaned_name = re.sub(r'^\[.*?\]\s*', '', original_name).strip()
-    new_nickname = f"{prefix} {cleaned_name}"
-    
+    new_nickname = f"{prefix}{cleaned_name}"
+
     if len(new_nickname) > 32:
         new_nickname = new_nickname[:32]
 
@@ -169,14 +207,63 @@ async def process_job_selection(interaction: discord.Interaction, job_name: str)
     except discord.Forbidden:
         nickname_msg = "(⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경 불가)"
 
-    await interaction.followup.send(f"✅ **[{job_name}]** 직업을 선택하셨습니다!\n{nickname_msg}", ephemeral=True)
+    summary = []
+    if current_weapon:
+        summary.append(f"무기: **{current_weapon}**")
+    if current_job:
+        summary.append(f"직업: **{current_job}**")
+
+    await interaction.followup.send(
+        f"✅ 설정 완료! ({', '.join(summary)})\n{nickname_msg}",
+        ephemeral=True
+    )
 
 
-# --- 📝 자기소개 모달 UI (외부인 보호 로직 적용) ---
+# --- ⚔️ 무기 & 직업 드롭다운 View ---
+class WeaponSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=w, description=f"{w} 무기 선택") for w in WEAPONS]
+        super().__init__(placeholder="🗡️ 무기를 선택하세요", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_weapon = self.values[0]
+        await interaction.response.send_message(f"무기 **[{self.values[0]}]**(을)를 선택하셨습니다. (선택 완료 버튼을 눌러 확정하세요)", ephemeral=True)
+
+class JobSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=j, description=f"{j} 직업 선택") for j in JOBS]
+        super().__init__(placeholder="🛠️ 직업을 선택하세요", min_values=1, max_values=1, options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_job = self.values[0]
+        await interaction.response.send_message(f"직업 **[{self.values[0]}]**(을)를 선택하셨습니다. (선택 완료 버튼을 눌러 확정하세요)", ephemeral=True)
+
+class LoadoutConfirmButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✅ 선택 완료 및 적용", style=discord.ButtonStyle.success, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: LoadoutSelectView = self.view
+        if not view.selected_weapon and not view.selected_job:
+            await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 드롭다운에서 선택해 주세요!", ephemeral=True)
+            return
+        await process_loadout_selection(interaction, view.selected_weapon, view.selected_job)
+
+class LoadoutSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.selected_weapon: Optional[str] = None
+        self.selected_job: Optional[str] = None
+        self.add_item(WeaponSelect())
+        self.add_item(JobSelect())
+        self.add_item(LoadoutConfirmButton())
+
+
+# --- 📝 자기소개 모달 UI (이름 / 마크닉 / 길드이름) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
-    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 루트", required=True, max_length=15)
-    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: RoOT_21", required=True, max_length=25)
-    birth_year = discord.ui.TextInput(label="출생 연도 (두 자리)", placeholder="예: 09", required=True, max_length=4)
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 준성", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: Jun_S14", required=True, max_length=25)
+    guild_name = discord.ui.TextInput(label="길드 이름", placeholder="예: 도담도담 / 무소속", required=True, max_length=20)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -185,27 +272,12 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
-        # 1. 기존 직업 태그 유지
-        current_job = "미선택"
-        prefix = ""
-        for j in JOBS:
-            if current_nick.startswith(f"[{j}]"):
-                current_job = j
-                prefix = f"[{j}] "
-                break
+        # 기존 [태그] 감지 및 보존
+        prefix_match = re.match(r'^(\[.*?\])\s*', current_nick)
+        prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
-        # 2. 나이 계산 (2026년 기준)
-        birth_str = self.birth_year.value.strip()
-        try:
-            yy = int(birth_str)
-            full_year = 2000 + yy if yy < 50 else 1900 + yy
-            age = 2026 - full_year + 1
-            age_display = f"{age} ({birth_str})"
-        except Exception:
-            age_display = birth_str
-
-        # 3. 닉네임 변경
-        new_nick = f"{prefix}{self.name.value} / {self.mc_name.value} / {birth_str}"
+        # 닉네임 구성 (이름 / 마크닉 / 길드이름)
+        new_nick = f"{prefix}{self.name.value.strip()} / {self.mc_name.value.strip()} / {self.guild_name.value.strip()}"
         if len(new_nick) > 32:
             new_nick = new_nick[:32]
 
@@ -214,7 +286,7 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         except discord.Forbidden:
             pass
 
-        # 4. 🛡️ 역할 분기: '외부인' 역할을 가지고 있으면 수습길드원을 절대 주지 않음!
+        # 역할 분기 처리 ('외부인' 역할을 가지고 있으면 수습길드원 지급 제외)
         external_role = discord.utils.get(guild.roles, name="외부인")
         trainee_role = discord.utils.get(guild.roles, name="수습길드원")
 
@@ -231,14 +303,12 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
                 except discord.Forbidden:
                     pass
 
-        # 5. 소개 메시지 전송
         gender_val = self.gender.value.strip() if self.gender.value else "미입력"
         intro_text = (
-            f"**이름 :** {self.name.value}\n"
-            f"**마크닉 :** {self.mc_name.value}\n"
-            f"**나이 :** {age_display}\n"
-            f"**성별 :** {gender_val}\n"
-            f"**직업 :** {current_job}"
+            f"**이름 :** {self.name.value.strip()}\n"
+            f"**마크닉 :** {self.mc_name.value.strip()}\n"
+            f"**길드 :** {self.guild_name.value.strip()}\n"
+            f"**성별 :** {gender_val}"
         )
 
         await interaction.channel.send(content=f"{user.mention} 님의 자기소개\n{intro_text}")
@@ -310,28 +380,6 @@ class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
         embed.set_footer(text=f"주최자: {interaction.user.display_name}")
 
         await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
-
-
-# --- 직업 버튼 UI ---
-class JobButton(discord.ui.Button):
-    def __init__(self, job_name: str, row: int):
-        super().__init__(
-            label=job_name, 
-            style=discord.ButtonStyle.primary, 
-            custom_id=f"job_button_{job_name}",
-            row=row
-        )
-        self.job_name = job_name
-
-    async def callback(self, interaction: discord.Interaction):
-        await process_job_selection(interaction, self.job_name)
-
-class JobButtonView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        for idx, job in enumerate(JOBS[:25]):
-            row_num = idx // 5
-            self.add_item(JobButton(job, row=row_num))
 
 
 class PollButton(discord.ui.Button):
@@ -639,50 +687,39 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
 # --- 슬래시 명령어 ---
 
-@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 출생 연도를 입력하여 닉네임을 설정합니다.")
+@bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 길드 이름을 입력하여 닉네임을 설정합니다.")
 async def profile(interaction: discord.Interaction):
     await interaction.response.send_modal(ProfileModal())
 
-@bot.tree.command(name="직업선택", description="버튼 형태의 직업 선택 메뉴를 출력합니다.")
-async def job_select_menu(interaction: discord.Interaction):
-    embed = discord.Embed(title="⚔️ 직업 선택", description="아래 버튼을 누르면 닉네임 앞에 `[직업]` 태그가 붙습니다!", color=discord.Color.green())
-    await interaction.response.send_message(embed=embed, view=JobButtonView())
+# ⚔️ [신규] 무기 및 직업 선택 드롭다운 메뉴
+@bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
+async def select_weapon_and_job(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="⚔️ 무기 & 직업 선택",
+        description=(
+            "아래 드롭다운에서 **무기**와 **직업**을 고른 후\n"
+            "**[선택 완료 및 적용]** 버튼을 눌러주세요!\n\n"
+            "• **무기:** 검, 창, 도끼, 활, 클로, 메이스\n"
+            "• **직업:** 요리사, 대장장이, 낚시꾼"
+        ),
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
-@bot.tree.command(name="직업", description="직업 이름을 직접 입력하여 변경합니다.")
-@app_commands.describe(직업명="선택할 직업 이름")
-async def choose_job(interaction: discord.Interaction, 직업명: str):
-    await interaction.response.defer(ephemeral=True)
-    if 직업명 not in JOBS:
-        await interaction.followup.send(f"❌ 존재하지 않는 직업입니다. 선택 가능: {', '.join(JOBS)}", ephemeral=True)
+# ⚔️ 직접 입력용 명령어
+@bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
+@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼)")
+async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[str] = None, 직업: Optional[str] = None):
+    if not 무기 and not 직업:
+        await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 입력해 주세요!", ephemeral=True)
         return
-    await process_job_selection(interaction, 직업명)
-
-@bot.tree.command(name="직업목록", description="선택 가능한 모든 직업 목록을 확인합니다.")
-async def job_list(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    job_text = "\n".join([f"• **{job}**" for job in JOBS])
-    embed = discord.Embed(title="⚔️ 선택 가능한 직업 목록 ⚔️", description=job_text, color=discord.Color.blue())
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="직업추가", description="선택 목록에 새로운 직업을 추가합니다.")
-@app_commands.describe(직업명="추가할 새로운 직업 이름")
-async def add_job(interaction: discord.Interaction, 직업명: str):
-    await interaction.response.defer(ephemeral=True)
-    if 직업명 in JOBS:
-        await interaction.followup.send(f"❌ **{직업명}**은(는) 이미 존재합니다.", ephemeral=True)
+    if 무기 and 무기 not in WEAPONS:
+        await interaction.response.send_message(f"❌ 올바른 무기를 입력해 주세요. (가능: {', '.join(WEAPONS)})", ephemeral=True)
         return
-    JOBS.append(직업명)
-    await interaction.followup.send(f"✅ 직업 **[{직업명}]**이(가) 추가되었습니다!", ephemeral=True)
-
-@bot.tree.command(name="직업삭제", description="선택 목록에서 직업을 삭제합니다.")
-@app_commands.describe(직업명="삭제할 직업 이름")
-async def remove_job(interaction: discord.Interaction, 직업명: str):
-    await interaction.response.defer(ephemeral=True)
-    if 직업명 not in JOBS:
-        await interaction.followup.send(f"❌ **{직업명}** 직업을 찾을 수 없습니다.", ephemeral=True)
+    if 직업 and 직업 not in JOBS:
+        await interaction.response.send_message(f"❌ 올바른 직업을 입력해 주세요. (가능: {', '.join(JOBS)})", ephemeral=True)
         return
-    JOBS.remove(직업명)
-    await interaction.followup.send(f"🗑️ 직업 **[{직업명}]**이(가) 삭제되었습니다!", ephemeral=True)
+    await process_loadout_selection(interaction, 무기, 직업)
 
 @bot.tree.command(name="사다리", description="통화방 인원으로 사다리 타기를 진행합니다.")
 @app_commands.describe(당첨인원="당첨될 인원수", 당첨항목="당첨 항목 이름 (기본값: 🎉 당첨)", 꽝항목="꽝 항목 이름 (기본값: ❌ 꽝)")
@@ -1035,7 +1072,7 @@ async def manual_sync(ctx):
 # --- 봇 시작 및 동기화 ---
 @bot.event
 async def on_ready():
-    bot.add_view(JobButtonView())
+    bot.add_view(LoadoutSelectView())
     bot.add_dynamic_items(DynamicLoanButton)
     bot.add_dynamic_items(DynamicKujiButton)
     

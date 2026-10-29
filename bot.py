@@ -41,7 +41,7 @@ WARN_LOG_CHANNEL_ID = 1542004718606487672
 # --- 보부상 타이머 메모리 관리 ---
 MERCHANT_TASKS: Dict[str, asyncio.Task] = {}
 MERCHANT_DATA: Dict[str, dict] = {}
-DEFAULT_MERCHANT_CHANNEL_ID: Optional[int] = None  # 서버 기본 보부상 알림 채널 ID
+DEFAULT_MERCHANT_CHANNEL_ID: Optional[int] = None
 
 # --- 채널 기반 영구 경고 데이터 관리 ---
 async def fetch_warnings_from_channel(guild: discord.Guild) -> dict:
@@ -135,6 +135,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
     guild = interaction.guild
     member = interaction.user
 
+    # 1. 무기 역할 갱신
     if weapon_name:
         for w in WEAPONS:
             r = discord.utils.get(guild.roles, name=w)
@@ -155,6 +156,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
             except discord.Forbidden:
                 pass
 
+    # 2. 직업 역할 갱신
     if job_name:
         for j in JOBS:
             r = discord.utils.get(guild.roles, name=j)
@@ -163,38 +165,48 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                     await member.remove_roles(r)
                 except discord.Forbidden:
                     pass
-        new_j_role = discord.utils.get(guild.roles, name=job_name)
-        if not new_j_role:
-            try:
-                new_j_role = await guild.create_role(name=job_name)
-            except discord.Forbidden:
-                new_j_role = None
-        if new_j_role:
-            try:
-                await member.add_roles(new_j_role)
-            except discord.Forbidden:
-                pass
+        
+        # '없음 (전투직)'이 아닌 경우에만 새 역할 부여
+        if job_name in JOBS:
+            new_j_role = discord.utils.get(guild.roles, name=job_name)
+            if not new_j_role:
+                try:
+                    new_j_role = await guild.create_role(name=job_name)
+                except discord.Forbidden:
+                    new_j_role = None
+            if new_j_role:
+                try:
+                    await member.add_roles(new_j_role)
+                except discord.Forbidden:
+                    pass
 
-    current_weapon = weapon_name
-    current_job = job_name
-
-    if not current_weapon:
+    # 3. 현재 무기/직업 상태 파악
+    active_weapon = weapon_name
+    if not active_weapon:
         for w in WEAPONS:
             r = discord.utils.get(guild.roles, name=w)
             if r and r in member.roles:
-                current_weapon = w
+                active_weapon = w
                 break
 
-    if not current_job:
+    active_job = job_name
+    if not active_job:
         for j in JOBS:
             r = discord.utils.get(guild.roles, name=j)
             if r and r in member.roles:
-                current_job = j
+                active_job = j
                 break
 
-    tag_parts = [p for p in [current_weapon, current_job] if p]
-    prefix = f"[{'/'.join(tag_parts)}] " if tag_parts else ""
+    # 4. 닉네임 태그 우선순위 판별 (직업 우선 -> 직업 없으면 무기)
+    chosen_tag = None
+    if active_job and active_job in JOBS:
+        chosen_tag = active_job
+    elif active_weapon:
+        chosen_tag = active_weapon
 
+    prefix = f"[{chosen_tag}] " if chosen_tag else ""
+
+    # 기존 닉네임에서 앞의 [태그] 부분만 안전하게 교체
     original_name = member.display_name
     cleaned_name = re.sub(r'^\[.*?\]\s*', '', original_name).strip()
     new_nickname = f"{prefix}{cleaned_name}"
@@ -209,13 +221,15 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         nickname_msg = "(⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경 불가)"
 
     summary = []
-    if current_weapon:
-        summary.append(f"무기: **{current_weapon}**")
-    if current_job:
-        summary.append(f"직업: **{current_job}**")
+    if active_weapon:
+        summary.append(f"무기: **{active_weapon}**")
+    if active_job and active_job in JOBS:
+        summary.append(f"직업: **{active_job}**")
+    else:
+        summary.append("직업: **전투직(없음)**")
 
     await interaction.followup.send(
-        f"✅ 설정 완료! ({', '.join(summary)})\n{nickname_msg}",
+        f"✅ 설정 완료! ({', '.join(summary)})\n🏷️ 적용된 태그: **{prefix.strip() or '없음'}**\n{nickname_msg}",
         ephemeral=True
     )
 
@@ -228,16 +242,18 @@ class WeaponSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_weapon = self.values[0]
-        await interaction.response.send_message(f"무기 **[{self.values[0]}]**(을)를 선택하셨습니다. (선택 완료 버튼을 눌러 확정하세요)", ephemeral=True)
+        await interaction.response.send_message(f"무기 **[{self.values[0]}]**(을)를 선택하셨습니다.", ephemeral=True)
 
 class JobSelect(discord.ui.Select):
     def __init__(self):
-        options = [discord.SelectOption(label=j, description=f"{j} 직업 선택") for j in JOBS]
+        options = [
+            discord.SelectOption(label="없음 (전투직)", description="생활직업 없음 (무기 태그 우선 적용)", value="없음 (전투직)")
+        ] + [discord.SelectOption(label=j, description=f"{j} 직업 선택", value=j) for j in JOBS]
         super().__init__(placeholder="🛠️ 직업을 선택하세요", min_values=1, max_values=1, options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_job = self.values[0]
-        await interaction.response.send_message(f"직업 **[{self.values[0]}]**(을)를 선택하셨습니다. (선택 완료 버튼을 눌러 확정하세요)", ephemeral=True)
+        await interaction.response.send_message(f"직업 **[{self.values[0]}]**(을)를 선택하셨습니다.", ephemeral=True)
 
 class LoadoutConfirmButton(discord.ui.Button):
     def __init__(self):
@@ -260,7 +276,7 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 📝 자기소개 모달 UI (소개글 전송 X, 역할 자동부여 X, 닉네임만 변경) ---
+# --- 📝 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
@@ -703,22 +719,25 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
 async def profile(interaction: discord.Interaction):
     await interaction.response.send_modal(ProfileModal())
 
+# ⚔️ [개선] 무기 및 직업 선택 드롭다운 메뉴 (직업 우선 / 전투직은 무기 적용)
 @bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
         title="⚔️ 무기 & 직업 선택",
         description=(
-            "아래 드롭다운에서 **무기**와 **직업**을 고른 후\n"
+            "아래 드롭다운에서 **무기**와 **직업**을 선택한 뒤\n"
             "**[선택 완료 및 적용]** 버튼을 눌러주세요!\n\n"
-            "• **무기:** 검, 창, 도끼, 활, 클로, 메이스\n"
-            "• **직업:** 요리사, 대장장이, 낚시꾼"
+            "🏷️ **태그 표기 규칙:**\n"
+            "• 직업이 있으면 **[직업]** 태그가 우선 표기됩니다.\n"
+            "• 직업이 없거나 **'없음 (전투직)'**을 선택하면 **[무기]** 태그가 표기됩니다."
         ),
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
+# ⚔️ 직접 입력용 명령어
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
-@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼)")
+@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 또는 전투직)")
 async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[str] = None, 직업: Optional[str] = None):
     if not 무기 and not 직업:
         await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 입력해 주세요!", ephemeral=True)
@@ -726,8 +745,8 @@ async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[
     if 무기 and 무기 not in WEAPONS:
         await interaction.response.send_message(f"❌ 올바른 무기를 입력해 주세요. (가능: {', '.join(WEAPONS)})", ephemeral=True)
         return
-    if 직업 and 직업 not in JOBS:
-        await interaction.response.send_message(f"❌ 올바른 직업을 입력해 주세요. (가능: {', '.join(JOBS)})", ephemeral=True)
+    if 직업 and 직업 not in JOBS and 직업 not in ["전투직", "없음"]:
+        await interaction.response.send_message(f"❌ 올바른 직업을 입력해 주세요. (가능: {', '.join(JOBS)}, 전투직)", ephemeral=True)
         return
     await process_loadout_selection(interaction, 무기, 직업)
 
@@ -742,7 +761,7 @@ async def set_merchant_default_channel(interaction: discord.Interaction, 채널:
     DEFAULT_MERCHANT_CHANNEL_ID = 채널.id
     await interaction.response.send_message(f"✅ 앞으로 별도 지정이 없으면 {채널.mention} 채널로 보부상 알림이 전송됩니다!")
 
-# 🔔 [보부상 타이머 등록 - 채널 직접 지정 옵션 추가]
+# 🔔 [보부상 타이머 등록]
 @bot.tree.command(name="보부상등록", description="보부상 등장 예정 시간을 계산해 예약 알림을 설정합니다.")
 @app_commands.describe(
     지역="보부상이 등장하는 지역 이름 (예: 플로라)",
@@ -764,7 +783,6 @@ async def register_merchant(
         await interaction.followup.send("❌ 남은 시간을 1분 이상으로 입력해 주세요!", ephemeral=True)
         return
 
-    # 알림 발송 채널 결정: 1) 직접 지정한 채널 -> 2) 기본 고정 채널 -> 3) 현재 입력한 채널
     target_channel = 알림채널
     if not target_channel and DEFAULT_MERCHANT_CHANNEL_ID:
         target_channel = interaction.guild.get_channel(DEFAULT_MERCHANT_CHANNEL_ID)

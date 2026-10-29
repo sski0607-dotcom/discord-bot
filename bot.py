@@ -4,6 +4,8 @@ import json
 import random
 import threading
 import asyncio
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from flask import Flask
@@ -47,6 +49,39 @@ BIRTHDAY_CACHE: Dict[int, Dict[str, str]] = {}  # guild_id -> {user_id_str: "MMD
 
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
+
+# --- 메뉴 추천 데이터베이스 ---
+MENU_DATA = {
+    "한식": [
+        "김치찌개", "된장찌개", "제육볶음", "소불고기", "비빔밥", "순두부찌개",
+        "닭볶음탕", "국밥 (순대국밥/돼지국밥)", "갈비탕", "육개장", "삼겹살",
+        "부대찌개", "쌈밥", "설렁탕", "김치볶음밥", "감자탕"
+    ],
+    "중식": [
+        "짜장면", "짬뽕", "탕수육", "볶음밥", "마파두부밥", "마라탕",
+        "마라샹궈", "꿔바로우", "유린기", "깐풍기", "군만두와 짬뽕밥"
+    ],
+    "일식": [
+        "돈가스 (카츠)", "초밥 (스시)", "라멘", "가츠동 / 규동", "우동",
+        "사케동 (연어덮밥)", "메밀소바", "텐동 (튀김덮밥)", "야키소바", "카레라이스"
+    ],
+    "양식": [
+        "토마토 파스타", "크림 파스타", "알리오 올리오", "스테이크", "화덕피자",
+        "수제버거", "리조또", "바베큐 폭립", "감바스 알 아히요", "필라프"
+    ],
+    "분식 / 패스트푸드": [
+        "떡볶이 & 튀김", "김밥 & 라면", "순대 & 어묵", "치킨버거", "불고기버거",
+        "피자 한 판", "핫도그 & 샌드위치", "서브웨이", "치킨 & 감자튀김"
+    ],
+    "야식 / 안주": [
+        "후라이드 / 양념치킨", "족발 & 보쌈", "곱창 / 막창 구이", "닭발 & 계란찜",
+        "골뱅이 소면", "피맥 (피자+맥주)", "오돌뼈 & 주먹밥", "모듬전 & 막걸리"
+    ],
+    "가벼운 식사 / 샐러드": [
+        "닭가슴살 샐러드 웜볼", "포케 (연어/참치)", "그릭요거트 볼", "서브웨이 로스트치킨",
+        "베이글 & 크림치즈", "클럽 샌드위치"
+    ]
+}
 
 # --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
@@ -179,7 +214,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
     guild = interaction.guild
     member = interaction.user
 
-    # 1. 무기 역할 갱신
     if weapon_name:
         for w in WEAPONS:
             r = discord.utils.get(guild.roles, name=w)
@@ -200,7 +234,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
             except discord.Forbidden:
                 pass
 
-    # 2. 직업 역할 갱신
     if job_name:
         for j in JOBS:
             r = discord.utils.get(guild.roles, name=j)
@@ -223,7 +256,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 except discord.Forbidden:
                     pass
 
-    # 3. 현재 무기/직업 상태 파악
     active_weapon = weapon_name
     if not active_weapon:
         for w in WEAPONS:
@@ -240,7 +272,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 active_job = j
                 break
 
-    # 4. 닉네임 태그 우선순위 판별 (직업 우선 -> 직업 없으면 무기)
     chosen_tag = None
     if active_job and active_job in JOBS:
         chosen_tag = active_job
@@ -820,7 +851,121 @@ async def daily_birthday_check():
                         print(f"생일 알림 발송 실패: {e}")
 
 
+# --- 날씨 데이터 파싱 함수 (wttr.in) ---
+def fetch_weather_sync(city_query: str) -> Optional[dict]:
+    try:
+        url = f"https://wttr.in/{urllib.parse.quote(city_query)}?format=j1"
+        req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode('utf-8'))
+                curr = data['current_condition'][0]
+                return {
+                    "temp": curr.get("temp_C", "-"),
+                    "feels": curr.get("FeelsLikeC", "-"),
+                    "desc": curr.get("lang_ko", [{}])[0].get("value") if curr.get("lang_ko") else curr.get("weatherDesc", [{}])[0].get("value", "-"),
+                    "humidity": curr.get("humidity", "-"),
+                    "wind": curr.get("windspeedKmph", "-")
+                }
+    except Exception:
+        return None
+    return None
+
+
 # --- 슬래시 명령어 ---
+
+# ⛅ [신규] 날씨 조회 명령어
+@bot.tree.command(name="날씨", description="전국 주요 지역 또는 지정한 도시의 현재 날씨 정보를 확인합니다.")
+@app_commands.describe(지역="확인할 지역 이름 (비워두면 전국 주요 거점 요약)")
+async def check_weather(interaction: discord.Interaction, 지역: Optional[str] = None):
+    await interaction.response.defer()
+    loop = asyncio.get_running_loop()
+
+    # 특정 도시 상세 조회
+    if 지역:
+        data = await loop.run_in_executor(None, fetch_weather_sync, 지역)
+        if not data:
+            await interaction.followup.send(f"❌ **{지역}** 지역의 날씨 정보를 가져올 수 없습니다. 도시 이름을 확인해 주세요.")
+            return
+
+        embed = discord.Embed(
+            title=f"🌤️ [{지역}] 현재 날씨 정보",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="🌡️ 현재 기온", value=f"**{data['temp']}°C** (체감: {data['feels']}°C)", inline=True)
+        embed.add_field(name="☁️ 날씨 상태", value=f"**{data['desc']}**", inline=True)
+        embed.add_field(name="💧 습도 / 바람", value=f"습도: `{data['humidity']}%` | 풍속: `{data['wind']}km/h`", inline=False)
+        embed.set_footer(text=f"기준: wttr.in • 확인 시간: {datetime.now(KST).strftime('%H:%M')} KST")
+        await interaction.followup.send(embed=embed)
+        return
+
+    # 전국 주요 거점 요약
+    cities = [
+        ("서울", "Seoul"),
+        ("수원/경기", "Suwon"),
+        ("춘천/강원", "Chuncheon"),
+        ("대전/충청", "Daejeon"),
+        ("광주/전라", "Gwangju"),
+        ("대구", "Daegu"),
+        ("부산/경상", "Busan"),
+        ("제주", "Jeju")
+    ]
+
+    weather_results = []
+    for kor_name, en_name in cities:
+        w_data = await loop.run_in_executor(None, fetch_weather_sync, en_name)
+        if w_data:
+            weather_results.append(f"• **{kor_name}**: `{w_data['temp']}°C` ({w_data['desc']}) | 체감 `{w_data['feels']}°C`")
+        else:
+            weather_results.append(f"• **{kor_name}**: 정보 조회 실패")
+
+    embed = discord.Embed(
+        title="🗺️ 전국 주요 거점 실시간 날씨 현황",
+        description="\n".join(weather_results),
+        color=discord.Color.teal()
+    )
+    embed.set_footer(text=f"특정 도시는 `/날씨 [도시이름]`으로 확인 가능 • {datetime.now(KST).strftime('%m/%d %H:%M')} KST")
+    await interaction.followup.send(embed=embed)
+
+
+# 🍽️ [신규] 밥 메뉴 추천 명령어
+@bot.tree.command(name="메뉴추천", description="오늘 뭐 먹을지 고민될 때 식사 메뉴를 추천해 줍니다.")
+@app_commands.describe(카테고리="원하는 음식 분류 (비워두면 전체 무작위)")
+@app_commands.choices(카테고리=[
+    app_commands.Choice(name="🍚 한식", value="한식"),
+    app_commands.Choice(name="🥟 중식", value="중식"),
+    app_commands.Choice(name="🍣 일식", value="일식"),
+    app_commands.Choice(name="🍕 양식", value="양식"),
+    app_commands.Choice(name="🍢 분식 / 패스트푸드", value="분식 / 패스트푸드"),
+    app_commands.Choice(name="🍗 야식 / 안주", value="야식 / 안주"),
+    app_commands.Choice(name="🥗 가벼운 식사 / 샐러드", value="가벼운 식사 / 샐러드"),
+    app_commands.Choice(name="🎲 전체 무작위", value="전체")
+])
+async def recommend_food(interaction: discord.Interaction, 카테고리: Optional[app_commands.Choice[str]] = None):
+    cat_key = 카테고리.value if 카테고리 else "전체"
+
+    if cat_key == "전체":
+        chosen_cat = random.choice(list(MENU_DATA.keys()))
+        picked_food = random.choice(MENU_DATA[chosen_cat])
+    else:
+        chosen_cat = cat_key
+        picked_food = random.choice(MENU_DATA[chosen_cat])
+
+    extra_pick = random.choice([
+        "식사 맛있게 하시고 시원한 음료도 한 잔 챙기세요! ✨",
+        "든든하게 먹어야 게임도 집중 잘 되는 거 아시죠? 😋",
+        "고민될 땐 오늘 이 메뉴로 직진해 보세요! 🏃",
+        "좋은 사람들과 함께 먹으면 맛이 두 배! 🥳"
+    ])
+
+    embed = discord.Embed(
+        title="🍴 오늘의 식사 추천 메뉴",
+        description=f"오늘은 **[{chosen_cat}]** 메뉴 어떠신가요?\n\n👉 오늘의 추천: **{picked_food}**\n\n💬 {extra_pick}",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"추천 요청자: {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 길드 이름, 생일을 입력하여 닉네임을 설정합니다.")
 async def profile(interaction: discord.Interaction):
@@ -885,7 +1030,7 @@ async def list_birthdays(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# ⚔️ [본인에게만 표시되도록 수정됨] 무기 및 직업 선택 드롭다운 메뉴
+# ⚔️ [본인에게만 표시] 무기 및 직업 선택 드롭다운 메뉴
 @bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -899,7 +1044,6 @@ async def select_weapon_and_job(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    # ephemeral=True 설정으로 본인에게만 메시지가 출력됨
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView(), ephemeral=True)
 
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")

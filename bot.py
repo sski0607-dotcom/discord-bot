@@ -179,6 +179,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
     guild = interaction.guild
     member = interaction.user
 
+    # 1. 무기 역할 갱신
     if weapon_name:
         for w in WEAPONS:
             r = discord.utils.get(guild.roles, name=w)
@@ -199,6 +200,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
             except discord.Forbidden:
                 pass
 
+    # 2. 직업 역할 갱신
     if job_name:
         for j in JOBS:
             r = discord.utils.get(guild.roles, name=j)
@@ -221,6 +223,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 except discord.Forbidden:
                     pass
 
+    # 3. 현재 무기/직업 상태 파악
     active_weapon = weapon_name
     if not active_weapon:
         for w in WEAPONS:
@@ -237,6 +240,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
                 active_job = j
                 break
 
+    # 4. 닉네임 태그 우선순위 판별 (직업 우선 -> 직업 없으면 무기)
     chosen_tag = None
     if active_job and active_job in JOBS:
         chosen_tag = active_job
@@ -314,7 +318,7 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 📝 자기소개 모달 UI (생일 입력 추가) ---
+# --- 📝 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
@@ -327,7 +331,6 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
-        # 1. 생일 포맷 정제 (숫자 4자리 추출)
         raw_bday = re.sub(r'[^0-9]', '', self.birthday.value.strip())
         bday_saved_msg = ""
         if len(raw_bday) == 4:
@@ -341,7 +344,6 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
                 BIRTHDAY_CACHE[interaction.guild.id][str(user.id)] = clean_bday
                 bday_saved_msg = f"\n🎂 생일 등록: **{month}월 {day}일** (당일 알림 예약)"
 
-        # 2. 닉네임 태그 유지 및 적용
         prefix_match = re.match(r'^(\[.*?\])\s*', current_nick)
         prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
@@ -769,12 +771,10 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
 @tasks.loop(minutes=1)
 async def daily_birthday_check():
     now_kst = datetime.now(KST)
-    # 오전 09시 00분에만 발송
     if now_kst.hour == 9 and now_kst.minute == 0:
         today_mmdd = now_kst.strftime("%m%d")
         
         for guild in bot.guilds:
-            # 캐시가 없으면 동기화 시도
             if guild.id not in BIRTHDAY_CACHE:
                 _, bdays = await fetch_database_from_channel(guild)
                 BIRTHDAY_CACHE[guild.id] = bdays
@@ -789,7 +789,6 @@ async def daily_birthday_check():
                         birthday_users.append(member)
 
             if birthday_users:
-                # 알림 채널 결정
                 channel = None
                 if DEFAULT_BIRTHDAY_CHANNEL_ID:
                     channel = guild.get_channel(DEFAULT_BIRTHDAY_CHANNEL_ID)
@@ -871,7 +870,6 @@ async def list_birthdays(interaction: discord.Interaction):
         await interaction.followup.send("🎂 등록된 생일 정보가 없습니다. `/자기소개` 또는 `/생일등록`으로 등록해 보세요!", ephemeral=True)
         return
 
-    # 월/일 순으로 정렬
     sorted_bdays = sorted(cached_bdays.items(), key=lambda x: x[1])
     lines = []
     for uid_str, bday_code in sorted_bdays:
@@ -887,6 +885,7 @@ async def list_birthdays(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
+# ⚔️ [본인에게만 표시되도록 수정됨] 무기 및 직업 선택 드롭다운 메뉴
 @bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -900,7 +899,8 @@ async def select_weapon_and_job(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
+    # ephemeral=True 설정으로 본인에게만 메시지가 출력됨
+    await interaction.response.send_message(embed=embed, view=LoadoutSelectView(), ephemeral=True)
 
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
 @app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 또는 전투직)")
@@ -1121,33 +1121,43 @@ async def create_poll(
     view = PollView(question=질문, options=options, author=interaction.user)
     await interaction.response.send_message(embed=view.make_embed(), view=view)
 
-@bot.tree.command(name="대여", description="[은행] 돈이나 물건을 빌려준 내역 박스를 생성합니다.")
+# 🏦 [대여 명령어]
+@bot.tree.command(name="대여", description="[은행] 돈이나 물건을 빌려준 내역 카드를 생성합니다.")
 @app_commands.describe(
     빌린사람="돈이나 물건을 빌려간 멤버",
     항목="대여 내용 (예: 5만 골드, 네더라이트 곡괭이 등)",
+    빌려준사람="빌려준 멤버 (비워두면 본인)",
     비고="추가 메모 (선택)"
 )
-async def loan_card(interaction: discord.Interaction, 빌린사람: discord.Member, 항목: str, 비고: Optional[str] = None):
-    if 빌린사람.id == interaction.user.id:
-        await interaction.response.send_message("❌ 자기 자신에게 빌려줄 수는 없습니다!", ephemeral=True)
+async def loan_card(
+    interaction: discord.Interaction, 
+    빌린사람: discord.Member, 
+    항목: str, 
+    빌려준사람: Optional[discord.Member] = None, 
+    비고: Optional[str] = None
+):
+    lender = 빌려준사람 if 빌려준사람 else interaction.user
+
+    if 빌린사람.id == lender.id:
+        await interaction.response.send_message("❌ 빌려준 사람과 빌린 사람이 같을 수 없습니다!", ephemeral=True)
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     embed = discord.Embed(
         title="🏦 [은행] 대여 등록",
-        description=f"{interaction.user.mention} ➔ {빌린사람.mention}",
+        description=f"{lender.mention} ➔ {빌린사람.mention}",
         color=discord.Color.gold()
     )
     embed.add_field(name="📦 대여 항목", value=f"**{항목}**", inline=False)
-    embed.add_field(name="👤 빌려준 사람", value=interaction.user.display_name, inline=True)
+    embed.add_field(name="👤 빌려준 사람", value=lender.display_name, inline=True)
     embed.add_field(name="🙋 빌린 사람", value=빌린사람.display_name, inline=True)
     embed.add_field(name="📌 상태", value="⏳ **미반납**", inline=True)
     if 비고:
         embed.add_field(name="📝 메모", value=비고, inline=False)
     embed.set_footer(text=f"등록 일시: {now_str} • 상환 완료 후 아래 버튼을 클릭하세요.")
 
-    view = LoanView(lender_id=interaction.user.id, borrower_id=빌린사람.id)
-    await interaction.response.send_message(content=f"{빌린사람.mention}", embed=embed, view=view)
+    view = LoanView(lender_id=lender.id, borrower_id=빌린사람.id)
+    await interaction.response.send_message(content=f"{빌린사람.mention} {lender.mention}", embed=embed, view=view)
 
 # 🎯 대규모 인원 추첨 명령어
 @bot.tree.command(name="추첨", description="팝업창을 열어 많은 인원을 복사/붙여넣기로 간편하게 추첨합니다.")
@@ -1368,7 +1378,6 @@ async def manual_sync(ctx):
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
         
-        # 생일 캐시 사전 로드
         _, bdays = await fetch_database_from_channel(ctx.guild)
         BIRTHDAY_CACHE[ctx.guild.id] = bdays
 
@@ -1383,11 +1392,9 @@ async def on_ready():
     bot.add_dynamic_items(DynamicLoanButton)
     bot.add_dynamic_items(DynamicKujiButton)
     
-    # 생일 체크 백그라운드 루프 시작
     if not daily_birthday_check.is_running():
         daily_birthday_check.start()
 
-    # 생일 캐시 사전 적재
     for guild in bot.guilds:
         try:
             _, bdays = await fetch_database_from_channel(guild)

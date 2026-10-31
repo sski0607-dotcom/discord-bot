@@ -766,7 +766,7 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
         await interaction.followup.send(content=f"📢 **균열석 기부자 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
 
 
-# --- 보부상 알림 비동기 태스크 ---
+# --- 보부상 알림 비동기 태스크 (멘션 제거 완료) ---
 async def merchant_timer_task(channel: discord.TextChannel, location: str, target_time: datetime):
     pre_notify_time = target_time - timedelta(minutes=5)
     now = datetime.now()
@@ -780,7 +780,8 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
             color=discord.Color.yellow()
         )
         try:
-            await channel.send(content="@everyone", embed=embed_pre)
+            # content="@everyone" 제거
+            await channel.send(embed=embed_pre)
         except Exception:
             pass
 
@@ -795,7 +796,8 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
         color=discord.Color.green()
     )
     try:
-        await channel.send(content="@everyone", embed=embed_arrive)
+        # content="@everyone" 제거
+        await channel.send(embed=embed_arrive)
     except Exception:
         pass
 
@@ -1075,7 +1077,7 @@ async def set_merchant_default_channel(interaction: discord.Interaction, 채널:
     DEFAULT_MERCHANT_CHANNEL_ID = 채널.id
     await interaction.response.send_message(f"✅ 앞으로 별도 지정이 없으면 {채널.mention} 채널로 보부상 알림이 전송됩니다!")
 
-# 🔔 [보부상 타이머 등록]
+# 🔔 [보부상 타이머 등록 - 멘션 제거 및 안내 문구 수정]
 @bot.tree.command(name="보부상등록", description="보부상 등장 예정 시간을 계산해 예약 알림을 설정합니다.")
 @app_commands.describe(
     지역="보부상이 등장하는 지역 이름 (예: 플로라)",
@@ -1127,7 +1129,7 @@ async def register_merchant(
     embed.add_field(name="⏳ 남은 시간", value=f"{시간}시간 {분}분 뒤", inline=True)
     embed.add_field(name="🎯 도착 예정 시각", value=f"**{target_str}** 경", inline=True)
     embed.add_field(name="📢 수신 채널", value=target_channel.mention, inline=True)
-    embed.add_field(name="📌 알림 규칙", value="등장 5분 전과 도착 정각에 `@everyone` 알림이 발송됩니다.", inline=False)
+    embed.add_field(name="📌 알림 규칙", value="등장 5분 전과 도착 정각에 채널 메시지가 발송됩니다.", inline=False)
     embed.set_footer(text=f"등록자: {interaction.user.display_name}")
 
     await interaction.followup.send(embed=embed)

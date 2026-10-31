@@ -532,7 +532,7 @@ class DynamicLoanButton(discord.ui.DynamicItem[discord.ui.Button], template=r'lo
             await interaction.response.send_message("❌ 메시지 정보를 읽을 수 없습니다.", ephemeral=True)
             return
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
         orig_embed = interaction.message.embeds[0]
         new_embed = orig_embed.copy()
         new_embed.color = discord.Color.green()
@@ -605,7 +605,7 @@ class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'ku
         picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
         
         is_finished = len(game["box"]) == 0
-        now_time = datetime.now().strftime("%H:%M")
+        now_time = datetime.now(KST).strftime("%H:%M")
         
         record = {
             "user_id": user_id,
@@ -766,10 +766,11 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
         await interaction.followup.send(content=f"📢 **균열석 기부자 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
 
 
-# --- 보부상 알림 비동기 태스크 (멘션 제거 완료) ---
+# --- 보부상 알림 비동기 태스크 (KST 타임존 적용 및 멘션 제거) ---
 async def merchant_timer_task(channel: discord.TextChannel, location: str, target_time: datetime):
+    # 1. 5분 전 알림 대기
     pre_notify_time = target_time - timedelta(minutes=5)
-    now = datetime.now()
+    now = datetime.now(KST)
     wait_pre = (pre_notify_time - now).total_seconds()
 
     if wait_pre > 0:
@@ -780,12 +781,12 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
             color=discord.Color.yellow()
         )
         try:
-            # content="@everyone" 제거
             await channel.send(embed=embed_pre)
         except Exception:
             pass
 
-    now = datetime.now()
+    # 2. 정각 알림 대기
+    now = datetime.now(KST)
     wait_final = (target_time - now).total_seconds()
     if wait_final > 0:
         await asyncio.sleep(wait_final)
@@ -796,7 +797,6 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
         color=discord.Color.green()
     )
     try:
-        # content="@everyone" 제거
         await channel.send(embed=embed_arrive)
     except Exception:
         pass
@@ -1077,7 +1077,7 @@ async def set_merchant_default_channel(interaction: discord.Interaction, 채널:
     DEFAULT_MERCHANT_CHANNEL_ID = 채널.id
     await interaction.response.send_message(f"✅ 앞으로 별도 지정이 없으면 {채널.mention} 채널로 보부상 알림이 전송됩니다!")
 
-# 🔔 [보부상 타이머 등록 - 멘션 제거 및 안내 문구 수정]
+# 🔔 [보부상 타이머 등록 - KST 기준 타임존 적용 & 멘션 제거]
 @bot.tree.command(name="보부상등록", description="보부상 등장 예정 시간을 계산해 예약 알림을 설정합니다.")
 @app_commands.describe(
     지역="보부상이 등장하는 지역 이름 (예: 플로라)",
@@ -1105,7 +1105,7 @@ async def register_merchant(
     if not target_channel:
         target_channel = interaction.channel
 
-    now = datetime.now()
+    now = datetime.now(KST)
     target_time = now + timedelta(minutes=total_minutes)
     target_str = target_time.strftime("%H시 %M분")
 
@@ -1264,7 +1264,7 @@ async def loan_card(
         await interaction.response.send_message("❌ 빌려준 사람과 빌린 사람이 같을 수 없습니다!", ephemeral=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     embed = discord.Embed(
         title="🏦 [은행] 대여 등록",
         description=f"{lender.mention} ➔ {빌린사람.mention}",
@@ -1393,7 +1393,7 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
         await interaction.followup.send("❌ 봇에게는 부여할 수 없습니다.", ephemeral=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     warn_entry = {"reason": 사유, "moderator": interaction.user.display_name, "date": now_str}
     
     await log_warning_action(interaction.guild, 유저.id, "add", warn_entry)

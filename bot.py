@@ -354,12 +354,12 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 📝 자기소개 모달 UI ---
+# --- 📝 자기소개 모달 UI (생일 선택 입력 적용) ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
     guild_name = discord.ui.TextInput(label="길드 이름", placeholder="예: 월영", required=True, max_length=20)
-    birthday = discord.ui.TextInput(label="생일 (월일 4자리 숫자)", placeholder="예: 0607 또는 1029", required=True, max_length=6)
+    birthday = discord.ui.TextInput(label="생일 (월일 4자리 숫자, 선택)", placeholder="예: 0607 또는 1029 (비워두기 가능)", required=False, max_length=6)
     gender = discord.ui.TextInput(label="성별 (선택)", placeholder="예: 남자 / 여자", required=False, max_length=10)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -367,19 +367,22 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         user = interaction.user
         current_nick = user.display_name
         
-        raw_bday = re.sub(r'[^0-9]', '', self.birthday.value.strip())
+        # 1. 생일 입력 여부 확인 및 저장 (선택 사항)
         bday_saved_msg = ""
-        if len(raw_bday) == 4:
-            month = int(raw_bday[:2])
-            day = int(raw_bday[2:])
-            if 1 <= month <= 12 and 1 <= day <= 31:
-                clean_bday = f"{month:02d}{day:02d}"
-                await log_birthday_action(interaction.guild, user.id, clean_bday)
-                if interaction.guild.id not in BIRTHDAY_CACHE:
-                    BIRTHDAY_CACHE[interaction.guild.id] = {}
-                BIRTHDAY_CACHE[interaction.guild.id][str(user.id)] = clean_bday
-                bday_saved_msg = f"\n🎂 생일 등록: **{month}월 {day}일** (당일 알림 예약)"
+        if self.birthday.value:
+            raw_bday = re.sub(r'[^0-9]', '', self.birthday.value.strip())
+            if len(raw_bday) == 4:
+                month = int(raw_bday[:2])
+                day = int(raw_bday[2:])
+                if 1 <= month <= 12 and 1 <= day <= 31:
+                    clean_bday = f"{month:02d}{day:02d}"
+                    await log_birthday_action(interaction.guild, user.id, clean_bday)
+                    if interaction.guild.id not in BIRTHDAY_CACHE:
+                        BIRTHDAY_CACHE[interaction.guild.id] = {}
+                    BIRTHDAY_CACHE[interaction.guild.id][str(user.id)] = clean_bday
+                    bday_saved_msg = f"\n🎂 생일 등록: **{month}월 {day}일** (당일 알림 예약)"
 
+        # 2. 닉네임 태그 유지 및 적용
         prefix_match = re.match(r'^(\[.*?\])\s*', current_nick)
         prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
@@ -768,7 +771,6 @@ class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기�
 
 # --- 보부상 알림 비동기 태스크 (KST 타임존 적용 및 멘션 제거) ---
 async def merchant_timer_task(channel: discord.TextChannel, location: str, target_time: datetime):
-    # 1. 5분 전 알림 대기
     pre_notify_time = target_time - timedelta(minutes=5)
     now = datetime.now(KST)
     wait_pre = (pre_notify_time - now).total_seconds()
@@ -785,7 +787,6 @@ async def merchant_timer_task(channel: discord.TextChannel, location: str, targe
         except Exception:
             pass
 
-    # 2. 정각 알림 대기
     now = datetime.now(KST)
     wait_final = (target_time - now).total_seconds()
     if wait_final > 0:

@@ -105,7 +105,7 @@ async def send_error_log(guild: Optional[discord.Guild], error_title: str, error
     except Exception:
         pass
 
-# --- 채널 기반 영구 데이터 관리 (최신 5,000건 역순 수집 후 과거순 정렬 복원) ---
+# --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
@@ -223,7 +223,6 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
-# DB 채널 전송 성공 후 캐시 누적 갱신
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
         return
@@ -276,7 +275,6 @@ async def log_voice_config(guild: discord.Guild, channel_id: int):
     await channel.send(embed=embed)
     VOICE_NOTICE_CHANNELS[guild.id] = channel_id
 
-# DB 채널 전송 성공 후 메모리 플래그 갱신
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
         return
@@ -519,7 +517,6 @@ async def daily_voice_check():
             if now.hour == 0 and now.weekday() == 0 and guild_flags.get("weekly") != yesterday_str:
                 weekly_failed = []
                 weekly_pings = []
-                # 지난주 월요일부터 일요일까지 7일 계산
                 past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
 
                 for member in target_members:
@@ -733,9 +730,63 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
         await interaction.followup.send(embed=embed)
 
 
+# --- 📑 [신규] 공지 미확인자 페이지네이션 View ---
+class NoticePaginationView(discord.ui.View):
+    def __init__(self, author_id: int, base_embed: discord.Embed, chunks: List[List[str]], total_unreacted: int):
+        super().__init__(timeout=180)
+        self.author_id = author_id
+        self.base_embed = base_embed
+        self.chunks = chunks
+        self.total_unreacted = total_unreacted
+        self.current_page = 0
+        self.max_page = len(chunks) - 1
+
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = (self.current_page == 0)
+        self.next_button.disabled = (self.current_page == self.max_page)
+
+    def get_current_embed(self) -> discord.Embed:
+        # 기존 요약 필드 복사 후 현재 페이지의 미반응자 목록 필드 추가
+        embed = self.base_embed.copy()
+        current_chunk = self.chunks[self.current_page]
+        
+        start_idx = self.current_page * 25 + 1
+        end_idx = start_idx + len(current_chunk) - 1
+
+        embed.add_field(
+            name=f"⚠️ 미반응 멤버 명단 ({start_idx}~{end_idx}명 / 총 {self.total_unreacted}명)",
+            value=" ".join(current_chunk),
+            inline=False
+        )
+        embed.set_footer(text=f"페이지 {self.current_page + 1} / {self.max_page + 1} (하단 버튼을 눌러 넘겨보세요)")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ 명령어를 실행한 관리자만 페이지를 넘길 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, custom_id="notice_prev_btn")
+    async def prev_button_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
+
+    @discord.ui.button(label="다음 ▶", style=discord.ButtonStyle.primary, custom_id="notice_next_btn")
+    async def next_button_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.max_page:
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
+
+
 # --- 슬래시 명령어 세트 ---
 
-# 📢 [공지 이모지 미반응자 확인]
+# 📢 [공지 이모지 미반응자 확인 - 페이지 넘김 버튼 전원 확인]
 @bot.tree.command(name="공지미확인", description="[관리자 전용] 공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
 @app_commands.describe(메시지id="특정 공지 글을 확인할 경우 메시지 ID 입력 (비워두면 본인의 가장 최근 @everyone 공지)")
 async def check_notice_reactions(interaction: discord.Interaction, 메시지id: Optional[str] = None):
@@ -786,26 +837,40 @@ async def check_notice_reactions(interaction: discord.Interaction, 메시지id: 
     summary_content = (target_message.content[:40] + "...") if len(target_message.content) > 40 else target_message.content
     msg_link = f"https://discord.com/channels/{guild.id}/{channel.id}/{target_message.id}"
 
-    embed = discord.Embed(
+    base_embed = discord.Embed(
         title="📢 [공지 이모지 확인 현황]",
         description=f"🔗 [해당 공지 바로가기]({msg_link})\n📝 **공지 요약:** {summary_content or '(임베드 공지)'}",
         color=discord.Color.orange() if unreacted_members else discord.Color.green()
     )
-    embed.add_field(name="👥 전체 대상 인원", value=f"{len(target_members)}명", inline=True)
-    embed.add_field(name="✅ 확인 (이모지 등록)", value=f"{len(target_members) - len(unreacted_members)}명", inline=True)
-    embed.add_field(name="❌ 미확인 (미반응)", value=f"**{len(unreacted_members)}명**", inline=True)
+    base_embed.add_field(name="👥 전체 대상 인원", value=f"{len(target_members)}명", inline=True)
+    base_embed.add_field(name="✅ 확인 (이모지 등록)", value=f"{len(target_members) - len(unreacted_members)}명", inline=True)
+    base_embed.add_field(name="❌ 미확인 (미반응)", value=f"**{len(unreacted_members)}명**", inline=True)
 
-    if unreacted_members:
-        mentions = [m.mention for m in unreacted_members]
-        chunk_size = 35
-        for i in range(0, len(mentions), chunk_size):
-            chunk = mentions[i:i + chunk_size]
-            field_name = "⚠️ 미반응 멤버 명단" if i == 0 else f"⚠️ 미반응 멤버 명단 ({i+1}~{i+len(chunk)})"
-            embed.add_field(name=field_name, value=" ".join(chunk), inline=False)
+    if not unreacted_members:
+        base_embed.add_field(name="🎉 전원 확인 완료!", value="모든 길드원/수습생이 공지에 이모지를 남겼습니다.", inline=False)
+        await interaction.followup.send(embed=base_embed, ephemeral=True)
+        return
+
+    # 순수 멘션 리스트 생성
+    mentions = [m.mention for m in unreacted_members]
+
+    # 한 페이지당 25명씩 분할
+    chunk_size = 25
+    chunks = [mentions[i:i + chunk_size] for i in range(0, len(mentions), chunk_size)]
+
+    # 1페이지만 있는 경우 버튼 없이 바로 전송
+    if len(chunks) == 1:
+        base_embed.add_field(name=f"⚠️ 미반응 멤버 명단 ({len(unreacted_members)}명)", value=" ".join(chunks[0]), inline=False)
+        await interaction.followup.send(embed=base_embed, ephemeral=True)
     else:
-        embed.add_field(name="🎉 전원 확인 완료!", value="모든 길드원/수습생이 공지에 이모지를 남겼습니다.", inline=False)
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
+        # 여러 페이지인 경우 페이지 넘김 View 연결
+        view = NoticePaginationView(
+            author_id=interaction.user.id,
+            base_embed=base_embed,
+            chunks=chunks,
+            total_unreacted=len(unreacted_members)
+        )
+        await interaction.followup.send(embed=view.get_current_embed(), view=view, ephemeral=True)
 
 # 🪜 [사다리 타기]
 @bot.tree.command(name="사다리", description="현재 통화방에 있는 인원으로 사다리 타기를 진행합니다.")
@@ -856,7 +921,7 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
-# 🎙️ [통화 시간 조회 - 대괄호 중복 제거 및 이번 주 / 지난 주 기록 완벽 지원]
+# 🎙️ [통화 시간 조회 - 대괄호 중복 제거 및 이번 주 / 지난 주 기록 지원]
 @bot.tree.command(name="통화시간", description="오늘, 이번 주, 지난 주 및 최근 누적 통화방 참여 시간을 확인합니다.")
 @app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
 async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
@@ -882,7 +947,6 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     today_sec = guild_data.get(today_str, {}).get(u_str, 0)
     current_status = "❌ 현재 미접속"
 
-    # 실시간 통화 세션 추가 시간 계산
     cur_live_diff = 0
     if target.id in VOICE_ACTIVE_SESSIONS:
         sess = VOICE_ACTIVE_SESSIONS[target.id]
@@ -900,8 +964,8 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
-    # 2. 이번 주 누적 (이번 주 월요일 00:00부터 오늘까지)
-    current_weekday = now.weekday()  # 월요일=0, 일요일=6
+    # 2. 이번 주 누적 (월요일 00:00부터 오늘까지)
+    current_weekday = now.weekday()
     days_from_monday = current_weekday
     this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_from_monday + 1)]
     this_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in this_week_days) + cur_live_diff
@@ -911,11 +975,11 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     last_week_days = [(last_week_monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     last_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in last_week_days)
 
-    # 4. 최근 7일 누적 (오늘 포함 최근 7일 이동 합계)
+    # 4. 최근 7일 누적
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
-    # 닉네임 앞뒤의 불필요한 대괄호 중복 제거: target.display_name 그대로 1개만 출력
+    # 닉네임 대괄호 중복 제거: target.display_name 그대로 1개만 출력
     embed = discord.Embed(
         title=f"🎙️ {target.display_name} 님의 통화방 시간표",
         color=discord.Color.teal()
@@ -930,7 +994,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # 🎙️ [통화 기준 미달자 확인 - 관리자용]
-@bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 이번 주/최근 11시간 미달자를 확인합니다.")
+@bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 최근 7일 11시간 미달자를 확인합니다.")
 @app_commands.describe(구분="확인할 기준 (일일 or 주간)")
 @app_commands.choices(구분=[
     app_commands.Choice(name="📅 오늘 1시간 미달자", value="일일"),

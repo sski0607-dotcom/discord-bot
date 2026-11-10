@@ -44,7 +44,19 @@ ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
 # 👋 신규 멤버 환영 메시지 설정
 # Render 환경변수 또는 .env에 WELCOME_CHANNEL_ID를 설정하세요.
-WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
+def read_int_env(name: str, default: int = 0) -> int:
+    """환경변수를 안전하게 정수로 읽습니다."""
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f"[환경변수 오류] {name} 값이 정수가 아닙니다. 환영 기능을 비활성화합니다.")
+        return default
+
+
+WELCOME_CHANNEL_ID = read_int_env("WELCOME_CHANNEL_ID", 0)
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "두 개의 길드, 하나의 밤.")
 
 # 💤 [중요] 시간 측정을 제외할 잠수방 음성 채널 ID
@@ -82,15 +94,3 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
 
 # 서버별 설정 매핑 {guild_id: channel_id}
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
-MEMBER_COUNTER_CHANNELS: Dict[int, int] = {}
-
-# 통화방 세션 메모리 {user_id: {"active": bool, "start_time": datetime, "guild_id": int}}
-VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
-# DB에서 복원된 누적 통화 시간 {guild_id: {date_str(YYYY-MM-DD): {user_id_str: seconds}}}
-VOICE_DAILY_CACHE: Dict[int, Dict[str, Dict[str, int]]] = {}
-
-# 서버별 정산 실행 플래그 {guild_id: {"night": date_str, "daily": date_str, "weekly": date_str}}
-SERVER_AUDIT_FLAGS: Dict[int, Dict[str, str]] = {}
-
-def is_admin_or_mod(interaction: discord.Interaction) -> bool:
-    perms = interaction.user.guild_permissions

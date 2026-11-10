@@ -4,13 +4,11 @@ import json
 import random
 import threading
 import asyncio
-import urllib.request
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 from flask import Flask
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # --- 0. 백그라운드 웹 서버 (Render 슬립 방지) ---
@@ -37,73 +35,61 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# 🚨 [중요] 경고 데이터를 영구 보관할 비공개 채널 ID
-WARN_LOG_CHANNEL_ID = 1542004718606487672
+# 🚨 [중요] 경고 및 통화 기록을 보관할 비공개 채널 ID
+WARN_LOG_CHANNEL_ID = 1569705414839242884
 
-# --- 보부상 메모리 관리 ---
-MERCHANT_TASKS: Dict[str, asyncio.Task] = {}
-MERCHANT_DATA: Dict[str, dict] = {}
-DEFAULT_MERCHANT_CHANNEL_ID: Optional[int] = None
+# 📢 공지 확인 대상 채널 ID
+ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
 
-# --- 메뉴 추천 데이터베이스 ---
-MENU_DATA = {
-    "한식": [
-        "김치찌개", "된장찌개", "제육볶음", "소불고기", "비빔밥", "순두부찌개",
-        "닭볶음탕", "국밥 (순대국밥/돼지국밥)", "갈비탕", "육개장", "삼겹살",
-        "부대찌개", "쌈밥", "설렁탕", "김치볶음밥", "감자탕"
-    ],
-    "중식": [
-        "짜장면", "짬뽕", "탕수육", "볶음밥", "마파두부밥", "마라탕",
-        "마라샹궈", "꿔바로우", "유린기", "깐풍기", "군만두와 짬뽕밥"
-    ],
-    "일식": [
-        "돈가스 (카츠)", "초밥 (스시)", "라멘", "가츠동 / 규동", "우동",
-        "사케동 (연어덮밥)", "메밀소바", "텐동 (튀김덮밥)", "야키소바", "카레라이스"
-    ],
-    "양식": [
-        "토마토 파스타", "크림 파스타", "알리오 올리오", "스테이크", "화덕피자",
-        "수제버거", "리조또", "바베큐 폭립", "감바스 알 아히요", "필라프"
-    ],
-    "분식 / 패스트푸드": [
-        "떡볶이 & 튀김", "김밥 & 라면", "순대 & 어묵", "치킨버거", "불고기버거",
-        "피자 한 판", "핫도그 & 샌드위치", "서브웨이", "치킨 & 감자튀김"
-    ],
-    "야식 / 안주": [
-        "후라이드 / 양념치킨", "족발 & 보쌈", "곱창 / 막창 구이", "닭발 & 계란찜",
-        "골뱅이 소면", "피맥 (피자+맥주)", "오돌뼈 & 주먹밥", "모듬전 & 막걸리"
-    ],
-    "가벼운 식사 / 샐러드": [
-        "닭가슴살 샐러드 웜볼", "포케 (연어/참치)", "그릭요거트 볼", "서브웨이 로스트치킨",
-        "베이글 & 크림치즈", "클럽 샌드위치"
-    ]
-}
+# --- 통화방 시간 및 공지 확인 대상 역할 목록 ---
+TARGET_ROLES = [
+    "월영 길드원",
+    "월영 수습생",
+    "영월 길드원",
+    "영월 수습생",
+    "은월 길드원",
+    "은월 수습생"
+]
 
-# --- 채널 기반 경고 데이터 관리 ---
+def is_target_member(member: discord.Member) -> bool:
+    """지정된 길드원/수습생 역할을 하나라도 가지고 있는지 확인"""
+    return any(role.name in TARGET_ROLES for role in member.roles)
+
+VOICE_NOTICE_CHANNEL_ID: Optional[int] = None
+
+# 통화방 세션 메모리 {user_id: {"active": bool, "start_time": datetime, "guild_id": int}}
+VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
+# DB에서 복원된 누적 통화 시간 {guild_id: {date_str(YYYY-MM-DD): {user_id_str: seconds}}}
+VOICE_DAILY_CACHE: Dict[int, Dict[str, Dict[str, int]]] = {}
+
+# --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
-        return {}
+        return {}, {}
     
     channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
     if not channel:
         try:
             channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
-        except Exception as e:
-            print(f"⚠️ DB 로그 채널 탐색 실패: {e}")
-            return {}
+        except Exception:
+            return {}, {}
 
     warnings = {}
+    voice_records: Dict[str, Dict[str, int]] = {}
+    global VOICE_NOTICE_CHANNEL_ID
 
     try:
-        async for message in channel.history(limit=1000, oldest_first=True):
+        async for message in channel.history(limit=2500, oldest_first=True):
             if message.author.id == bot.user.id and message.embeds:
                 for embed in message.embeds:
                     if not (embed.footer and embed.footer.text):
                         continue
                     footer_text = embed.footer.text
 
+                    # 1. 경고 데이터 복원
                     if footer_text.startswith("WARN_DATA:"):
                         try:
                             raw_data = footer_text.replace("WARN_DATA:", "").strip()
@@ -128,10 +114,34 @@ async def fetch_database_from_channel(guild: discord.Guild):
                                     warnings[u_id] = []
                         except Exception:
                             continue
+
+                    # 2. 통화방 누적 시간 복원
+                    elif footer_text.startswith("VOICE_LOG:"):
+                        try:
+                            raw_data = footer_text.replace("VOICE_LOG:", "").strip()
+                            data = json.loads(raw_data)
+                            d_str = data["date"]
+                            u_id = str(data["user_id"])
+                            dur = int(data.get("duration", 0))
+
+                            if d_str not in voice_records:
+                                voice_records[d_str] = {}
+                            voice_records[d_str][u_id] = voice_records[d_str].get(u_id, 0) + dur
+                        except Exception:
+                            continue
+
+                    # 3. 통화 알림 채널 ID 복원
+                    elif footer_text.startswith("VOICE_CONFIG:"):
+                        try:
+                            raw_data = footer_text.replace("VOICE_CONFIG:", "").strip()
+                            cfg = json.loads(raw_data)
+                            VOICE_NOTICE_CHANNEL_ID = cfg.get("channel_id")
+                        except Exception:
+                            continue
     except Exception as e:
         print(f"⚠️ 히스토리 탐색 중 오류: {e}")
 
-    return warnings
+    return warnings, voice_records
 
 async def log_warning_action(guild: discord.Guild, user_id: int, action: str, data: dict):
     if WARN_LOG_CHANNEL_ID == 0:
@@ -154,26 +164,287 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
+async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
+    if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    if guild.id not in VOICE_DAILY_CACHE:
+        VOICE_DAILY_CACHE[guild.id] = {}
+    if date_str not in VOICE_DAILY_CACHE[guild.id]:
+        VOICE_DAILY_CACHE[guild.id][date_str] = {}
+    
+    u_str = str(user_id)
+    VOICE_DAILY_CACHE[guild.id][date_str][u_str] = VOICE_DAILY_CACHE[guild.id][date_str].get(u_str, 0) + duration_sec
+
+    embed = discord.Embed(
+        title="🎙️ [통화 DB 로그] RECORD",
+        color=discord.Color.dark_blue()
+    )
+    embed.add_field(name="User ID", value=str(user_id), inline=True)
+    embed.add_field(name="Date", value=date_str, inline=True)
+    embed.add_field(name="Duration", value=f"{duration_sec}초 ({duration_sec // 60}분)", inline=True)
+
+    payload = {"date": date_str, "user_id": user_id, "duration": duration_sec}
+    embed.set_footer(text=f"VOICE_LOG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+async def log_voice_config(guild: discord.Guild, channel_id: int):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    embed = discord.Embed(
+        title="🎙️ [통화 설정 DB 로그] NOTICE_CHANNEL",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Notice Channel ID", value=str(channel_id), inline=True)
+    payload = {"channel_id": channel_id}
+    embed.set_footer(text=f"VOICE_CONFIG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
 def is_admin_or_mod(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions
     return perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
 
-def find_guild_member(guild: discord.Guild, query: str) -> Optional[discord.Member]:
-    query = query.strip()
-    if not query:
-        return None
-        
-    match = re.match(r'<@!?(\d+)>', query)
-    if match:
-        return guild.get_member(int(match.group(1)))
-        
-    query_lower = query.lower()
-    for m in guild.members:
-        if m.bot:
-            continue
-        if query_lower in m.display_name.lower() or query_lower in m.name.lower():
-            return m
-    return None
+def format_seconds(seconds: int) -> str:
+    hrs = seconds // 3600
+    mins = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hrs > 0:
+        return f"{hrs}시간 {mins}분 {secs}초"
+    elif mins > 0:
+        return f"{mins}분 {secs}초"
+    return f"{secs}초"
+
+# --- 🎙️ 통화방 출결 및 헤드셋 끔 잠수 판정 리스너 ---
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    if not is_target_member(member):
+        if member.id in VOICE_ACTIVE_SESSIONS:
+            VOICE_ACTIVE_SESSIONS.pop(member.id, None)
+        return
+
+    now = datetime.now(KST)
+    user_id = member.id
+    guild = member.guild
+
+    # 1. 방 퇴장
+    if before.channel and not after.channel:
+        if user_id in VOICE_ACTIVE_SESSIONS:
+            sess = VOICE_ACTIVE_SESSIONS.pop(user_id)
+            if sess["active"] and sess["start_time"]:
+                duration = int((now - sess["start_time"]).total_seconds())
+                date_str = sess["start_time"].strftime("%Y-%m-%d")
+                await log_voice_duration(guild, user_id, date_str, duration)
+        return
+
+    # 2. 방 입장
+    if not before.channel and after.channel:
+        is_deaf = after.self_deaf or after.deaf
+        VOICE_ACTIVE_SESSIONS[user_id] = {
+            "active": not is_deaf,
+            "start_time": now if not is_deaf else None,
+            "guild_id": guild.id
+        }
+        return
+
+    # 3. 채널 이동 및 헤드셋 끔 상태 변경
+    if before.channel and after.channel:
+        was_deaf = before.self_deaf or before.deaf
+        is_deaf = after.self_deaf or after.deaf
+
+        if not was_deaf and is_deaf:
+            if user_id in VOICE_ACTIVE_SESSIONS:
+                sess = VOICE_ACTIVE_SESSIONS[user_id]
+                if sess["active"] and sess["start_time"]:
+                    duration = int((now - sess["start_time"]).total_seconds())
+                    date_str = sess["start_time"].strftime("%Y-%m-%d")
+                    await log_voice_duration(guild, user_id, date_str, duration)
+                sess["active"] = False
+                sess["start_time"] = None
+
+        elif was_deaf and not is_deaf:
+            VOICE_ACTIVE_SESSIONS[user_id] = {
+                "active": True,
+                "start_time": now,
+                "guild_id": guild.id
+            }
+
+# --- 🕛 밤 9시(21:00 KST) 당일 미달 사전 경고 & 자정(00:00 KST) 정산 루프 ---
+@tasks.loop(minutes=1)
+async def daily_voice_check():
+    now = datetime.now(KST)
+
+    # 1. 매일 밤 9시(21:00 KST) 사전 알림
+    if now.hour == 21 and now.minute == 0:
+        today_str = now.strftime("%Y-%m-%d")
+        past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+        for guild in bot.guilds:
+            if guild.id not in VOICE_DAILY_CACHE:
+                _, v_records = await fetch_database_from_channel(guild)
+                VOICE_DAILY_CACHE[guild.id] = v_records
+
+            channel = None
+            if VOICE_NOTICE_CHANNEL_ID:
+                channel = guild.get_channel(VOICE_NOTICE_CHANNEL_ID)
+            if not channel:
+                channel = guild.system_channel
+            if not channel:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).send_messages:
+                        channel = ch
+                        break
+
+            if not channel:
+                continue
+
+            guild_data = VOICE_DAILY_CACHE.get(guild.id, {})
+            target_members = [m for m in guild.members if not m.bot and is_target_member(m)]
+
+            pending_members = []
+            mention_list = []
+
+            for member in target_members:
+                today_spent = guild_data.get(today_str, {}).get(str(member.id), 0)
+                if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
+                    today_spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
+
+                week_spent = 0
+                for d_str in past_7_days:
+                    week_spent += guild_data.get(d_str, {}).get(str(member.id), 0)
+                if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
+                    week_spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
+
+                if today_spent < 3600:
+                    needed_min = (3600 - today_spent) // 60
+                    pending_members.append(
+                        f"• {member.mention} ({member.display_name}) - 오늘 `{format_seconds(today_spent)}` (앞으로 `{needed_min}분` 필요 / 이번 주: `{format_seconds(week_spent)}`)"
+                    )
+                    mention_list.append(member.mention)
+
+            if pending_members:
+                embed_reminder = discord.Embed(
+                    title="⏰ [통화방 출결 사전 알림] 자정 마감 3시간 전!",
+                    description=(
+                        "오늘 자정(24:00)까지 **최소 1시간** 통화방 참여를 완료해야 합니다!\n"
+                        "아직 1시간을 채우지 못한 분들은 자정 전에 통화방에 접속해 주세요.\n\n"
+                        "*(※ 헤드셋 끔 상태는 시간이 누적되지 않으니 주의해 주세요!)*"
+                    ),
+                    color=discord.Color.gold()
+                )
+                cut_list = pending_members[:25]
+                text = "\n".join(cut_list)
+                if len(pending_members) > 25:
+                    text += f"\n...외 {len(pending_members) - 25}명"
+                embed_reminder.add_field(name=f"⚠️ 오늘 참여 시간 부족 ({len(pending_members)}명)", value=text, inline=False)
+                embed_reminder.set_footer(text="매일 밤 9시 자동 발송")
+
+                mentions_pings = " ".join(mention_list[:40])
+                await channel.send(content=f"📢 {mentions_pings}", embed=embed_reminder)
+
+    # 2. 매일 자정(00:00 KST) 최종 정산
+    elif now.hour == 0 and now.minute == 0:
+        yesterday_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        for u_id, sess in list(VOICE_ACTIVE_SESSIONS.items()):
+            if sess["active"] and sess["start_time"]:
+                duration = int((now - sess["start_time"]).total_seconds())
+                guild = bot.get_guild(sess["guild_id"])
+                if guild:
+                    await log_voice_duration(guild, u_id, yesterday_str, duration)
+                sess["start_time"] = now
+
+        for guild in bot.guilds:
+            if guild.id not in VOICE_DAILY_CACHE:
+                _, v_records = await fetch_database_from_channel(guild)
+                VOICE_DAILY_CACHE[guild.id] = v_records
+
+            channel = None
+            if VOICE_NOTICE_CHANNEL_ID:
+                channel = guild.get_channel(VOICE_NOTICE_CHANNEL_ID)
+            if not channel:
+                channel = guild.system_channel
+            if not channel:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).send_messages:
+                        channel = ch
+                        break
+
+            if not channel:
+                continue
+
+            guild_data = VOICE_DAILY_CACHE.get(guild.id, {})
+            target_members = [m for m in guild.members if not m.bot and is_target_member(m)]
+
+            yest_records = guild_data.get(yesterday_str, {})
+            daily_failed = []
+            daily_pings = []
+            for member in target_members:
+                spent = yest_records.get(str(member.id), 0)
+                if spent < 3600:
+                    daily_failed.append(f"• {member.mention} ({member.display_name}) - `{format_seconds(spent)}` / 1시간")
+                    daily_pings.append(member.mention)
+
+            embed_daily = discord.Embed(
+                title=f"📋 [일일 통화시간 정산] {yesterday_str}",
+                description="길드원/수습생 대상 하루 최소 **1시간** 통화방 참여 미달자 명단입니다.",
+                color=discord.Color.red() if daily_failed else discord.Color.green()
+            )
+            if daily_failed:
+                cut_list = daily_failed[:30]
+                more_cnt = len(daily_failed) - 30
+                embed_text = "\n".join(cut_list)
+                if more_cnt > 0:
+                    embed_text += f"\n...외 {more_cnt}명"
+                embed_daily.add_field(name=f"🚨 일일 미달 확정자 (총 {len(daily_failed)}명)", value=embed_text, inline=False)
+                await channel.send(content=" ".join(daily_pings[:40]), embed=embed_daily)
+            else:
+                embed_daily.add_field(name="🎉 전원 달성!", value="어제 모든 대상 멤버가 1시간 이상 통화방에 참여했습니다.", inline=False)
+                await channel.send(embed=embed_daily)
+
+            if now.weekday() == 0:
+                weekly_failed = []
+                weekly_pings = []
+                past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
+                for member in target_members:
+                    week_spent = 0
+                    for d_str in past_7_days:
+                        week_spent += guild_data.get(d_str, {}).get(str(member.id), 0)
+
+                    if week_spent < 39600:
+                        weekly_failed.append(f"• {member.mention} ({member.display_name}) - `{format_seconds(week_spent)}` / 11시간")
+                        weekly_pings.append(member.mention)
+
+                embed_weekly = discord.Embed(
+                    title=f"📊 [주간 통화시간 결산] 지난주 종합",
+                    description="길드원/수습생 대상 일주일 최소 **11시간** 통화방 참여 미달자 명단입니다.",
+                    color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
+                )
+                if weekly_failed:
+                    cut_w = weekly_failed[:30]
+                    more_w = len(weekly_failed) - 30
+                    w_text = "\n".join(cut_w)
+                    if more_w > 0:
+                        w_text += f"\n...외 {more_w}명"
+                    embed_weekly.add_field(name=f"🚨 주간 미달 확정자 (총 {len(weekly_failed)}명)", value=w_text, inline=False)
+                    await channel.send(content=" ".join(weekly_pings[:40]), embed=embed_weekly)
+                else:
+                    embed_weekly.add_field(name="👑 전원 달성!", value="지난주 모든 대상 멤버가 11시간 이상 통화방에 참여했습니다.", inline=False)
+                    await channel.send(embed=embed_weekly)
 
 # --- 무기 및 직업 목록 ---
 WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
@@ -276,7 +547,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         ephemeral=True
     )
 
-
 # --- ⚔️ 무기 & 직업 드롭다운 View ---
 class WeaponSelect(discord.ui.Select):
     def __init__(self):
@@ -318,8 +588,7 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(JobSelect())
         self.add_item(LoadoutConfirmButton())
 
-
-# --- 📝 자기소개 모달 UI (생일 제거 완료) ---
+# --- 📝 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
@@ -348,7 +617,6 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
             ephemeral=True
         )
 
-
 class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
     notice_title = discord.ui.TextInput(label="공지 제목", placeholder="예: 길드 레이드 안내", required=True, max_length=50)
     notice_content = discord.ui.TextInput(label="공지 본문", placeholder="내용을 입력하세요.", style=discord.TextStyle.paragraph, required=True, max_length=1500)
@@ -363,508 +631,266 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
         await interaction.followup.send(embed=embed)
 
 
-# 🎯 대규모 인원 추첨 팝업창 모달
-class LotteryModal(discord.ui.Modal, title="🎯 대규모 인원 추첨"):
-    event_name = discord.ui.TextInput(label="이벤트명", placeholder="예: 균열석 기부자 추첨", required=True, max_length=50)
-    winner_count = discord.ui.TextInput(label="당첨 인원수 (숫자만)", placeholder="예: 5", required=True, max_length=4)
-    participants_input = discord.ui.TextInput(
-        label="참여자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)", 
-        placeholder="루트, 김민수, 우기\n또는 멘션 나열",
-        style=discord.TextStyle.paragraph, 
-        required=True, 
-        max_length=4000
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        
-        try:
-            w_count = int(self.winner_count.value.strip())
-        except ValueError:
-            await interaction.followup.send("❌ 당첨 인원수에는 숫자만 입력해 주세요!", ephemeral=True)
-            return
-
-        raw_names = [name.strip() for name in re.split(r'[,\n]', self.participants_input.value) if name.strip()]
-        participants = []
-        for name in raw_names:
-            mem = find_guild_member(interaction.guild, name)
-            if mem and mem not in participants:
-                participants.append(mem)
-
-        total_count = len(participants)
-        if total_count < 2:
-            await interaction.followup.send("❌ 최소 2명 이상의 유저를 입력해 주세요!", ephemeral=True)
-            return
-
-        if w_count <= 0 or w_count > total_count:
-            await interaction.followup.send(f"❌ 당첨 인원은 1명 이상, 입력된 총 인원({total_count}명) 이하여야 합니다.", ephemeral=True)
-            return
-
-        winners = random.sample(participants, w_count)
-        winner_mentions = [w.mention for w in winners]
-
-        embed = discord.Embed(
-            title=f"🎉 [추첨 결과] {self.event_name.value}",
-            description=f"총 **{total_count}명** 중 **{w_count}명**이 당첨되었습니다!\n\n👑 **당첨자 명단:**\n" + "\n".join([f"• {w.mention} ({w.display_name})" for w in winners]),
-            color=discord.Color.gold()
-        )
-        embed.set_footer(text=f"주최자: {interaction.user.display_name}")
-
-        await interaction.followup.send(content=" ".join(winner_mentions), embed=embed)
-
-
-class PollButton(discord.ui.Button):
-    def __init__(self, label: str, index: int):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary, custom_id=f"poll_opt_{index}")
-        self.index = index
-
-    async def callback(self, interaction: discord.Interaction):
-        view: PollView = self.view
-        user_id = interaction.user.id
-        view.votes[user_id] = self.index
-        await interaction.response.edit_message(embed=view.make_embed(), view=view)
-
-
-class PollView(discord.ui.View):
-    def __init__(self, question: str, options: List[str], author: discord.Member):
-        super().__init__(timeout=None)
-        self.question = question
-        self.options = options
-        self.author = author
-        self.votes: Dict[int, int] = {}
-        for idx, opt in enumerate(options):
-            self.add_item(PollButton(label=f"{idx+1}. {opt}", index=idx))
-
-    def make_embed(self) -> discord.Embed:
-        total_votes = len(self.votes)
-        counts = [0] * len(self.options)
-        for opt_idx in self.votes.values():
-            counts[opt_idx] += 1
-
-        desc_lines = []
-        for idx, (opt, count) in enumerate(zip(self.options, counts)):
-            pct = (count / total_votes * 100) if total_votes > 0 else 0
-            bar_len = int(pct / 10)
-            bar = "█" * bar_len + "░" * (10 - bar_len)
-            desc_lines.append(f"**{idx+1}. {opt}**\n`{bar}` **{count}표** ({pct:.1f}%)")
-
-        embed = discord.Embed(title=f"📊 투표: {self.question}", description="\n\n".join(desc_lines), color=discord.Color.teal())
-        embed.set_footer(text=f"주최: {self.author.display_name} • 총 {total_votes}명 참여 (버튼으로 투표/변경)")
-        return embed
-
-
-# --- 은행 대여 반납 버튼 UI ---
-class DynamicLoanButton(discord.ui.DynamicItem[discord.ui.Button], template=r'loan_return:(?P<lender_id>[0-9]+):(?P<borrower_id>[0-9]+)'):
-    def __init__(self, lender_id: int, borrower_id: int):
-        super().__init__(
-            discord.ui.Button(
-                label="반납 완료",
-                style=discord.ButtonStyle.success,
-                emoji="✅",
-                custom_id=f"loan_return:{lender_id}:{borrower_id}"
-            )
-        )
-        self.lender_id = lender_id
-        self.borrower_id = borrower_id
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str], /):
-        lender_id = int(match.group("lender_id"))
-        borrower_id = int(match.group("borrower_id"))
-        return cls(lender_id, borrower_id)
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.lender_id and interaction.user.id != self.borrower_id and not is_admin_or_mod(interaction):
-            await interaction.response.send_message("❌ 빌려준 사람, 빌린 사람 또는 관리자만 반납 처리를 할 수 있습니다.", ephemeral=True)
-            return
-
-        if not interaction.message.embeds:
-            await interaction.response.send_message("❌ 메시지 정보를 읽을 수 없습니다.", ephemeral=True)
-            return
-
-        now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-        orig_embed = interaction.message.embeds[0]
-        new_embed = orig_embed.copy()
-        new_embed.color = discord.Color.green()
-        new_embed.title = "🏦 [은행] 상환 완료"
-        
-        for i, field in enumerate(new_embed.fields):
-            if field.name == "📌 상태":
-                new_embed.set_field_at(i, name="📌 상태", value="✅ **반납 완료**", inline=True)
-                break
-                
-        new_embed.add_field(name="🎉 반납 일시", value=f"{now_str} (확인: {interaction.user.display_name})", inline=False)
-        
-        self.item.disabled = True
-        self.item.label = "반납 완료됨"
-        
-        view = discord.ui.View(timeout=None)
-        view.add_item(self.item)
-
-        await interaction.response.edit_message(embed=new_embed, view=view)
-        await interaction.followup.send(f"✅ **{interaction.user.display_name}** 님이 상환 완료 처리했습니다!", ephemeral=False)
-
-
-class LoanView(discord.ui.View):
-    def __init__(self, lender_id: int, borrower_id: int):
-        super().__init__(timeout=None)
-        self.add_item(DynamicLoanButton(lender_id, borrower_id))
-
-
-# --- 정해진 수량만큼 뽑히는 쿠지 데이터 및 UI ---
-KUJI_GAMES: Dict[str, dict] = {}
-
-class DynamicKujiButton(discord.ui.DynamicItem[discord.ui.Button], template=r'kuji_draw:(?P<game_id>[a-zA-Z0-9_-]+)'):
-    def __init__(self, game_id: str):
-        super().__init__(
-            discord.ui.Button(
-                label="🎫 쿠지 뽑기!",
-                style=discord.ButtonStyle.primary,
-                emoji="🎁",
-                custom_id=f"kuji_draw:{game_id}"
-            )
-        )
-        self.game_id = game_id
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str], /):
-        game_id = match.group("game_id")
-        return cls(game_id)
-
-    async def callback(self, interaction: discord.Interaction):
-        game = KUJI_GAMES.get(self.game_id)
-        if not game:
-            await interaction.response.send_message("❌ 진행 중인 쿠지 판 정보를 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        user_id = interaction.user.id
-        if user_id not in game["allowed_users"]:
-            await interaction.response.send_message("❌ 참여 대상자가 아닙니다!", ephemeral=True)
-            return
-
-        remaining_tickets = game["allowed_users"][user_id]
-        if remaining_tickets <= 0:
-            await interaction.response.send_message("❌ 보유한 뽑기 티켓을 모두 사용하셨습니다!", ephemeral=True)
-            return
-
-        if len(game["box"]) == 0:
-            await interaction.response.send_message("❌ 모든 쿠지가 이미 소진되었습니다!", ephemeral=True)
-            return
-
-        game["allowed_users"][user_id] -= 1
-        picked_prize = game["box"].pop(random.randint(0, len(game["box"]) - 1))
-        
-        is_finished = len(game["box"]) == 0
-        now_time = datetime.now(KST).strftime("%H:%M")
-        
-        record = {
-            "user_id": user_id,
-            "user_name": interaction.user.display_name,
-            "prize": picked_prize,
-            "time": now_time
-        }
-        game["history"].append(record)
-
-        embed = self.build_embed(game)
-        
-        if is_finished:
-            self.item.disabled = True
-            self.item.label = "쿠지 매진 (종료)"
-            self.item.style = discord.ButtonStyle.secondary
-
-        view = discord.ui.View(timeout=None)
-        view.add_item(self.item)
-
-        await interaction.response.edit_message(embed=embed, view=view)
-        
-        lose_name = game.get("lose_name", "❌ 꽝")
-        if picked_prize == lose_name or "꽝" in picked_prize:
-            result_comment = f"💨 아쉽네요... {interaction.user.mention} 님은 **[{picked_prize}]** (다음 기회에!)"
-        else:
-            result_comment = f"🎉 축하합니다! {interaction.user.mention} 님이 **[{picked_prize}]** 에 당첨되셨습니다!"
-
-        await interaction.followup.send(
-            f"{result_comment} (남은 티켓: {game['allowed_users'][user_id]}장)",
-            ephemeral=False
-        )
-
-    @staticmethod
-    def build_embed(game: dict) -> discord.Embed:
-        total_left = len(game["box"])
-        total_init = game["total_initial"]
-        
-        prize_status = []
-        for prize, count in game["initial_prizes"].items():
-            left_count = game["box"].count(prize)
-            prize_status.append(f"• **{prize}**: 남은 수량 `{left_count} / {count}`개")
-
-        desc = (
-            f"**📢 {game['title']}**\n"
-            f"균열석 기부자 전용 뽑기판입니다!\n\n"
-            f"📊 **전체 잔여 쿠지:** `{total_left} / {total_init}`장\n"
-        )
-
-        embed = discord.Embed(
-            title="🎪 [균열석 기부자] 뽑기판",
-            description=desc,
-            color=discord.Color.gold() if total_left > 0 else discord.Color.dark_grey()
-        )
-
-        embed.add_field(name="🎁 상품 잔여 현황", value="\n".join(prize_status), inline=False)
-        
-        if game["history"]:
-            recent_lines = [f"• **{r['user_name']}** ➔ **{r['prize']}** ({r['time']})" for r in game["history"][-5:]]
-            embed.add_field(name="📜 최근 당첨 내역", value="\n".join(reversed(recent_lines)), inline=False)
-
-        allowed_mentions = [f"<@{uid}>({cnt}회)" for uid, cnt in game["allowed_users"].items() if cnt > 0]
-        if allowed_mentions:
-            embed.add_field(name="🎫 참여 가능 기부자", value=" ".join(allowed_mentions), inline=False)
-        else:
-            embed.add_field(name="🎫 참여 상태", value="✅ 모든 기부자가 참여를 완료했습니다!", inline=False)
-
-        embed.set_footer(text=f"주최: {game['host']} • 1회 뽑기당 티켓 1장 소모")
-        return embed
-
-
-class KujiCreateModal(discord.ui.Modal, title="🎪 균열석 기부자 뽑기판 생성"):
-    kuji_title = discord.ui.TextInput(label="뽑기 제목", placeholder="예: 균열석 기부 감사 뽑기", required=True, max_length=50)
-    prizes = discord.ui.TextInput(
-        label="당첨 상품 라인업 (상품명:수량 줄바꿈)",
-        placeholder="기어 4개:2\n기어 2개:2\n(※ 꽝은 적지 않아도 총 인원에 맞춰 자동 생성)",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000
-    )
-    allowed_donors = discord.ui.TextInput(
-        label="참여 가능 기부자 목록 (닉네임/멘션, 줄바꿈 또는 쉼표)",
-        placeholder="루트, 김민수, 우기\n또는 줄바꿈으로 나열",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=2000
-    )
-    default_lose_name = discord.ui.TextInput(label="꽝 상품 이름 (기본값: ❌ 꽝)", placeholder="❌ 꽝", default="❌ 꽝", required=False, max_length=30)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-
-        raw_names = [name.strip() for name in re.split(r'[,\n]', self.allowed_donors.value) if name.strip()]
-        matched_members = []
-        for name in raw_names:
-            mem = find_guild_member(interaction.guild, name)
-            if mem and mem not in matched_members:
-                matched_members.append(mem)
-
-        if not matched_members:
-            await interaction.followup.send("❌ 참여 가능한 기부자를 찾지 못했습니다. 닉네임이나 멘션을 확인해 주세요!", ephemeral=True)
-            return
-
-        total_required_tickets = len(matched_members)
-
-        box = []
-        initial_prizes = {}
-        for line in self.prizes.value.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if ":" in line:
-                parts = line.rsplit(":", 1)
-                p_name = parts[0].strip()
-                try:
-                    p_count = int(parts[1].strip())
-                except ValueError:
-                    p_count = 1
-            else:
-                p_name = line
-                p_count = 1
-
-            initial_prizes[p_name] = p_count
-            box.extend([p_name] * p_count)
-
-        current_prize_count = len(box)
-        lose_name = self.default_lose_name.value.strip() if self.default_lose_name.value else "❌ 꽝"
-
-        if current_prize_count < total_required_tickets:
-            remaining_lose_count = total_required_tickets - current_prize_count
-            initial_prizes[lose_name] = initial_prizes.get(lose_name, 0) + remaining_lose_count
-            box.extend([lose_name] * remaining_lose_count)
-        elif current_prize_count > total_required_tickets:
-            await interaction.followup.send(
-                f"⚠️ 입력한 당첨 상품 총 개수({current_prize_count}개)가 참여자 인원수({total_required_tickets}명)보다 많습니다!",
-                ephemeral=True
-            )
-            return
-
-        game_id = f"kuji_{int(datetime.now().timestamp())}_{random.randint(100, 999)}"
-        allowed_users = {m.id: 1 for m in matched_members}
-
-        KUJI_GAMES[game_id] = {
-            "title": self.kuji_title.value,
-            "host": interaction.user.display_name,
-            "box": box,
-            "initial_prizes": initial_prizes,
-            "total_initial": len(box),
-            "allowed_users": allowed_users,
-            "lose_name": lose_name,
-            "history": []
-        }
-
-        embed = DynamicKujiButton.build_embed(KUJI_GAMES[game_id])
-        view = discord.ui.View(timeout=None)
-        view.add_item(DynamicKujiButton(game_id))
-
-        mention_pings = " ".join([m.mention for m in matched_members])
-        await interaction.followup.send(content=f"📢 **균열석 기부자 뽑기판이 열렸습니다!**\n{mention_pings}", embed=embed, view=view)
-
-
-# --- 보부상 알림 비동기 태스크 ---
-async def merchant_timer_task(channel: discord.TextChannel, location: str, target_time: datetime):
-    pre_notify_time = target_time - timedelta(minutes=5)
-    now = datetime.now(KST)
-    wait_pre = (pre_notify_time - now).total_seconds()
-
-    if wait_pre > 0:
-        await asyncio.sleep(wait_pre)
-        embed_pre = discord.Embed(
-            title="⏰ [보부상] 등장 5분 전!",
-            description=f"**[{location}]** 보부상이 약 **5분 뒤**에 도착합니다! 준비해 주세요.",
-            color=discord.Color.yellow()
-        )
-        try:
-            await channel.send(embed=embed_pre)
-        except Exception:
-            pass
-
-    now = datetime.now(KST)
-    wait_final = (target_time - now).total_seconds()
-    if wait_final > 0:
-        await asyncio.sleep(wait_final)
-
-    embed_arrive = discord.Embed(
-        title="🔔 [보부상] 지금 등장!",
-        description=f"**[{location}]**에 보부상이 도착했습니다! 지금 방문해 보세요.",
-        color=discord.Color.green()
-    )
-    try:
-        await channel.send(embed=embed_arrive)
-    except Exception:
-        pass
-
-    MERCHANT_TASKS.pop(location, None)
-    MERCHANT_DATA.pop(location, None)
-
-
-# --- 날씨 데이터 파싱 함수 (wttr.in) ---
-def fetch_weather_sync(city_query: str) -> Optional[dict]:
-    try:
-        url = f"https://wttr.in/{urllib.parse.quote(city_query)}?format=j1"
-        req = urllib.request.Request(url, headers={'User-Agent': 'curl/7.68.0'})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode('utf-8'))
-                curr = data['current_condition'][0]
-                return {
-                    "temp": curr.get("temp_C", "-"),
-                    "feels": curr.get("FeelsLikeC", "-"),
-                    "desc": curr.get("lang_ko", [{}])[0].get("value") if curr.get("lang_ko") else curr.get("weatherDesc", [{}])[0].get("value", "-"),
-                    "humidity": curr.get("humidity", "-"),
-                    "wind": curr.get("windspeedKmph", "-")
-                }
-    except Exception:
-        return None
-    return None
-
-
 # --- 슬래시 명령어 ---
 
-# ⛅ 날씨 조회 명령어
-@bot.tree.command(name="날씨", description="전국 주요 지역 또는 지정한 도시의 현재 날씨 정보를 확인합니다.")
-@app_commands.describe(지역="확인할 지역 이름 (비워두면 전국 주요 거점 요약)")
-async def check_weather(interaction: discord.Interaction, 지역: Optional[str] = None):
-    await interaction.response.defer()
-    loop = asyncio.get_running_loop()
-
-    if 지역:
-        data = await loop.run_in_executor(None, fetch_weather_sync, 지역)
-        if not data:
-            await interaction.followup.send(f"❌ **{지역}** 지역의 날씨 정보를 가져올 수 없습니다. 도시 이름을 확인해 주세요.")
-            return
-
-        embed = discord.Embed(
-            title=f"🌤️ [{지역}] 현재 날씨 정보",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="🌡️ 현재 기온", value=f"**{data['temp']}°C** (체감: {data['feels']}°C)", inline=True)
-        embed.add_field(name="☁️ 날씨 상태", value=f"**{data['desc']}**", inline=True)
-        embed.add_field(name="💧 습도 / 바람", value=f"습도: `{data['humidity']}%` | 풍속: `{data['wind']}km/h`", inline=False)
-        embed.set_footer(text=f"기준: wttr.in • 확인 시간: {datetime.now(KST).strftime('%H:%M')} KST")
-        await interaction.followup.send(embed=embed)
+# 📢 [공지 이모지 미반응자 확인 명령어]
+@bot.tree.command(name="공지미확인", description="공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
+@app_commands.describe(메시지id="특정 공지 글을 확인할 경우 메시지 ID 입력 (비워두면 본인의 가장 최근 @everyone 공지)")
+async def check_notice_reactions(interaction: discord.Interaction, 메시지id: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 확인할 수 있습니다.", ephemeral=True)
         return
 
-    cities = [
-        ("서울", "Seoul"),
-        ("수원/경기", "Suwon"),
-        ("춘천/강원", "Chuncheon"),
-        ("대전/충청", "Daejeon"),
-        ("광주/전라", "Gwangju"),
-        ("대구", "Daegu"),
-        ("부산/경상", "Busan"),
-        ("제주", "Jeju")
-    ]
+    guild = interaction.guild
+    channel = guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(ANNOUNCEMENT_CHANNEL_ID)
+        except Exception:
+            await interaction.followup.send("❌ 공지 채널을 찾을 수 없습니다. 채널 권한 또는 ID를 확인해 주세요.", ephemeral=True)
+            return
 
-    weather_results = []
-    for kor_name, en_name in cities:
-        w_data = await loop.run_in_executor(None, fetch_weather_sync, en_name)
-        if w_data:
-            weather_results.append(f"• **{kor_name}**: `{w_data['temp']}°C` ({w_data['desc']}) | 체감 `{w_data['feels']}°C`")
-        else:
-            weather_results.append(f"• **{kor_name}**: 정보 조회 실패")
+    target_message: Optional[discord.Message] = None
+
+    if 메시지id:
+        try:
+            target_message = await channel.fetch_message(int(메시지id.strip()))
+        except Exception:
+            await interaction.followup.send("❌ 지정한 메시지 ID의 글을 찾을 수 없습니다.", ephemeral=True)
+            return
+    else:
+        async for msg in channel.history(limit=50):
+            if msg.author.id == interaction.user.id and ("@everyone" in msg.content or msg.mention_everyone):
+                target_message = msg
+                break
+
+        if not target_message:
+            async for msg in channel.history(limit=50):
+                if "@everyone" in msg.content or msg.mention_everyone:
+                    target_message = msg
+                    break
+
+    if not target_message:
+        await interaction.followup.send("❌ 공지 채널에서 `@everyone` 태그가 포함된 공지 글을 찾지 못했습니다.", ephemeral=True)
+        return
+
+    reacted_user_ids = set()
+    for reaction in target_message.reactions:
+        async for user in reaction.users():
+            reacted_user_ids.add(user.id)
+
+    target_members = [m for m in guild.members if not m.bot and is_target_member(m)]
+    unreacted_members = [m for m in target_members if m.id not in reacted_user_ids]
+
+    summary_content = (target_message.content[:40] + "...") if len(target_message.content) > 40 else target_message.content
+    msg_link = f"https://discord.com/channels/{guild.id}/{channel.id}/{target_message.id}"
 
     embed = discord.Embed(
-        title="🗺️ 전국 주요 거점 실시간 날씨 현황",
-        description="\n".join(weather_results),
-        color=discord.Color.teal()
+        title="📢 [공지 이모지 확인 현황]",
+        description=f"🔗 [해당 공지 바로가기]({msg_link})\n📝 **공지 요약:** {summary_content or '(임베드 공지)'}",
+        color=discord.Color.orange() if unreacted_members else discord.Color.green()
     )
-    embed.set_footer(text=f"특정 도시는 `/날씨 [도시이름]`으로 확인 가능 • {datetime.now(KST).strftime('%m/%d %H:%M')} KST")
+    embed.add_field(name="👥 전체 대상 인원", value=f"{len(target_members)}명", inline=True)
+    embed.add_field(name="✅ 확인 (이모지 등록)", value=f"{len(target_members) - len(unreacted_members)}명", inline=True)
+    embed.add_field(name="❌ 미확인 (미반응)", value=f"**{len(unreacted_members)}명**", inline=True)
+
+    if unreacted_members:
+        unreacted_lines = [f"• {m.mention} ({m.display_name})" for m in unreacted_members]
+        cut_list = unreacted_lines[:35]
+        cut_text = "\n".join(cut_list)
+        if len(unreacted_members) > 35:
+            cut_text += f"\n...외 {len(unreacted_members) - 35}명"
+        embed.add_field(name="⚠️ 미반응 멤버 명단", value=cut_text, inline=False)
+    else:
+        embed.add_field(name="🎉 전원 확인 완료!", value="모든 길드원/수습생이 공지에 이모지를 남겼습니다.", inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# 🪜 [사다리 타기 명령어 - 당첨/꽝 동일 항목 검증 및 판정 수정]
+@bot.tree.command(name="사다리", description="현재 통화방에 있는 인원으로 사다리 타기를 진행합니다.")
+@app_commands.describe(당첨인원="당첨될 인원수", 당첨항목="당첨 항목 이름 (기본값: 🎉 당첨)", 꽝항목="꽝 항목 이름 (기본값: ❌ 꽝)")
+async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당첨항목: str = "🎉 당첨", 꽝항목: str = "❌ 꽝"):
+    await interaction.response.defer()
+
+    # 1. 당첨 항목과 꽝 항목 동일 입력 방지 검증
+    win_label = 당첨항목.strip()
+    lose_label = 꽝항목.strip()
+    if not win_label or not lose_label:
+        await interaction.followup.send("❌ 당첨 항목과 꽝 항목 이름을 비워둘 수 없습니다.", ephemeral=True)
+        return
+
+    if win_label == lose_label:
+        await interaction.followup.send("❌ **당첨 항목**과 **꽝 항목**의 이름을 서로 다르게 입력해 주세요! (동일하게 입력할 수 없습니다)", ephemeral=True)
+        return
+
+    # 2. 통화방 인원 검증
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("❌ 먼저 음성 채널(통화방)에 접속한 뒤 사용해 주세요!", ephemeral=True)
+        return
+
+    voice_channel = interaction.user.voice.channel
+    players = [m.display_name for m in voice_channel.members if not m.bot]
+    total_count = len(players)
+
+    if total_count < 2:
+        await interaction.followup.send("❌ 통화방에 최소 2명 이상 있어야 합니다.", ephemeral=True)
+        return
+
+    if 당첨인원 <= 0 or 당첨인원 >= total_count:
+        await interaction.followup.send(f"❌ 당첨 인원은 1명 이상 {total_count - 1}명 이하여야 합니다.", ephemeral=True)
+        return
+
+    # 3. 불리언 기반 안전 셔플 (문자열 일치 의존 제거)
+    lose_count = total_count - 당첨인원
+    winner_flags = [True] * 당첨인원 + [False] * lose_count
+    random.shuffle(winner_flags)
+
+    result_lines = []
+    winners = []
+    for player, is_winner in zip(players, winner_flags):
+        if is_winner:
+            result_lines.append(f"👑 **{player}** ➔ **{win_label}**")
+            winners.append(player)
+        else:
+            result_lines.append(f"👤 {player} ➔ {lose_label}")
+
+    embed = discord.Embed(title=f"🪜 [{voice_channel.name}] 사다리 타기 결과 🪜", description="\n".join(result_lines), color=discord.Color.purple())
+    embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
 
-# 🍽️ 밥 메뉴 추천 명령어
-@bot.tree.command(name="메뉴추천", description="오늘 뭐 먹을지 고민될 때 식사 메뉴를 추천해 줍니다.")
-@app_commands.describe(카테고리="원하는 음식 분류 (비워두면 전체 무작위)")
-@app_commands.choices(카테고리=[
-    app_commands.Choice(name="🍚 한식", value="한식"),
-    app_commands.Choice(name="🥟 중식", value="중식"),
-    app_commands.Choice(name="🍣 일식", value="일식"),
-    app_commands.Choice(name="🍕 양식", value="양식"),
-    app_commands.Choice(name="🍢 분식 / 패스트푸드", value="분식 / 패스트푸드"),
-    app_commands.Choice(name="🍗 야식 / 안주", value="야식 / 안주"),
-    app_commands.Choice(name="🥗 가벼운 식사 / 샐러드", value="가벼운 식사 / 샐러드"),
-    app_commands.Choice(name="🎲 전체 무작위", value="전체")
-])
-async def recommend_food(interaction: discord.Interaction, 카테고리: Optional[app_commands.Choice[str]] = None):
-    cat_key = 카테고리.value if 카테고리 else "전체"
+# 🎙️ [통화 시간 조회]
+@bot.tree.command(name="통화시간", description="오늘의 통화방 참여 시간 및 이번 주 누적 시간을 확인합니다.")
+@app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
+async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
+    await interaction.response.defer(ephemeral=True)
+    target = 유저 if 유저 else interaction.user
 
-    if cat_key == "전체":
-        chosen_cat = random.choice(list(MENU_DATA.keys()))
-        picked_food = random.choice(MENU_DATA[chosen_cat])
-    else:
-        chosen_cat = cat_key
-        picked_food = random.choice(MENU_DATA[chosen_cat])
+    if not is_target_member(target):
+        await interaction.followup.send("⚠️ 해당 멤버는 통화 시간 집계 대상(길드원/수습생)이 아닙니다.", ephemeral=True)
+        return
 
-    extra_pick = random.choice([
-        "식사 맛있게 하시고 시원한 음료도 한 잔 챙기세요! ✨",
-        "든든하게 먹어야 게임도 집중 잘 되는 거 아시죠? 😋",
-        "고민될 땐 오늘 이 메뉴로 직진해 보세요! 🏃",
-        "좋은 사람들과 함께 먹으면 맛이 두 배! 🥳"
-    ])
+    guild_id = interaction.guild.id
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if guild_id not in VOICE_DAILY_CACHE:
+        _, v_records = await fetch_database_from_channel(interaction.guild)
+        VOICE_DAILY_CACHE[guild_id] = v_records
+
+    guild_data = VOICE_DAILY_CACHE.get(guild_id, {})
+    u_str = str(target.id)
+
+    today_sec = guild_data.get(today_str, {}).get(u_str, 0)
+
+    current_status = "❌ 현재 미접속"
+    if target.id in VOICE_ACTIVE_SESSIONS:
+        sess = VOICE_ACTIVE_SESSIONS[target.id]
+        if sess["active"] and sess["start_time"]:
+            cur_diff = int((now - sess["start_time"]).total_seconds())
+            today_sec += cur_diff
+            current_status = f"🟢 참여 중 (+{format_seconds(cur_diff)})"
+        else:
+            current_status = "⏸️ 헤드셋 끔 (잠수 중 / 측정 일시정지)"
+
+    past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    week_sec = 0
+    for d_str in past_7_days:
+        week_sec += guild_data.get(d_str, {}).get(u_str, 0)
+
+    if target.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[target.id]["active"]:
+        week_sec += int((now - VOICE_ACTIVE_SESSIONS[target.id]["start_time"]).total_seconds())
 
     embed = discord.Embed(
-        title="🍴 오늘의 식사 추천 메뉴",
-        description=f"오늘은 **[{chosen_cat}]** 메뉴 어떠신가요?\n\n👉 오늘의 추천: **{picked_food}**\n\n💬 {extra_pick}",
-        color=discord.Color.orange()
+        title=f"🎙️ [{target.display_name}] 님의 통화방 시간표",
+        color=discord.Color.teal()
     )
-    embed.set_footer(text=f"추천 요청자: {interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
+    embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}** (기준: 1시간)", inline=True)
+    embed.add_field(name="📊 이번 주 누적 시간", value=f"**{format_seconds(week_sec)}** (기준: 11시간)", inline=True)
+    embed.add_field(name="📌 실시간 상태", value=current_status, inline=False)
+    embed.set_footer(text="헤드셋 끔(Deafen) 상태에서는 측정되지 않습니다.")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# 🎙️ [통화 기준 미달자 확인 - 관리자용]
+@bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 이번 주 11시간 미달자를 확인합니다.")
+@app_commands.describe(구분="확인할 기준 (일일 or 주간)")
+@app_commands.choices(구분=[
+    app_commands.Choice(name="📅 오늘 1시간 미달자", value="일일"),
+    app_commands.Choice(name="📊 이번 주 11시간 미달자", value="주간")
+])
+async def list_voice_failed(interaction: discord.Interaction, 구분: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 확인할 수 있습니다.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if guild.id not in VOICE_DAILY_CACHE:
+        _, v_records = await fetch_database_from_channel(guild)
+        VOICE_DAILY_CACHE[guild.id] = v_records
+
+    guild_data = VOICE_DAILY_CACHE.get(guild.id, {})
+    failed_lines = []
+    target_members = [m for m in guild.members if not m.bot and is_target_member(m)]
+
+    if 구분.value == "일일":
+        today_records = guild_data.get(today_str, {})
+        for member in target_members:
+            spent = today_records.get(str(member.id), 0)
+            if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
+                spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
+
+            if spent < 3600:
+                failed_lines.append(f"• {member.mention} ({member.display_name}) : `{format_seconds(spent)}`")
+
+        title = f"📋 [오늘 길드 통화방 1시간 미달자] ({len(failed_lines)}명)"
+    else:
+        past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+        for member in target_members:
+            spent = 0
+            for d_str in past_7_days:
+                spent += guild_data.get(d_str, {}).get(str(member.id), 0)
+            if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
+                spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
+
+            if spent < 39600:
+                failed_lines.append(f"• {member.mention} ({member.display_name}) : `{format_seconds(spent)}`")
+
+        title = f"📊 [이번 주 길드 통화방 11시간 미달자] ({len(failed_lines)}명)"
+
+    if not failed_lines:
+        await interaction.followup.send("🎉 전원 기준 달성 완료! 미달자가 없습니다.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(failed_lines[:40]),
+        color=discord.Color.red()
+    )
+    if len(failed_lines) > 40:
+        embed.set_footer(text=f"외 {len(failed_lines) - 40}명 생략됨")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# 🎙️ [통화 알림 채널 설정 - DB 영구 저장 연동]
+@bot.tree.command(name="통화알림채널설정", description="[관리자] 밤 9시 사전 알림 및 자정 정산 브리핑이 전송될 채널을 설정합니다.")
+@app_commands.describe(채널="브리핑이 올라갈 텍스트 채널")
+async def set_voice_notice_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    global VOICE_NOTICE_CHANNEL_ID
+    VOICE_NOTICE_CHANNEL_ID = 채널.id
+    await log_voice_config(interaction.guild, 채널.id)
+    await interaction.response.send_message(f"✅ 매일 밤 9시 사전 태그 및 자정 미달자 브리핑이 {채널.mention} 채널로 전송됩니다!")
 
 
 @bot.tree.command(name="자기소개", description="이름, 마크 닉네임, 길드 이름을 입력하여 닉네임을 설정합니다.")
@@ -901,148 +927,6 @@ async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[
         return
     await process_loadout_selection(interaction, 무기, 직업)
 
-# 🔔 [보부상 기본 알림 채널 지정]
-@bot.tree.command(name="보부상채널설정", description="[관리자] 보부상 알림을 기본으로 수신할 고정 채널을 설정합니다.")
-@app_commands.describe(채널="보부상 알림이 울릴 텍스트 채널")
-async def set_merchant_default_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
-    global DEFAULT_MERCHANT_CHANNEL_ID
-    DEFAULT_MERCHANT_CHANNEL_ID = 채널.id
-    await interaction.response.send_message(f"✅ 앞으로 별도 지정이 없으면 {채널.mention} 채널로 보부상 알림이 전송됩니다!")
-
-# 🔔 [보부상 타이머 등록 - KST 기준 타임존 적용 & 멘션 제거]
-@bot.tree.command(name="보부상등록", description="보부상 등장 예정 시간을 계산해 예약 알림을 설정합니다.")
-@app_commands.describe(
-    지역="보부상이 등장하는 지역 이름 (예: 플로라)",
-    시간="남은 시간 (시간 단위, 없으면 0)",
-    분="남은 시간 (분 단위, 예: 21)",
-    알림채널="알림을 받을 채널 (지정하지 않으면 기본 채널 또는 현재 채널)"
-)
-async def register_merchant(
-    interaction: discord.Interaction, 
-    지역: str, 
-    시간: int = 0, 
-    분: int = 0, 
-    알림채널: Optional[discord.TextChannel] = None
-):
-    await interaction.response.defer()
-    
-    total_minutes = (시간 * 60) + 분
-    if total_minutes <= 0:
-        await interaction.followup.send("❌ 남은 시간을 1분 이상으로 입력해 주세요!", ephemeral=True)
-        return
-
-    target_channel = 알림채널
-    if not target_channel and DEFAULT_MERCHANT_CHANNEL_ID:
-        target_channel = interaction.guild.get_channel(DEFAULT_MERCHANT_CHANNEL_ID)
-    if not target_channel:
-        target_channel = interaction.channel
-
-    now = datetime.now(KST)
-    target_time = now + timedelta(minutes=total_minutes)
-    target_str = target_time.strftime("%H시 %M분")
-
-    if 지역 in MERCHANT_TASKS:
-        MERCHANT_TASKS[지역].cancel()
-
-    MERCHANT_DATA[지역] = {
-        "target_time": target_time,
-        "channel_id": target_channel.id,
-        "registrant": interaction.user.display_name
-    }
-
-    task = asyncio.create_task(merchant_timer_task(target_channel, 지역, target_time))
-    MERCHANT_TASKS[지역] = task
-
-    embed = discord.Embed(
-        title="🧭 [보부상] 알림 예약 완료",
-        description=f"**[{지역}]** 보부상 등장 알림이 예약되었습니다!",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="⏳ 남은 시간", value=f"{시간}시간 {분}분 뒤", inline=True)
-    embed.add_field(name="🎯 도착 예정 시각", value=f"**{target_str}** 경", inline=True)
-    embed.add_field(name="📢 수신 채널", value=target_channel.mention, inline=True)
-    embed.add_field(name="📌 알림 규칙", value="등장 5분 전과 도착 정각에 채널 메시지가 발송됩니다.", inline=False)
-    embed.set_footer(text=f"등록자: {interaction.user.display_name}")
-
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="보부상취소", description="등록되어 있는 특정 지역의 보부상 알림을 취소합니다.")
-@app_commands.describe(지역="취소할 지역 이름")
-async def cancel_merchant(interaction: discord.Interaction, 지역: str):
-    if 지역 in MERCHANT_TASKS:
-        MERCHANT_TASKS[지역].cancel()
-        MERCHANT_TASKS.pop(지역, None)
-        MERCHANT_DATA.pop(지역, None)
-        await interaction.response.send_message(f"🗑️ **[{지역}]** 보부상 알림이 취소되었습니다.")
-    else:
-        await interaction.response.send_message(f"❌ 등록된 **[{지역}]** 보부상 정보를 찾을 수 없습니다.", ephemeral=True)
-
-@bot.tree.command(name="사다리", description="통화방 인원으로 사다리 타기를 진행합니다.")
-@app_commands.describe(당첨인원="당첨될 인원수", 당첨항목="당첨 항목 이름 (기본값: 🎉 당첨)", 꽝항목="꽝 항목 이름 (기본값: ❌ 꽝)")
-async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당첨항목: str = "🎉 당첨", 꽝항목: str = "❌ 꽝"):
-    await interaction.response.defer()
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.followup.send("❌ 통화방에 먼저 접속한 뒤 입력해 주세요!", ephemeral=True)
-        return
-
-    voice_channel = interaction.user.voice.channel
-    players = [m.display_name for m in voice_channel.members if not m.bot]
-    total_count = len(players)
-
-    if total_count < 2:
-        await interaction.followup.send("❌ 음성 채널에 최소 2명 이상 있어야 합니다.", ephemeral=True)
-        return
-
-    if 당첨인원 <= 0 or 당첨인원 >= total_count:
-        await interaction.followup.send(f"❌ 당첨 인원은 1명 이상 {total_count - 1}명 이하여야 합니다.", ephemeral=True)
-        return
-
-    lose_count = total_count - 당첨인원
-    results = [당첨항목] * 당첨인원 + [꽝항목] * lose_count
-    random.shuffle(results)
-
-    result_lines = []
-    winners = []
-    for player, res in zip(players, results):
-        if res == 당첨항목:
-            result_lines.append(f"👑 **{player}** ➔ **{res}**")
-            winners.append(player)
-        else:
-            result_lines.append(f"👤 {player} ➔ {res}")
-
-    embed = discord.Embed(title=f"🪜 [{voice_channel.name}] 사다리 타기 결과 🪜", description="\n".join(result_lines), color=discord.Color.purple())
-    embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
-    await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="기부알림", description="지정한 유저들에게 골드 기부 요청 알림을 발송합니다.")
-@app_commands.describe(
-    참여자="멘션할 유저들을 나열해 주세요 (예: @유저1 @유저2 @유저3 ...)",
-    추가메시지="알림에 덧붙일 내용 (선택)"
-)
-async def manual_gold_reminder(
-    interaction: discord.Interaction,
-    참여자: str,
-    추가메시지: Optional[str] = None
-):
-    await interaction.response.defer()
-    raw_ids = list(set([int(uid) for uid in re.findall(r'<@!?(\d+)>', 참여자)]))
-    
-    if not raw_ids:
-        await interaction.followup.send("❌ 멘션된 유저를 찾을 수 없습니다. `@유저` 형태로 입력해 주세요!", ephemeral=True)
-        return
-
-    mentions_text = " ".join([f"<@{uid}>" for uid in raw_ids])
-    desc = "길드 성장을 위해 **일일 골드 기부**를 진행해 주세요! ✨"
-    if 추가메시지:
-        desc += f"\n\n💬 **전달사항:** {추가메시지}"
-
-    embed = discord.Embed(title="💰 일일 골드 기부 알림", description=desc, color=discord.Color.gold())
-    embed.set_footer(text=f"발송자: {interaction.user.display_name}")
-    await interaction.followup.send(content=mentions_text, embed=embed)
-
 @bot.tree.command(name="공지", description="팝업창을 열어 공지사항을 작성합니다.")
 async def create_notice(interaction: discord.Interaction):
     await interaction.response.send_modal(NoticeModal())
@@ -1060,142 +944,6 @@ async def clear_messages(interaction: discord.Interaction, 개수: int):
     except discord.Forbidden:
         await interaction.followup.send("⚠️ 봇에 '메시지 관리' 권한이 없습니다.", ephemeral=True)
 
-@bot.tree.command(name="투표", description="버튼식 실시간 투표를 생성합니다. (최대 5개)")
-async def create_poll(
-    interaction: discord.Interaction,
-    질문: str,
-    항목1: str,
-    항목2: str,
-    항목3: Optional[str] = None,
-    항목4: Optional[str] = None,
-    항목5: Optional[str] = None
-):
-    raw_options = [항목1, 항목2, 항목3, 항목4, 항목5]
-    options = [opt for opt in raw_options if opt]
-    if len(options) < 2:
-        await interaction.response.send_message("❌ 최소 2개 이상 입력하세요.", ephemeral=True)
-        return
-    view = PollView(question=질문, options=options, author=interaction.user)
-    await interaction.response.send_message(embed=view.make_embed(), view=view)
-
-# 🏦 [대여 명령어]
-@bot.tree.command(name="대여", description="[은행] 돈이나 물건을 빌려준 내역 카드를 생성합니다.")
-@app_commands.describe(
-    빌린사람="돈이나 물건을 빌려간 멤버",
-    항목="대여 내용 (예: 5만 골드, 네더라이트 곡괭이 등)",
-    빌려준사람="빌려준 멤버 (비워두면 본인)",
-    비고="추가 메모 (선택)"
-)
-async def loan_card(
-    interaction: discord.Interaction, 
-    빌린사람: discord.Member, 
-    항목: str, 
-    빌려준사람: Optional[discord.Member] = None, 
-    비고: Optional[str] = None
-):
-    lender = 빌려준사람 if 빌려준사람 else interaction.user
-
-    if 빌린사람.id == lender.id:
-        await interaction.response.send_message("❌ 빌려준 사람과 빌린 사람이 같을 수 없습니다!", ephemeral=True)
-        return
-
-    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    embed = discord.Embed(
-        title="🏦 [은행] 대여 등록",
-        description=f"{lender.mention} ➔ {빌린사람.mention}",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="📦 대여 항목", value=f"**{항목}**", inline=False)
-    embed.add_field(name="👤 빌려준 사람", value=lender.display_name, inline=True)
-    embed.add_field(name="🙋 빌린 사람", value=빌린사람.display_name, inline=True)
-    embed.add_field(name="📌 상태", value="⏳ **미반납**", inline=True)
-    if 비고:
-        embed.add_field(name="📝 메모", value=비고, inline=False)
-    embed.set_footer(text=f"등록 일시: {now_str} • 상환 완료 후 아래 버튼을 클릭하세요.")
-
-    view = LoanView(lender_id=lender.id, borrower_id=빌린사람.id)
-    await interaction.response.send_message(content=f"{빌린사람.mention} {lender.mention}", embed=embed, view=view)
-
-# 🎯 대규모 인원 추첨 명령어
-@bot.tree.command(name="추첨", description="팝업창을 열어 많은 인원을 복사/붙여넣기로 간편하게 추첨합니다.")
-async def open_lottery_modal(interaction: discord.Interaction):
-    await interaction.response.send_modal(LotteryModal())
-
-# 🎪 쿠지 명령어
-@bot.tree.command(name="쿠지생성", description="[관리자] 균열석 기부자를 위한 뽑기판을 생성합니다.")
-async def create_kuji(interaction: discord.Interaction):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 쿠지 판을 생성할 수 있습니다.", ephemeral=True)
-        return
-    await interaction.response.send_modal(KujiCreateModal())
-
-@bot.tree.command(name="쿠지티켓지급", description="[관리자] 특정 유저에게 뽑기 기회(티켓)를 추가 지급하거나 참여자로 등록합니다.")
-@app_commands.describe(유저="티켓을 지급할 대상", 횟수="추가할 뽑기 횟수 (기본 1회)")
-async def add_kuji_ticket(interaction: discord.Interaction, 유저: discord.Member, 횟수: Optional[int] = 1):
-    if not is_admin_or_mod(interaction):
-        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
-        return
-
-    if not KUJI_GAMES:
-        await interaction.response.send_message("❌ 진행 중인 쿠지 판이 없습니다.", ephemeral=True)
-        return
-
-    latest_game_id = list(KUJI_GAMES.keys())[-1]
-    game = KUJI_GAMES[latest_game_id]
-
-    game["allowed_users"][유저.id] = game["allowed_users"].get(유저.id, 0) + (횟수 if 횟수 else 1)
-
-    await interaction.response.send_message(
-        f"✅ **{유저.display_name}** 님에게 뽑기 티켓 **{횟수}장**을 지급했습니다! (현재 잔여: **{game['allowed_users'][유저.id]}장**)",
-        ephemeral=True
-    )
-
-# 🏆 가장 최근 쿠지 당첨자 명단 조회 명령어
-@bot.tree.command(name="쿠지당첨자", description="가장 최근에 진행된 쿠지의 당첨자 명단 및 결과를 확인합니다.")
-async def show_kuji_winners(interaction: discord.Interaction):
-    await interaction.response.defer()
-    if not KUJI_GAMES:
-        await interaction.followup.send("❌ 진행 중이거나 등록된 쿠지 판이 없습니다.")
-        return
-
-    latest_game_id = list(KUJI_GAMES.keys())[-1]
-    game = KUJI_GAMES[latest_game_id]
-    history = game.get("history", [])
-    lose_name = game.get("lose_name", "❌ 꽝")
-
-    if not history:
-        await interaction.followup.send(f"📢 **{game['title']}**\n아직 아무도 뽑기를 진행하지 않았습니다.")
-        return
-
-    winners_list = []
-    losers_list = []
-    for r in history:
-        line = f"• <@{r['user_id']}> ({r['user_name']}) ➔ **{r['prize']}** *({r['time']})*"
-        if r['prize'] == lose_name or "꽝" in r['prize']:
-            losers_list.append(line)
-        else:
-            winners_list.append(line)
-
-    embed = discord.Embed(
-        title=f"🏆 [최근 뽑기 결과] {game['title']}",
-        description=f"총 `{len(history)}회` 뽑기가 진행되었습니다.",
-        color=discord.Color.gold()
-    )
-
-    if winners_list:
-        embed.add_field(name="🎁 당첨자 명단", value="\n".join(winners_list), inline=False)
-    else:
-        embed.add_field(name="🎁 당첨자 명단", value="아직 당첨자가 없습니다.", inline=False)
-
-    if losers_list:
-        embed.add_field(name="💨 꽝 명단", value="\n".join(losers_list), inline=False)
-
-    not_played = [f"<@{uid}>" for uid, count in game["allowed_users"].items() if count > 0]
-    if not_played:
-        embed.add_field(name="⏳ 미참여 인원", value=" ".join(not_played), inline=False)
-
-    await interaction.followup.send(embed=embed)
-
 # 📋 멤버 닉네임 추출 명령어
 @bot.tree.command(name="멤버멘션추출", description="[관리자] 특정 역할을 가진 멤버들의 닉네임을 복사용 텍스트로 출력합니다.")
 @app_commands.describe(역할="목록을 추출할 역할")
@@ -1210,10 +958,7 @@ async def extract_role_mentions(interaction: discord.Interaction, 역할: discor
         return
 
     name_list = "\n".join([m.display_name for m in members])
-    
-    msg = f"📋 **{역할.name}** 멤버 닉네임 목록 (총 {len(members)}명):\n\n"
-    msg += f"```text\n{name_list}\n```"
-    
+    msg = f"📋 **{역할.name}** 멤버 닉네임 목록 (총 {len(members)}명):\n\n```text\n{name_list}\n```"
     await interaction.response.send_message(msg, ephemeral=True)
 
 # --- 영구 보존 경고 시스템 ---
@@ -1233,7 +978,7 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
     
     await log_warning_action(interaction.guild, 유저.id, "add", warn_entry)
     
-    warnings = await fetch_database_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     count = len(warnings.get(str(유저.id), []))
 
     embed = discord.Embed(
@@ -1254,7 +999,7 @@ async def check_warnings(interaction: discord.Interaction, 유저: Optional[disc
     await interaction.response.defer(ephemeral=True)
     target = 유저 if 유저 else interaction.user
     
-    warnings = await fetch_database_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     records = warnings.get(str(target.id), [])
     count = len(records)
 
@@ -1277,7 +1022,7 @@ async def show_all_warnings(interaction: discord.Interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    warnings = await fetch_database_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     active_warns = {uid: recs for uid, recs in warnings.items() if len(recs) > 0}
 
     if not active_warns:
@@ -1305,7 +1050,7 @@ async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
         
-    warnings = await fetch_database_from_channel(interaction.guild)
+    warnings, _ = await fetch_database_from_channel(interaction.guild)
     u_id = str(유저.id)
     if u_id not in warnings or len(warnings[u_id]) == 0:
         await interaction.followup.send("❌ 차감할 경고가 없습니다.", ephemeral=True)
@@ -1334,18 +1079,22 @@ async def manual_sync(ctx):
     try:
         bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
+        
+        _, v_records = await fetch_database_from_channel(ctx.guild)
+        VOICE_DAILY_CACHE[ctx.guild.id] = v_records
+
+        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어 및 통화 캐시를 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
 
-# --- 🧹 중복 명령어 정리 명령어 ---
+# --- 🧹 중복 및 삭제된 명령어 정리 명령어 ---
 @bot.command(name="초기화")
 async def clean_sync(ctx):
     try:
         ctx.bot.tree.clear_commands(guild=ctx.guild)
         await ctx.bot.tree.sync(guild=ctx.guild)
         synced = await ctx.bot.tree.sync()
-        await ctx.send(f"🧹 중복 명령어를 정리하고 최신 명령어 **{len(synced)}개**로 맞췄습니다! 디스코드를 재실행(Ctrl+R)해 보세요.")
+        await ctx.send(f"🧹 불필요한 명령어를 정리하고 최신 명령어 **{len(synced)}개**로 맞췄습니다! 디스코드를 재실행(Ctrl+R)해 보세요.")
     except Exception as e:
         await ctx.send(f"❌ 초기화 실패: {e}")
 
@@ -1353,8 +1102,17 @@ async def clean_sync(ctx):
 @bot.event
 async def on_ready():
     bot.add_view(LoadoutSelectView())
-    bot.add_dynamic_items(DynamicLoanButton)
-    bot.add_dynamic_items(DynamicKujiButton)
+
+    if not daily_voice_check.is_running():
+        daily_voice_check.start()
+
+    await asyncio.sleep(2)
+    for guild in bot.guilds:
+        try:
+            _, v_records = await fetch_database_from_channel(guild)
+            VOICE_DAILY_CACHE[guild.id] = v_records
+        except Exception:
+            pass
 
     try:
         synced = await bot.tree.sync()

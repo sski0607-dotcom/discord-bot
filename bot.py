@@ -1087,14 +1087,19 @@ async def manual_sync(ctx):
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
 
-# --- 🧹 중복 및 삭제된 명령어 정리 명령어 ---
+# --- 🧹 글로벌 및 길드 중복 명령어 완전 초기화 ---
 @bot.command(name="초기화")
 async def clean_sync(ctx):
     try:
+        # 1. 현재 서버(길드)에 등록된 명령어 완전 삭제
         ctx.bot.tree.clear_commands(guild=ctx.guild)
         await ctx.bot.tree.sync(guild=ctx.guild)
-        synced = await ctx.bot.tree.sync()
-        await ctx.send(f"🧹 불필요한 명령어를 정리하고 최신 명령어 **{len(synced)}개**로 맞췄습니다! 디스코드를 재실행(Ctrl+R)해 보세요.")
+
+        # 2. 전역(글로벌)에 등록된 명령어 완전 삭제
+        ctx.bot.tree.clear_commands(guild=None)
+        await ctx.bot.tree.sync()
+
+        await ctx.send("🧹 전역 및 서버의 모든 명령어를 깨끗하게 비웠습니다! 이제 `!동기화`를 입력해 주세요.")
     except Exception as e:
         await ctx.send(f"❌ 초기화 실패: {e}")
 

@@ -105,7 +105,7 @@ async def send_error_log(guild: Optional[discord.Guild], error_title: str, error
     except Exception:
         pass
 
-# --- 채널 기반 영구 데이터 관리 ---
+# --- 채널 기반 영구 데이터 관리 (최신 5,000건 수집 후 시간순 정렬 복원) ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
@@ -121,7 +121,6 @@ async def fetch_database_from_channel(guild: discord.Guild):
     voice_records: Dict[str, Dict[str, int]] = {}
 
     try:
-        # 최신 5,000건을 역순으로 수집 후 시간순(과거->최신)으로 정렬 재생
         raw_messages = []
         async for message in channel.history(limit=5000, oldest_first=False):
             if message.author.id == bot.user.id and message.embeds:
@@ -224,7 +223,7 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
-# --- [개선 ③] DB 채널 전송 성공 후 캐시 누적 갱신 ---
+# DB 채널 전송 성공 후 캐시 누적 갱신
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
         return
@@ -246,7 +245,6 @@ async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, 
     payload = {"date": date_str, "user_id": user_id, "duration": duration_sec}
     embed.set_footer(text=f"VOICE_LOG:{json.dumps(payload, ensure_ascii=False)}")
 
-    # DB 전송 성공 후 캐시 갱신
     await channel.send(embed=embed)
 
     if guild.id not in VOICE_DAILY_CACHE:
@@ -278,7 +276,7 @@ async def log_voice_config(guild: discord.Guild, channel_id: int):
     await channel.send(embed=embed)
     VOICE_NOTICE_CHANNELS[guild.id] = channel_id
 
-# --- [개선 ①] DB 채널 전송 성공 후 메모리 플래그 갱신 ---
+# DB 채널 전송 성공 후 메모리 플래그 갱신
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
         return
@@ -299,7 +297,6 @@ async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     payload = {"guild_id": guild.id, "type": flag_type, "date": date_str}
     embed.set_footer(text=f"AUDIT_FLAG:{json.dumps(payload, ensure_ascii=False)}")
 
-    # DB 전송 성공 후 메모리 플래그 설정
     await channel.send(embed=embed)
 
     if guild.id not in SERVER_AUDIT_FLAGS:
@@ -325,7 +322,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
 
         sess = VOICE_ACTIVE_SESSIONS.get(m.id)
 
-        # 1. 측정 중이었는데 멈춰야 하는 경우 (인원 1명으로 감소 or 헤드셋 끔)
+        # 1. 측정 중단 조건 (1명으로 감소 or 헤드셋 끔)
         if sess and sess["active"] and not should_track:
             if sess["start_time"]:
                 duration = int((now - sess["start_time"]).total_seconds())
@@ -334,7 +331,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
             sess["active"] = False
             sess["start_time"] = None
 
-        # 2. 멈춰있었는데 측정을 시작해야 하는 경우 (2명 이상 충족 & 헤드셋 끔 해제)
+        # 2. 측정 시작 조건 (2명 이상 충족 & 헤드셋 켬)
         elif should_track and (not sess or not sess["active"]):
             VOICE_ACTIVE_SESSIONS[m.id] = {
                 "active": True,
@@ -398,7 +395,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
 
-# --- 🕛 밤 9시(사전 경고) & 자정(확정 정산) 루프 [개선 ②: 일일/주간 완전 분리] ---
+# --- 🕛 밤 9시(사전 경고) & 자정(확정 정산) 루프 ---
 @tasks.loop(minutes=1)
 async def daily_voice_check():
     now = datetime.now(KST)
@@ -488,7 +485,6 @@ async def daily_voice_check():
             # 2. 자정 일일 정산 (00:00~00:59 사이, 서버별 1회 보장)
             # -------------------------------------------------------------
             if now.hour == 0 and guild_flags.get("daily") != yesterday_str:
-                # 접속 중 세션 자정 분할
                 for u_id, sess in list(VOICE_ACTIVE_SESSIONS.items()):
                     if sess["active"] and sess["start_time"] and sess["guild_id"] == guild.id:
                         before_midnight = int((exact_midnight - sess["start_time"]).total_seconds())
@@ -525,7 +521,7 @@ async def daily_voice_check():
                 await log_audit_flag(guild, "daily", yesterday_str)
 
             # -------------------------------------------------------------
-            # 3. [개선 ②] 매주 월요일 주간 정산 (독립 실행 블록)
+            # 3. 매주 월요일 주간 정산 (독립 실행 블록)
             # -------------------------------------------------------------
             if now.hour == 0 and now.weekday() == 0 and guild_flags.get("weekly") != yesterday_str:
                 weekly_failed = []
@@ -745,7 +741,7 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
 
 # --- 슬래시 명령어 세트 ---
 
-# 📢 [공지 이모지 미반응자 확인]
+# 📢 [공지 이모지 미반응자 확인 - 1024자 초과 에러 방지 적용]
 @bot.tree.command(name="공지미확인", description="[관리자 전용] 공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
 @app_commands.describe(메시지id="특정 공지 글을 확인할 경우 메시지 ID 입력 (비워두면 본인의 가장 최근 @everyone 공지)")
 async def check_notice_reactions(interaction: discord.Interaction, 메시지id: Optional[str] = None):
@@ -806,10 +802,22 @@ async def check_notice_reactions(interaction: discord.Interaction, 메시지id: 
     embed.add_field(name="❌ 미확인 (미반응)", value=f"**{len(unreacted_members)}명**", inline=True)
 
     if unreacted_members:
-        unreacted_lines = [f"• {m.mention} ({m.display_name})" for m in unreacted_members]
-        cut_text = "\n".join(unreacted_lines[:35])
-        if len(unreacted_members) > 35:
-            cut_text += f"\n...외 {len(unreacted_members) - 35}명"
+        displayed_lines = []
+        current_len = 0
+        omitted_count = 0
+
+        for idx, m in enumerate(unreacted_members):
+            line = f"• {m.mention} ({m.display_name})"
+            if current_len + len(line) + 30 > 950:
+                omitted_count = len(unreacted_members) - idx
+                break
+            displayed_lines.append(line)
+            current_len += len(line) + 1
+
+        cut_text = "\n".join(displayed_lines)
+        if omitted_count > 0:
+            cut_text += f"\n...외 {omitted_count}명"
+
         embed.add_field(name="⚠️ 미반응 멤버 명단", value=cut_text, inline=False)
     else:
         embed.add_field(name="🎉 전원 확인 완료!", value="모든 길드원/수습생이 공지에 이모지를 남겼습니다.", inline=False)

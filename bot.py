@@ -105,7 +105,7 @@ async def send_error_log(guild: Optional[discord.Guild], error_title: str, error
     except Exception:
         pass
 
-# --- 채널 기반 영구 데이터 관리 ---
+# --- 채널 기반 영구 데이터 관리 (최신 5,000건 역순 수집 후 과거순 정렬 복원) ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
@@ -223,6 +223,7 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
+# DB 채널 전송 성공 후 캐시 누적 갱신
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
         return
@@ -275,6 +276,7 @@ async def log_voice_config(guild: discord.Guild, channel_id: int):
     await channel.send(embed=embed)
     VOICE_NOTICE_CHANNELS[guild.id] = channel_id
 
+# DB 채널 전송 성공 후 메모리 플래그 갱신
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
         return
@@ -730,7 +732,7 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
         await interaction.followup.send(embed=embed)
 
 
-# --- 📑 [신규] 공지 미확인자 페이지네이션 View ---
+# --- 📑 [수정 완료] 공지 미확인자 페이지네이션 View (속성 이름 오류 해결) ---
 class NoticePaginationView(discord.ui.View):
     def __init__(self, author_id: int, base_embed: discord.Embed, chunks: List[List[str]], total_unreacted: int):
         super().__init__(timeout=180)
@@ -744,11 +746,11 @@ class NoticePaginationView(discord.ui.View):
         self.update_buttons()
 
     def update_buttons(self):
-        self.prev_button.disabled = (self.current_page == 0)
-        self.next_button.disabled = (self.current_page == self.max_page)
+        # 데코레이터 버튼 객체에 정확한 활성화/비활성화 반영
+        self.prev_btn_action.disabled = (self.current_page == 0)
+        self.next_btn_action.disabled = (self.current_page == self.max_page)
 
     def get_current_embed(self) -> discord.Embed:
-        # 기존 요약 필드 복사 후 현재 페이지의 미반응자 목록 필드 추가
         embed = self.base_embed.copy()
         current_chunk = self.chunks[self.current_page]
         
@@ -760,7 +762,7 @@ class NoticePaginationView(discord.ui.View):
             value=" ".join(current_chunk),
             inline=False
         )
-        embed.set_footer(text=f"페이지 {self.current_page + 1} / {self.max_page + 1} (하단 버튼을 눌러 넘겨보세요)")
+        embed.set_footer(text=f"페이지 {self.current_page + 1} / {self.max_page + 1} (하단 버튼으로 이동)")
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -770,14 +772,14 @@ class NoticePaginationView(discord.ui.View):
         return True
 
     @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, custom_id="notice_prev_btn")
-    async def prev_button_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def prev_btn_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page > 0:
             self.current_page -= 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
     @discord.ui.button(label="다음 ▶", style=discord.ButtonStyle.primary, custom_id="notice_next_btn")
-    async def next_button_click(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def next_btn_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.current_page < self.max_page:
             self.current_page += 1
             self.update_buttons()
@@ -858,12 +860,10 @@ async def check_notice_reactions(interaction: discord.Interaction, 메시지id: 
     chunk_size = 25
     chunks = [mentions[i:i + chunk_size] for i in range(0, len(mentions), chunk_size)]
 
-    # 1페이지만 있는 경우 버튼 없이 바로 전송
     if len(chunks) == 1:
         base_embed.add_field(name=f"⚠️ 미반응 멤버 명단 ({len(unreacted_members)}명)", value=" ".join(chunks[0]), inline=False)
         await interaction.followup.send(embed=base_embed, ephemeral=True)
     else:
-        # 여러 페이지인 경우 페이지 넘김 View 연결
         view = NoticePaginationView(
             author_id=interaction.user.id,
             base_embed=base_embed,
@@ -979,7 +979,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
-    # 닉네임 대괄호 중복 제거: target.display_name 그대로 1개만 출력
+    # 닉네임 대괄호 중복 제거: target.display_name 그대로 출력
     embed = discord.Embed(
         title=f"🎙️ {target.display_name} 님의 통화방 시간표",
         color=discord.Color.teal()
@@ -1166,7 +1166,7 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
     await interaction.channel.send(content=유저.mention, embed=embed)
     await interaction.followup.send(f"✅ {유저.display_name} 님에게 경고를 부여했습니다. (누적: {count}회)", ephemeral=True)
 
-# 📋 [경고 확인 - 대괄호 중복 제거 수정]
+# 📋 [경고 확인]
 @bot.tree.command(name="경고확인", description="경고 내역을 확인합니다.")
 @app_commands.describe(유저="조회할 대상 멤버 (비워두면 본인)")
 async def check_warnings(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):

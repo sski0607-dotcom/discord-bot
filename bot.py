@@ -36,7 +36,7 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# 🚨 [중요] 경고 및 통화 기록을 보관할 비공개 채널 ID
+# 🚨 [중요] 경고, 통화 기록, 설정을 보관할 비공개 채널 ID
 WARN_LOG_CHANNEL_ID = 1569705414839242884
 
 # 📢 공지 확인 대상 채널 ID
@@ -44,6 +44,9 @@ ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
 # 💤 [중요] 시간 측정을 제외할 잠수방 음성 채널 ID
 AFK_VOICE_CHANNEL_ID = 1569698118004514836
+
+# 🎫 인증 시 기본으로 부여할 역할 이름 (필요시 서버 상황에 맞게 수정 가능)
+VERIFIED_ROLE_NAME = "월영 길드원"
 
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
@@ -72,8 +75,9 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
         return True
     return False
 
-# 서버별 통화 알림 채널 매핑 {guild_id: channel_id}
+# 서버별 설정 매핑 {guild_id: channel_id}
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
+MEMBER_COUNTER_CHANNELS: Dict[int, int] = {}
 
 # 통화방 세션 메모리 {user_id: {"active": bool, "start_time": datetime, "guild_id": int}}
 VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
@@ -222,7 +226,17 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
-                # 4. 정산 플래그 복원
+                # 4. 서버 인원 카운터 채널 ID 복원
+                elif footer_text.startswith("COUNTER_CONFIG:"):
+                    try:
+                        raw_data = footer_text.replace("COUNTER_CONFIG:", "").strip()
+                        cfg = json.loads(raw_data)
+                        g_id = cfg.get("guild_id", guild.id)
+                        MEMBER_COUNTER_CHANNELS[g_id] = cfg.get("channel_id")
+                    except Exception:
+                        continue
+
+                # 5. 정산 플래그 복원
                 elif footer_text.startswith("AUDIT_FLAG:"):
                     try:
                         raw_data = footer_text.replace("AUDIT_FLAG:", "").strip()
@@ -312,6 +326,27 @@ async def log_voice_config(guild: discord.Guild, channel_id: int):
     await channel.send(embed=embed)
     VOICE_NOTICE_CHANNELS[guild.id] = channel_id
 
+async def log_counter_config(guild: discord.Guild, channel_id: int):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    embed = discord.Embed(
+        title="👥 [인원 카운터 DB 로그] COUNTER_CHANNEL",
+        color=discord.Color.dark_teal()
+    )
+    embed.add_field(name="Guild ID", value=str(guild.id), inline=True)
+    embed.add_field(name="Counter Channel ID", value=str(channel_id), inline=True)
+    payload = {"guild_id": guild.id, "channel_id": channel_id}
+    embed.set_footer(text=f"COUNTER_CONFIG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+    MEMBER_COUNTER_CHANNELS[guild.id] = channel_id
+
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
         return
@@ -339,6 +374,29 @@ async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     SERVER_AUDIT_FLAGS[guild.id][flag_type] = date_str
 
 
+# --- 👥 [신규] 서버 멤버 인원수 갱신 헬퍼 ---
+async def update_member_counter(guild: discord.Guild):
+    channel_id = MEMBER_COUNTER_CHANNELS.get(guild.id)
+    if not channel_id:
+        return
+
+    channel = guild.get_channel(channel_id)
+    if not channel or not isinstance(channel, discord.VoiceChannel):
+        return
+
+    # 봇을 제외한 실제 유저 수 계산
+    human_count = len([m for m in guild.members if not m.bot])
+    new_name = f"👥│길드원: {human_count}명"
+
+    if channel.name != new_name:
+        try:
+            await channel.edit(name=new_name)
+        except discord.Forbidden:
+            pass
+        except discord.HTTPException:
+            pass
+
+
 # --- 👥 음성 채널 인원(최소 2인 이상 & 잠수방 제외) 상태 점검 및 세션 갱신 헬퍼 ---
 async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
     if not channel:
@@ -346,7 +404,6 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
 
     now = datetime.now(KST)
     
-    # 잠수방 채널인 경우 해당 방의 모든 세션 측정 중단 및 정산
     if is_afk_channel(channel):
         for m in channel.members:
             if m.id in VOICE_ACTIVE_SESSIONS:
@@ -371,7 +428,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
 
         sess = VOICE_ACTIVE_SESSIONS.get(m.id)
 
-        # 1. 측정 중단 조건 (1명으로 감소 or 헤드셋 끔)
+        # 1. 측정 중단 조건
         if sess and sess["active"] and not should_track:
             if sess["start_time"]:
                 duration = int((now - sess["start_time"]).total_seconds())
@@ -380,7 +437,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
             sess["active"] = False
             sess["start_time"] = None
 
-        # 2. 측정 시작 조건 (2명 이상 충족 & 헤드셋 켬)
+        # 2. 측정 시작 조건
         elif should_track and (not sess or not sess["active"]):
             VOICE_ACTIVE_SESSIONS[m.id] = {
                 "active": True,
@@ -389,7 +446,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
             }
 
 
-# --- 🎙️ 통화방 출결 및 상태 변경 리스너 (잠수방 이동 대응) ---
+# --- 🎙️ 통화방 출결 및 상태 변경 리스너 ---
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
@@ -416,7 +473,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # 3. 방 이동 또는 헤드셋 끔 상태 변경
     if before.channel and after.channel:
         if before.channel.id != after.channel.id:
-            # 기존 방 세션 정산
             if member.id in VOICE_ACTIVE_SESSIONS:
                 sess = VOICE_ACTIVE_SESSIONS.pop(member.id)
                 if sess["active"] and sess["start_time"]:
@@ -429,7 +485,17 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await update_voice_channel_members(after.channel)
 
 
-# --- 🏷️ 역할 변경 시 통화 세션 즉시 정산 및 종료 ---
+# --- 🏷️ 멤버 입장/퇴장/역할 변경 리스너 ---
+@bot.event
+async def on_member_join(member: discord.Member):
+    # 인원수 채널 갱신
+    await update_member_counter(member.guild)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    # 인원수 채널 갱신
+    await update_member_counter(member.guild)
+
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     was_target = is_target_member(before)
@@ -445,7 +511,17 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
 
-# --- 🕛 주간 전용 정산 루프 (매주 월요일 자정에만 결산 발송) ---
+# --- 👥 [신규] 10분 주기 서버 인원수 자동 동기화 루프 ---
+@tasks.loop(minutes=10)
+async def update_member_counter_loop():
+    for guild in bot.guilds:
+        try:
+            await update_member_counter(guild)
+        except Exception:
+            pass
+
+
+# --- 🕛 주간 전용 정산 루프 ---
 @tasks.loop(minutes=1)
 async def daily_voice_check():
     now = datetime.now(KST)
@@ -454,7 +530,6 @@ async def daily_voice_check():
 
     for guild in bot.guilds:
         try:
-            # 1. 자정 통화 세션 분할 (일별 누적 시간 데이터 보존을 위해 백그라운드 자동 저장)
             if now.hour == 0 and now.minute == 0:
                 for u_id, sess in list(VOICE_ACTIVE_SESSIONS.items()):
                     if sess["active"] and sess["start_time"] and sess["guild_id"] == guild.id:
@@ -463,7 +538,6 @@ async def daily_voice_check():
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
 
-            # 2. 매주 월요일 자정(00:00~00:59) 주간 11시간 미달자 브리핑 발송
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -500,7 +574,7 @@ async def daily_voice_check():
                             for d_str in past_7_days:
                                 week_spent += guild_data.get(d_str, {}).get(str(member.id), 0)
 
-                            if week_spent < 39600:  # 11시간 미만
+                            if week_spent < 39600:
                                 weekly_failed.append(f"• {member.mention} ({member.display_name}) - `{format_seconds(week_spent)}` / 11시간")
                                 weekly_pings.append(member.mention)
 
@@ -661,6 +735,37 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(JobSelect())
         self.add_item(LoadoutConfirmButton())
 
+# --- 🎫 [신규] 영구 인증 View ---
+class VerificationView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ 길드원 인증하기", style=discord.ButtonStyle.success, custom_id="btn_guild_verify")
+    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        member = interaction.user
+
+        # 부여할 역할 조회
+        role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        if not role:
+            # 역할이 없으면 자동 생성 시도
+            try:
+                role = await guild.create_role(name=VERIFIED_ROLE_NAME)
+            except discord.Forbidden:
+                await interaction.followup.send("⚠️ 봇에 '역할 관리' 권한이 없어 인증 역할을 생성할 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
+                return
+
+        if role in member.roles:
+            await interaction.followup.send(f"ℹ️ 이미 **{role.name}** 인증이 완료된 상태입니다!", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role)
+            await interaction.followup.send(f"🎉 인증 완료! **{role.name}** 역할이 지급되었습니다. 환영합니다!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ 봇의 역할 순위가 인증 역할보다 낮아 역할을 지급할 수 없습니다.", ephemeral=True)
+
 # --- 📝 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
@@ -755,6 +860,43 @@ class NoticePaginationView(discord.ui.View):
 
 
 # --- 슬래시 명령어 세트 ---
+
+# 🎫 [신규: 인증 메시지 전송 - 관리자 전용]
+@bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 길드원 인증 버튼 임베드를 전송합니다.")
+@app_commands.describe(채널="인증 메시지를 보낼 텍스트 채널")
+async def send_verification_message(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🛡️ [길드원 서버 인증]",
+        description=(
+            "서버에 오신 것을 환영합니다!\n\n"
+            "아래 **[길드원 인증하기]** 버튼을 누르시면\n"
+            f"**{VERIFIED_ROLE_NAME}** 역할이 지급되며 채널 이용이 가능해집니다."
+        ),
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="버튼을 한 번만 클릭해 주세요.")
+
+    try:
+        await 채널.send(embed=embed, view=VerificationView())
+        await interaction.response.send_message(f"✅ {채널.mention} 채널에 인증 메시지를 전송했습니다!", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"⚠️ {채널.mention} 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
+
+# 👥 [신규: 인원 카운터 채널 설정 - 관리자 전용]
+@bot.tree.command(name="인원수채널설정", description="[관리자 전용] 실시간 길드원 수가 표시될 음성 채널을 지정합니다.")
+@app_commands.describe(채널="인원수가 표시될 음성 채널 (통화방)")
+async def set_member_counter_channel(interaction: discord.Interaction, 채널: discord.VoiceChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    await log_counter_config(interaction.guild, 채널.id)
+    await update_member_counter(interaction.guild)
+    await interaction.response.send_message(f"✅ {채널.mention} 채널이 실시간 인원수 카운터로 설정되었습니다!\n(10분 주기 및 멤버 입장/퇴장 시 자동 갱신됩니다)", ephemeral=True)
 
 # 📢 [공지 이모지 미반응자 확인]
 @bot.tree.command(name="공지미확인", description="[관리자 전용] 공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
@@ -886,8 +1028,8 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
-# 🎙️ [통화 시간 조회 - 잠수방 감지 반영]
-@bot.tree.command(name="통화시간", description="오늘, 이번 주, 지난 주 및 최근 누적 통화방 참여 시간을 확인합니다.")
+# 🎙️ [통화 시간 조회]
+@bot.tree.command(name="통화시간", description="오늘, 이번 주 요일별 참여 시간, 지난 주 기록 등을 확인합니다.")
 @app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
 async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
     await interaction.response.defer(ephemeral=True)
@@ -931,13 +1073,31 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
-    # 이번 주 누적 (월요일 00:00부터 오늘까지)
+    # 이번 주 요일별 통화시간 계산
     current_weekday = now.weekday()
-    days_from_monday = current_weekday
-    this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_from_monday + 1)]
-    this_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in this_week_days) + cur_live_diff
+    monday_date = now - timedelta(days=current_weekday)
+    weekdays_ko = ["월", "화", "수", "목", "금", "토", "일"]
 
-    # 지난 주 누적 (지난 주 월~일 7일 완주 기록)
+    daily_breakdown = []
+    this_week_sec = 0
+
+    for i in range(7):
+        target_day = monday_date + timedelta(days=i)
+        d_str = target_day.strftime("%Y-%m-%d")
+        day_spent = guild_data.get(d_str, {}).get(u_str, 0)
+
+        if i == current_weekday:
+            day_spent += cur_live_diff
+
+        this_week_sec += day_spent
+        
+        day_label = f"**{weekdays_ko[i]}요일**"
+        if i == current_weekday:
+            day_label += " *(오늘)*"
+
+        daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
+
+    # 지난 주 누적
     last_week_monday = now - timedelta(days=current_weekday + 7)
     last_week_days = [(last_week_monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     last_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in last_week_days)
@@ -951,10 +1111,16 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
         color=discord.Color.teal()
     )
     embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**", inline=True)
-    embed.add_field(name="🗓️ 이번 주 누적 (월~오늘)", value=f"**{format_seconds(this_week_sec)}** (기준: 11시간)", inline=True)
+    embed.add_field(name="🗓️ 이번 주 총합 (월~오늘)", value=f"**{format_seconds(this_week_sec)}** (기준: 11시간)", inline=True)
     embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
-    embed.add_field(name="📊 최근 7일 누적", value=f"**{format_seconds(recent_7_sec)}**", inline=True)
-    embed.add_field(name="📌 실시간 상태", value=current_status, inline=False)
+    
+    embed.add_field(
+        name="📊 이번 주 요일별 상세 기록",
+        value="\n".join(daily_breakdown),
+        inline=False
+    )
+    embed.add_field(name="📈 최근 7일 이동 합계", value=f"**{format_seconds(recent_7_sec)}**", inline=True)
+    embed.add_field(name="📌 실시간 상태", value=current_status, inline=True)
     embed.set_footer(text="잠수방, 혼자 있는 경우, 헤드셋 끔 상태에서는 시간이 측정되지 않습니다.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1268,10 +1434,15 @@ async def sync_permission_error(ctx, error):
 # --- 🌟 봇 시작 이벤트 (영구 View 등록 및 세션 보존) ---
 @bot.event
 async def on_ready():
+    # 영구 View 등록 (무기/직업 선택 및 신규 인증 버튼)
     bot.add_view(LoadoutSelectView())
+    bot.add_view(VerificationView())
 
     if not daily_voice_check.is_running():
         daily_voice_check.start()
+
+    if not update_member_counter_loop.is_running():
+        update_member_counter_loop.start()
 
     await asyncio.sleep(2)
     now = datetime.now(KST)
@@ -1281,8 +1452,10 @@ async def on_ready():
             _, v_records = await fetch_database_from_channel(guild)
             VOICE_DAILY_CACHE[guild.id] = v_records
 
+            # 서버 인원수 카운터 초기 갱신
+            await update_member_counter(guild)
+
             for vc in guild.voice_channels:
-                # 봇 재부팅 시 잠수방에 있는 인원은 시작 세션에서 배제
                 if is_afk_channel(vc):
                     continue
 

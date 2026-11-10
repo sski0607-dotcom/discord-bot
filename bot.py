@@ -1073,36 +1073,37 @@ async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
     await log_warning_action(interaction.guild, 유저.id, "clear", {})
     await interaction.followup.send(f"🧹 **{유저.display_name}** 님의 모든 경고가 초기화되었습니다.", ephemeral=True)
 
-# --- 백업용 즉시 동기화 일반 명령어 ---
-@bot.command(name="동기화")
-async def manual_sync(ctx):
-    try:
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
-        
-        _, v_records = await fetch_database_from_channel(ctx.guild)
-        VOICE_DAILY_CACHE[ctx.guild.id] = v_records
-
-        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어 및 통화 캐시를 동기화했습니다! 잠시 후 `/`를 쳐보세요.")
-    except Exception as e:
-        await ctx.send(f"❌ 동기화 실패: {e}")
-
-# --- 🧹 글로벌 및 길드 중복 명령어 완전 초기화 ---
+# --- 🧹 완전 초기화 (전역 & 서버 명령어 모두 제거) ---
 @bot.command(name="초기화")
 async def clean_sync(ctx):
     try:
-        # 1. 현재 서버(길드)에 등록된 명령어 완전 삭제
+        # 1. 서버 전용 명령어 비우기
         ctx.bot.tree.clear_commands(guild=ctx.guild)
         await ctx.bot.tree.sync(guild=ctx.guild)
-
-        # 2. 전역(글로벌)에 등록된 명령어 완전 삭제
+        
+        # 2. 전역 명령어 비우기
         ctx.bot.tree.clear_commands(guild=None)
         await ctx.bot.tree.sync()
-
-        await ctx.send("🧹 전역 및 서버의 모든 명령어를 깨끗하게 비웠습니다! 이제 `!동기화`를 입력해 주세요.")
+        
+        await ctx.send("🧹 모든 명령어를 깨끗하게 비웠습니다! 이제 `!동기화`를 입력하세요.")
     except Exception as e:
         await ctx.send(f"❌ 초기화 실패: {e}")
 
+# --- 🚀 확실한 단일 서버 직접 동기화 ---
+@bot.command(name="동기화")
+async def manual_sync(ctx):
+    try:
+        # 봇에 정의된 @bot.tree.command 들을 현재 서버에 직접 복사 후 동기화
+        ctx.bot.tree.copy_global_to(guild=ctx.guild)
+        synced = await ctx.bot.tree.sync(guild=ctx.guild)
+        
+        # 캐시 갱신
+        _, v_records = await fetch_database_from_channel(ctx.guild)
+        VOICE_DAILY_CACHE[ctx.guild.id] = v_records
+
+        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 성공적으로 등록했습니다! 잠시 후 `/`를 쳐보세요.")
+    except Exception as e:
+        await ctx.send(f"❌ 동기화 실패: {e}")
 # --- 봇 시작 및 동기화 ---
 @bot.event
 async def on_ready():

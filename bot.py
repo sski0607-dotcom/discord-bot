@@ -36,7 +36,7 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# 🚨 [중요] 경고, 통화 기록, 설정을 보관할 비공개 채널 ID
+# 🚨 [중요] 경고, 통화 기록, 관리자 승인 검토 채널 ID
 WARN_LOG_CHANNEL_ID = 1569705414839242884
 
 # 📢 공지 확인 대상 채널 ID
@@ -45,8 +45,8 @@ ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 # 💤 [중요] 시간 측정을 제외할 잠수방 음성 채널 ID
 AFK_VOICE_CHANNEL_ID = 1569698118004514836
 
-# 🎫 인증 시 기본으로 부여할 역할 이름 (필요시 서버 상황에 맞게 수정 가능)
-VERIFIED_ROLE_NAME = "월영 길드원"
+# 🎫 승인 시 기본으로 부여할 역할 이름
+DEFAULT_VERIFIED_ROLE = "월영 길드원"
 
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
@@ -374,7 +374,7 @@ async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     SERVER_AUDIT_FLAGS[guild.id][flag_type] = date_str
 
 
-# --- 👥 [신규] 서버 멤버 인원수 갱신 헬퍼 ---
+# --- 👥 서버 전체 이용자수 갱신 헬퍼 ---
 async def update_member_counter(guild: discord.Guild):
     channel_id = MEMBER_COUNTER_CHANNELS.get(guild.id)
     if not channel_id:
@@ -384,16 +384,13 @@ async def update_member_counter(guild: discord.Guild):
     if not channel or not isinstance(channel, discord.VoiceChannel):
         return
 
-    # 봇을 제외한 실제 유저 수 계산
     human_count = len([m for m in guild.members if not m.bot])
-    new_name = f"👥│길드원: {human_count}명"
+    new_name = f"👥│전체 인원: {human_count}명"
 
     if channel.name != new_name:
         try:
             await channel.edit(name=new_name)
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
+        except (discord.Forbidden, discord.HTTPException):
             pass
 
 
@@ -488,12 +485,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # --- 🏷️ 멤버 입장/퇴장/역할 변경 리스너 ---
 @bot.event
 async def on_member_join(member: discord.Member):
-    # 인원수 채널 갱신
     await update_member_counter(member.guild)
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    # 인원수 채널 갱신
     await update_member_counter(member.guild)
 
 @bot.event
@@ -511,7 +506,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
 
-# --- 👥 [신규] 10분 주기 서버 인원수 자동 동기화 루프 ---
+# --- 👥 10분 주기 서버 인원수 자동 동기화 루프 ---
 @tasks.loop(minutes=10)
 async def update_member_counter_loop():
     for guild in bot.guilds:
@@ -735,38 +730,161 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(JobSelect())
         self.add_item(LoadoutConfirmButton())
 
-# --- 🎫 [신규] 영구 인증 View ---
-class VerificationView(discord.ui.View):
+
+# --- 🛡️ [고도화된 인증 & 검토 시스템: ApplyView, ApplyModal, ReviewView] ---
+
+# 1. 관리자 검토 뷰 (승인 / 거절)
+class ReviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="✅ 길드원 인증하기", style=discord.ButtonStyle.success, custom_id="btn_guild_verify")
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        guild = interaction.guild
-        member = interaction.user
-
-        # 부여할 역할 조회
-        role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
-        if not role:
-            # 역할이 없으면 자동 생성 시도
-            try:
-                role = await guild.create_role(name=VERIFIED_ROLE_NAME)
-            except discord.Forbidden:
-                await interaction.followup.send("⚠️ 봇에 '역할 관리' 권한이 없어 인증 역할을 생성할 수 없습니다. 관리자에게 문의하세요.", ephemeral=True)
-                return
-
-        if role in member.roles:
-            await interaction.followup.send(f"ℹ️ 이미 **{role.name}** 인증이 완료된 상태입니다!", ephemeral=True)
+    @discord.ui.button(label="✅ 승인", style=discord.ButtonStyle.success, custom_id="btn_review_approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if not is_admin_or_mod(interaction):
+            await interaction.followup.send("❌ 관리자만 승인할 수 있습니다.", ephemeral=True)
             return
 
-        try:
-            await member.add_roles(role)
-            await interaction.followup.send(f"🎉 인증 완료! **{role.name}** 역할이 지급되었습니다. 환영합니다!", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send("⚠️ 봇의 역할 순위가 인증 역할보다 낮아 역할을 지급할 수 없습니다.", ephemeral=True)
+        embed = interaction.message.embeds[0]
+        # 임베드 Footer에 보관된 user_id 및 닉네임 추출
+        footer_parts = embed.footer.text.split("|")
+        target_user_id = int(footer_parts[0].replace("USER_ID:", "").strip())
+        new_nick = footer_parts[1].replace("NICK:", "").strip() if len(footer_parts) > 1 else None
+        guild_target = footer_parts[2].replace("GUILD:", "").strip() if len(footer_parts) > 2 else "월영"
 
-# --- 📝 모달 UI ---
+        guild = interaction.guild
+        member = guild.get_member(target_user_id)
+
+        if not member:
+            try:
+                member = await guild.fetch_member(target_user_id)
+            except Exception:
+                await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다 (서버를 퇴장했을 수 있습니다).", ephemeral=True)
+                return
+
+        # 역할 지급 (지원한 길드에 맞게 또는 기본 역할)
+        role_to_give = discord.utils.get(guild.roles, name=f"{guild_target} 길드원") or discord.utils.get(guild.roles, name=DEFAULT_VERIFIED_ROLE)
+        if not role_to_give:
+            try:
+                role_to_give = await guild.create_role(name=f"{guild_target} 길드원")
+            except discord.Forbidden:
+                role_to_give = None
+
+        if role_to_give:
+            try:
+                await member.add_roles(role_to_give)
+            except discord.Forbidden:
+                pass
+
+        # 닉네임 자동 설정
+        if new_nick:
+            try:
+                await member.edit(nick=new_nick[:32])
+            except discord.Forbidden:
+                pass
+
+        # 임베드 갱신
+        embed.color = discord.Color.green()
+        embed.title = "🛡️ [인증 신청 - 승인 완료]"
+        embed.add_field(name="처리자", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=False)
+        
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        try:
+            await member.send(f"🎉 **{guild.name}** 서버의 길드원 인증이 승인되었습니다! 채널을 자유롭게 이용하실 수 있습니다.")
+        except Exception:
+            pass
+
+    @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger, custom_id="btn_review_reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if not is_admin_or_mod(interaction):
+            await interaction.followup.send("❌ 관리자만 거절할 수 있습니다.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        footer_parts = embed.footer.text.split("|")
+        target_user_id = int(footer_parts[0].replace("USER_ID:", "").strip())
+
+        embed.color = discord.Color.red()
+        embed.title = "🛡️ [인증 신청 - 거절 처리]"
+        embed.add_field(name="처리자", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=False)
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        guild = interaction.guild
+        member = guild.get_member(target_user_id)
+        if member:
+            try:
+                await member.send(f"⚠️ **{guild.name}** 서버의 길드원 인증 신청이 관리자에 의해 거절되었습니다. 관리자에게 문의해 주세요.")
+            except Exception:
+                pass
+
+
+# 2. 신청 모달 UI
+class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서 작성"):
+    name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
+    mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
+    guild_name = discord.ui.TextInput(label="소속 길드 (월영 / 영월 / 은월 등)", placeholder="예: 월영", required=True, max_length=15)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        user = interaction.user
+
+        clean_name = self.name.value.strip()
+        clean_mc = self.mc_name.value.strip()
+        clean_guild = self.guild_name.value.strip()
+
+        formatted_nick = f"{clean_name} / {clean_mc} / {clean_guild}"
+        if len(formatted_nick) > 32:
+            formatted_nick = formatted_nick[:32]
+
+        review_channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+        if not review_channel:
+            try:
+                review_channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+            except Exception:
+                review_channel = None
+
+        if not review_channel:
+            await interaction.followup.send("❌ 관리자 승인 채널을 찾을 수 없어 신청서를 제출하지 못했습니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            return
+
+        review_embed = discord.Embed(
+            title="🛡️ [신규 길드원 인증 신청]",
+            description=f"{user.mention} 님이 인증 신청서를 제출했습니다.",
+            color=discord.Color.gold(),
+            timestamp=datetime.now(KST)
+        )
+        review_embed.add_field(name="신청자 디스코드", value=f"{user.display_name} (`{user.id}`)", inline=True)
+        review_embed.add_field(name="이름 / 별명", value=clean_name, inline=True)
+        review_embed.add_field(name="마인크래프트 닉네임", value=clean_mc, inline=True)
+        review_embed.add_field(name="소속 길드", value=clean_guild, inline=True)
+        review_embed.add_field(name="적용될 닉네임", value=f"`{formatted_nick}`", inline=False)
+        review_embed.set_footer(text=f"USER_ID:{user.id}|NICK:{formatted_nick}|GUILD:{clean_guild}")
+
+        await review_channel.send(embed=review_embed, view=ReviewView())
+        await interaction.followup.send("✅ 인증 신청서가 관리자에게 제출되었습니다! 검토 완료 후 자동으로 닉네임과 역할이 적용됩니다.", ephemeral=True)
+
+
+# 3. 유저가 누르는 인증 신청 시작 뷰
+class ApplyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📝 길드원 인증 신청하기", style=discord.ButtonStyle.primary, custom_id="btn_guild_apply_start")
+    async def apply_start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ApplyModal())
+
+
+# --- 📝 자기소개 모달 UI ---
 class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
@@ -781,12 +899,12 @@ class ProfileModal(discord.ui.Modal, title="자기소개 입력"):
         prefix = f"{prefix_match.group(1)} " if prefix_match else ""
 
         new_nick = f"{prefix}{self.name.value.strip()} / {self.mc_name.value.strip()} / {self.guild_name.value.strip()}"
-        if len(new_nick) > 32:
-            new_nick = new_nick[:32]
+        if len(new_nickname := new_nick) > 32:
+            new_nickname = new_nickname[:32]
 
         try:
-            await user.edit(nick=new_nick)
-            nickname_msg = f"닉네임이 **{new_nick}**(으)로 설정되었습니다!"
+            await user.edit(nick=new_nickname)
+            nickname_msg = f"닉네임이 **{new_nickname}**(으)로 설정되었습니다!"
         except discord.Forbidden:
             nickname_msg = "⚠️ 서버장 또는 봇보다 높은 역할이라 닉네임 자동 변경이 불가능합니다."
 
@@ -861,8 +979,8 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🎫 [신규: 인증 메시지 전송 - 관리자 전용]
-@bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 길드원 인증 버튼 임베드를 전송합니다.")
+# 🎫 [인증 안내 메시지 전송 - 관리자 전용]
+@bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 길드원 인증 신청 버튼 임베드를 전송합니다.")
 @app_commands.describe(채널="인증 메시지를 보낼 텍스트 채널")
 async def send_verification_message(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not is_admin_or_mod(interaction):
@@ -870,25 +988,26 @@ async def send_verification_message(interaction: discord.Interaction, 채널: di
         return
 
     embed = discord.Embed(
-        title="🛡️ [길드원 서버 인증]",
+        title="🌙 [길드원 서버 인증 신청]",
         description=(
-            "서버에 오신 것을 환영합니다!\n\n"
-            "아래 **[길드원 인증하기]** 버튼을 누르시면\n"
-            f"**{VERIFIED_ROLE_NAME}** 역할이 지급되며 채널 이용이 가능해집니다."
+            "**라스트 트래블러** 서버에 오신 것을 환영합니다!\n\n"
+            "원활한 길드 활동과 채널 이용을 위해 아래 **[📝 길드원 인증 신청하기]** 버튼을 눌러 양식을 작성해 주세요.\n\n"
+            "• 관리자 확인 후 닉네임 설정 및 길드원 역할이 자동으로 지급됩니다.\n"
+            "• 양식: **이름(별명) / 마크 닉네임 / 소속 길드**"
         ),
-        color=discord.Color.green()
+        color=discord.Color.dark_purple()
     )
-    embed.set_footer(text="버튼을 한 번만 클릭해 주세요.")
+    embed.set_footer(text="버튼을 눌러 신청서를 작성해 주세요.")
 
     try:
-        await 채널.send(embed=embed, view=VerificationView())
-        await interaction.response.send_message(f"✅ {채널.mention} 채널에 인증 메시지를 전송했습니다!", ephemeral=True)
+        await 채널.send(embed=embed, view=ApplyView())
+        await interaction.response.send_message(f"✅ {채널.mention} 채널에 인증 신청 메시지를 전송했습니다!", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message(f"⚠️ {채널.mention} 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
 
-# 👥 [신규: 인원 카운터 채널 설정 - 관리자 전용]
-@bot.tree.command(name="인원수채널설정", description="[관리자 전용] 실시간 길드원 수가 표시될 음성 채널을 지정합니다.")
-@app_commands.describe(채널="인원수가 표시될 음성 채널 (통화방)")
+# 👥 [인원 카운터 채널 설정 - 관리자 전용]
+@bot.tree.command(name="인원수채널설정", description="[관리자 전용] 실시간 전체 이용자 수가 표시될 음성 채널을 지정합니다.")
+@app_commands.describe(채널="전체 인원수가 표시될 음성 채널")
 async def set_member_counter_channel(interaction: discord.Interaction, 채널: discord.VoiceChannel):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
@@ -896,7 +1015,7 @@ async def set_member_counter_channel(interaction: discord.Interaction, 채널: d
 
     await log_counter_config(interaction.guild, 채널.id)
     await update_member_counter(interaction.guild)
-    await interaction.response.send_message(f"✅ {채널.mention} 채널이 실시간 인원수 카운터로 설정되었습니다!\n(10분 주기 및 멤버 입장/퇴장 시 자동 갱신됩니다)", ephemeral=True)
+    await interaction.response.send_message(f"✅ {채널.mention} 채널이 실시간 전체 인원수 카운터로 설정되었습니다!\n(10분 주기 및 멤버 입장/퇴장 시 자동 갱신됩니다)", ephemeral=True)
 
 # 📢 [공지 이모지 미반응자 확인]
 @bot.tree.command(name="공지미확인", description="[관리자 전용] 공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
@@ -1073,7 +1192,6 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
-    # 이번 주 요일별 통화시간 계산
     current_weekday = now.weekday()
     monday_date = now - timedelta(days=current_weekday)
     weekdays_ko = ["월", "화", "수", "목", "금", "토", "일"]
@@ -1097,12 +1215,10 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
 
         daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
 
-    # 지난 주 누적
     last_week_monday = now - timedelta(days=current_weekday + 7)
     last_week_days = [(last_week_monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     last_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in last_week_days)
 
-    # 최근 7일 누적
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
@@ -1434,9 +1550,10 @@ async def sync_permission_error(ctx, error):
 # --- 🌟 봇 시작 이벤트 (영구 View 등록 및 세션 보존) ---
 @bot.event
 async def on_ready():
-    # 영구 View 등록 (무기/직업 선택 및 신규 인증 버튼)
+    # 영구 View 등록: 무기/직업, 인증 신청, 관리자 승인 검토
     bot.add_view(LoadoutSelectView())
-    bot.add_view(VerificationView())
+    bot.add_view(ApplyView())
+    bot.add_view(ReviewView())
 
     if not daily_voice_check.is_running():
         daily_voice_check.start()
@@ -1452,7 +1569,6 @@ async def on_ready():
             _, v_records = await fetch_database_from_channel(guild)
             VOICE_DAILY_CACHE[guild.id] = v_records
 
-            # 서버 인원수 카운터 초기 갱신
             await update_member_counter(guild)
 
             for vc in guild.voice_channels:

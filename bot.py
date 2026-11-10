@@ -105,7 +105,31 @@ async def send_error_log(guild: Optional[discord.Guild], error_title: str, error
     except Exception:
         pass
 
-# --- 채널 기반 영구 데이터 관리 (최신 5,000건 역순 수집 후 과거순 정렬 복원) ---
+# --- 임베드 필드 글자 수(1,024자) 제한 방어 헬퍼 ---
+def add_chunked_fields(embed: discord.Embed, base_title: str, lines: List[str], max_chars: int = 900):
+    if not lines:
+        return
+    current_chunk = []
+    current_length = 0
+    field_index = 1
+
+    for line in lines:
+        line_len = len(line) + 1
+        if current_length + line_len > max_chars:
+            title = base_title if field_index == 1 else f"{base_title} ({field_index})"
+            embed.add_field(name=title, value="\n".join(current_chunk), inline=False)
+            current_chunk = [line]
+            current_length = line_len
+            field_index += 1
+        else:
+            current_chunk.append(line)
+            current_length += line_len
+
+    if current_chunk:
+        title = base_title if field_index == 1 else f"{base_title} ({field_index})"
+        embed.add_field(name=title, value="\n".join(current_chunk), inline=False)
+
+# --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
     if WARN_LOG_CHANNEL_ID == 0:
         return {}, {}
@@ -223,7 +247,6 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
 
-# DB 채널 전송 성공 후 캐시 누적 갱신
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
         return
@@ -276,7 +299,6 @@ async def log_voice_config(guild: discord.Guild, channel_id: int):
     await channel.send(embed=embed)
     VOICE_NOTICE_CHANNELS[guild.id] = channel_id
 
-# DB 채널 전송 성공 후 메모리 플래그 갱신
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
         return
@@ -395,7 +417,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
 
-# --- 🕛 밤 9시(사전 경고) & 자정(확정 정산) 루프 ---
+# --- 🕛 밤 9시(사전 경고) & 자정(확정 정산) 루프 [1024자 초과 방어 필드 적용] ---
 @tasks.loop(minutes=1)
 async def daily_voice_check():
     now = datetime.now(KST)
@@ -432,7 +454,9 @@ async def daily_voice_check():
             guild_data = VOICE_DAILY_CACHE.get(guild.id, {})
             target_members = [m for m in guild.members if not m.bot and is_target_member(m)]
 
+            # -------------------------------------------------------------
             # 1. 밤 9시 사전 알림 (21:00~23:59 사이, 서버별 1회 보장)
+            # -------------------------------------------------------------
             if now.hour >= 21 and now.hour < 24 and guild_flags.get("night") != today_str:
                 past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
                 pending_members = []
@@ -466,11 +490,8 @@ async def daily_voice_check():
                         ),
                         color=discord.Color.gold()
                     )
-                    cut_list = pending_members[:25]
-                    text = "\n".join(cut_list)
-                    if len(pending_members) > 25:
-                        text += f"\n...외 {len(pending_members) - 25}명"
-                    embed_reminder.add_field(name=f"⚠️ 오늘 참여 시간 부족 ({len(pending_members)}명)", value=text, inline=False)
+                    # 1,024자 초과 방어 필드 자동 분할
+                    add_chunked_fields(embed_reminder, f"⚠️ 오늘 참여 시간 부족 ({len(pending_members)}명)", pending_members)
                     embed_reminder.set_footer(text="매일 밤 9시 자동 발송")
 
                     mentions_pings = " ".join(mention_list[:40])
@@ -478,7 +499,9 @@ async def daily_voice_check():
 
                 await log_audit_flag(guild, "night", today_str)
 
+            # -------------------------------------------------------------
             # 2. 자정 일일 정산 (00:00~00:59 사이, 서버별 1회 보장)
+            # -------------------------------------------------------------
             if now.hour == 0 and guild_flags.get("daily") != yesterday_str:
                 for u_id, sess in list(VOICE_ACTIVE_SESSIONS.items()):
                     if sess["active"] and sess["start_time"] and sess["guild_id"] == guild.id:
@@ -502,12 +525,7 @@ async def daily_voice_check():
                     color=discord.Color.red() if daily_failed else discord.Color.green()
                 )
                 if daily_failed:
-                    cut_list = daily_failed[:30]
-                    more_cnt = len(daily_failed) - 30
-                    embed_text = "\n".join(cut_list)
-                    if more_cnt > 0:
-                        embed_text += f"\n...외 {more_cnt}명"
-                    embed_daily.add_field(name=f"🚨 일일 미달 확정자 (총 {len(daily_failed)}명)", value=embed_text, inline=False)
+                    add_chunked_fields(embed_daily, f"🚨 일일 미달 확정자 (총 {len(daily_failed)}명)", daily_failed)
                     await channel.send(content=" ".join(daily_pings[:40]), embed=embed_daily)
                 else:
                     embed_daily.add_field(name="🎉 전원 달성!", value="어제 모든 대상 멤버가 1시간 이상 통화방에 참여했습니다.", inline=False)
@@ -515,7 +533,9 @@ async def daily_voice_check():
 
                 await log_audit_flag(guild, "daily", yesterday_str)
 
+            # -------------------------------------------------------------
             # 3. 매주 월요일 주간 정산 (독립 실행 블록 - 지난주 월~일 7일 결산)
+            # -------------------------------------------------------------
             if now.hour == 0 and now.weekday() == 0 and guild_flags.get("weekly") != yesterday_str:
                 weekly_failed = []
                 weekly_pings = []
@@ -536,12 +556,7 @@ async def daily_voice_check():
                     color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
                 )
                 if weekly_failed:
-                    cut_w = weekly_failed[:30]
-                    more_w = len(weekly_failed) - 30
-                    w_text = "\n".join(cut_w)
-                    if more_w > 0:
-                        w_text += f"\n...외 {more_w}명"
-                    embed_weekly.add_field(name=f"🚨 주간 미달 확정자 (총 {len(weekly_failed)}명)", value=w_text, inline=False)
+                    add_chunked_fields(embed_weekly, f"🚨 주간 미달 확정자 (총 {len(weekly_failed)}명)", weekly_failed)
                     await channel.send(content=" ".join(weekly_pings[:40]), embed=embed_weekly)
                 else:
                     embed_weekly.add_field(name="👑 전원 달성!", value="지난주 모든 대상 멤버가 11시간 이상 통화방에 참여했습니다.", inline=False)
@@ -732,7 +747,7 @@ class NoticeModal(discord.ui.Modal, title="📢 공지사항 작성"):
         await interaction.followup.send(embed=embed)
 
 
-# --- 📑 [수정 완료] 공지 미확인자 페이지네이션 View (속성 이름 오류 해결) ---
+# --- 📑 공지 미확인자 페이지네이션 View ---
 class NoticePaginationView(discord.ui.View):
     def __init__(self, author_id: int, base_embed: discord.Embed, chunks: List[List[str]], total_unreacted: int):
         super().__init__(timeout=180)
@@ -746,7 +761,6 @@ class NoticePaginationView(discord.ui.View):
         self.update_buttons()
 
     def update_buttons(self):
-        # 데코레이터 버튼 객체에 정확한 활성화/비활성화 반영
         self.prev_btn_action.disabled = (self.current_page == 0)
         self.next_btn_action.disabled = (self.current_page == self.max_page)
 
@@ -853,10 +867,7 @@ async def check_notice_reactions(interaction: discord.Interaction, 메시지id: 
         await interaction.followup.send(embed=base_embed, ephemeral=True)
         return
 
-    # 순수 멘션 리스트 생성
     mentions = [m.mention for m in unreacted_members]
-
-    # 한 페이지당 25명씩 분할
     chunk_size = 25
     chunks = [mentions[i:i + chunk_size] for i in range(0, len(mentions), chunk_size)]
 
@@ -921,7 +932,7 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
-# 🎙️ [통화 시간 조회 - 대괄호 중복 제거 및 이번 주 / 지난 주 기록 지원]
+# 🎙️ [통화 시간 조회]
 @bot.tree.command(name="통화시간", description="오늘, 이번 주, 지난 주 및 최근 누적 통화방 참여 시간을 확인합니다.")
 @app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
 async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
@@ -979,7 +990,6 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
-    # 닉네임 대괄호 중복 제거: target.display_name 그대로 출력
     embed = discord.Embed(
         title=f"🎙️ {target.display_name} 님의 통화방 시간표",
         color=discord.Color.teal()
@@ -993,7 +1003,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎙️ [통화 기준 미달자 확인 - 관리자용]
+# 🎙️ [통화 기준 미달자 확인 - 관리자용 / 1024자 초과 방어 필드 적용]
 @bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 최근 7일 11시간 미달자를 확인합니다.")
 @app_commands.describe(구분="확인할 기준 (일일 or 주간)")
 @app_commands.choices(구분=[
@@ -1045,9 +1055,8 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         await interaction.followup.send("🎉 전원 기준 달성 완료! 미달자가 없습니다.", ephemeral=True)
         return
 
-    embed = discord.Embed(title=title, description="\n".join(failed_lines[:40]), color=discord.Color.red())
-    if len(failed_lines) > 40:
-        embed.set_footer(text=f"외 {len(failed_lines) - 40}명 생략됨")
+    embed = discord.Embed(title=title, color=discord.Color.red())
+    add_chunked_fields(embed, "미달자 목록", failed_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # 🎙️ [통화 알림 채널 설정 - 관리자 전용 / 서버별 분리]

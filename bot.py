@@ -44,7 +44,7 @@ ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
 # 👋 신규 멤버 환영 메시지 설정
 # Render 환경변수 또는 .env에 WELCOME_CHANNEL_ID를 설정하세요.
-WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "1559051383980818533"))
+WELCOME_CHANNEL_ID = int(os.getenv("WELCOME_CHANNEL_ID", "0"))
 WELCOME_TEXT = os.getenv("WELCOME_TEXT", "두 개의 길드, 하나의 밤.")
 
 # 💤 [중요] 시간 측정을 제외할 잠수방 음성 채널 ID

@@ -42,6 +42,9 @@ WARN_LOG_CHANNEL_ID = 1569705414839242884
 # 📢 공지 확인 대상 채널 ID
 ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
+# 💤 [중요] 시간 측정을 제외할 잠수방 음성 채널 ID
+AFK_VOICE_CHANNEL_ID = 1569698118004514836
+
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
 
@@ -58,6 +61,16 @@ TARGET_ROLES = [
 def is_target_member(member: discord.Member) -> bool:
     """지정된 길드원/수습생 역할을 하나라도 가지고 있는지 확인"""
     return any(role.name in TARGET_ROLES for role in member.roles)
+
+def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
+    """해당 음성 채널이 잠수방(지정 ID 또는 디스코드 기본 AFK 채널)인지 확인"""
+    if not channel:
+        return False
+    if channel.id == AFK_VOICE_CHANNEL_ID:
+        return True
+    if channel.guild.afk_channel and channel.id == channel.guild.afk_channel.id:
+        return True
+    return False
 
 # 서버별 통화 알림 채널 매핑 {guild_id: channel_id}
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
@@ -326,12 +339,26 @@ async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     SERVER_AUDIT_FLAGS[guild.id][flag_type] = date_str
 
 
-# --- 👥 음성 채널 인원(최소 2인 이상) 상태 점검 및 세션 갱신 헬퍼 ---
+# --- 👥 음성 채널 인원(최소 2인 이상 & 잠수방 제외) 상태 점검 및 세션 갱신 헬퍼 ---
 async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
     if not channel:
         return
 
     now = datetime.now(KST)
+    
+    # 잠수방 채널인 경우 해당 방의 모든 세션 측정 중단 및 정산
+    if is_afk_channel(channel):
+        for m in channel.members:
+            if m.id in VOICE_ACTIVE_SESSIONS:
+                sess = VOICE_ACTIVE_SESSIONS[m.id]
+                if sess["active"] and sess["start_time"]:
+                    duration = int((now - sess["start_time"]).total_seconds())
+                    date_str = sess["start_time"].strftime("%Y-%m-%d")
+                    await log_voice_duration(channel.guild, m.id, date_str, duration)
+                sess["active"] = False
+                sess["start_time"] = None
+        return
+
     human_members = [m for m in channel.members if not m.bot]
     has_enough_members = len(human_members) >= 2
 
@@ -362,7 +389,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
             }
 
 
-# --- 🎙️ 통화방 출결 및 상태 변경 리스너 ---
+# --- 🎙️ 통화방 출결 및 상태 변경 리스너 (잠수방 이동 대응) ---
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
@@ -389,6 +416,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # 3. 방 이동 또는 헤드셋 끔 상태 변경
     if before.channel and after.channel:
         if before.channel.id != after.channel.id:
+            # 기존 방 세션 정산
             if member.id in VOICE_ACTIVE_SESSIONS:
                 sess = VOICE_ACTIVE_SESSIONS.pop(member.id)
                 if sess["active"] and sess["start_time"]:
@@ -417,7 +445,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
 
-# --- 🕛 주간 전용 정산 루프 (매일 알림 제거, 매주 월요일 자정에만 결산) ---
+# --- 🕛 주간 전용 정산 루프 (매주 월요일 자정에만 결산 발송) ---
 @tasks.loop(minutes=1)
 async def daily_voice_check():
     now = datetime.now(KST)
@@ -426,7 +454,7 @@ async def daily_voice_check():
 
     for guild in bot.guilds:
         try:
-            # 1. 자정 통화 세션 분할 (날짜별 누적 데이터를 위해 매일 자정 자동 저장 유지)
+            # 1. 자정 통화 세션 분할 (일별 누적 시간 데이터 보존을 위해 백그라운드 자동 저장)
             if now.hour == 0 and now.minute == 0:
                 for u_id, sess in list(VOICE_ACTIVE_SESSIONS.items()):
                     if sess["active"] and sess["start_time"] and sess["guild_id"] == guild.id:
@@ -435,7 +463,7 @@ async def daily_voice_check():
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
 
-            # 2. 매주 월요일 자정(00:00~00:59) 주간 정산 브리핑만 발송
+            # 2. 매주 월요일 자정(00:00~00:59) 주간 11시간 미달자 브리핑 발송
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -446,7 +474,6 @@ async def daily_voice_check():
 
                 guild_flags = SERVER_AUDIT_FLAGS[guild.id]
 
-                # 이번 주 정산이 아직 실행되지 않은 경우에만 발송
                 if guild_flags.get("weekly") != yesterday_str:
                     channel = None
                     target_ch_id = VOICE_NOTICE_CHANNELS.get(guild.id)
@@ -466,7 +493,6 @@ async def daily_voice_check():
 
                         weekly_failed = []
                         weekly_pings = []
-                        # 지난주 월요일부터 일요일까지 7일간의 기록 합산
                         past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
 
                         for member in target_members:
@@ -490,7 +516,6 @@ async def daily_voice_check():
                             embed_weekly.add_field(name="👑 전원 달성!", value="지난주 모든 대상 멤버가 11시간 이상 통화방에 참여했습니다.", inline=False)
                             await channel.send(embed=embed_weekly)
 
-                    # 발송 완료 플래그 저장
                     await log_audit_flag(guild, "weekly", yesterday_str)
 
         except Exception as e:
@@ -595,7 +620,7 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         ephemeral=True
     )
 
-# --- ⚔️ 무기 & 직업 드롭다운 View (영구 View: 고유 custom_id 명시) ---
+# --- ⚔️ 무기 & 직업 드롭다운 View ---
 class WeaponSelect(discord.ui.Select):
     def __init__(self):
         options = [discord.SelectOption(label=w, description=f"{w} 무기 선택") for w in WEAPONS]
@@ -861,7 +886,7 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
-# 🎙️ [통화 시간 조회]
+# 🎙️ [통화 시간 조회 - 잠수방 감지 반영]
 @bot.tree.command(name="통화시간", description="오늘, 이번 주, 지난 주 및 최근 누적 통화방 참여 시간을 확인합니다.")
 @app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
 async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
@@ -883,7 +908,6 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     guild_data = VOICE_DAILY_CACHE.get(guild_id, {})
     u_str = str(target.id)
 
-    # 1. 오늘 참여 시간
     today_sec = guild_data.get(today_str, {}).get(u_str, 0)
     current_status = "❌ 현재 미접속"
 
@@ -896,26 +920,29 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             current_status = f"🟢 참여 중 (+{format_seconds(cur_live_diff)})"
         else:
             if target.voice and target.voice.channel:
-                humans = [m for m in target.voice.channel.members if not m.bot]
-                if len(humans) < 2:
-                    current_status = "⏸️ 혼자 접속 중 (2명 이상 모여야 측정)"
+                if is_afk_channel(target.voice.channel):
+                    current_status = "⏸️ 잠수방 접속 중 (측정 일시정지)"
                 else:
-                    current_status = "⏸️ 헤드셋 끔 (잠수 중 / 측정 일시정지)"
+                    humans = [m for m in target.voice.channel.members if not m.bot]
+                    if len(humans) < 2:
+                        current_status = "⏸️ 혼자 접속 중 (2명 이상 모여야 측정)"
+                    else:
+                        current_status = "⏸️ 헤드셋 끔 (잠수 중 / 측정 일시정지)"
             else:
                 current_status = "⏸️ 측정 대기 중"
 
-    # 2. 이번 주 누적 (월요일 00:00부터 오늘까지)
+    # 이번 주 누적 (월요일 00:00부터 오늘까지)
     current_weekday = now.weekday()
     days_from_monday = current_weekday
     this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_from_monday + 1)]
     this_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in this_week_days) + cur_live_diff
 
-    # 3. 지난 주 누적 (지난 주 월요일~일요일 7일 완주 기록)
+    # 지난 주 누적 (지난 주 월~일 7일 완주 기록)
     last_week_monday = now - timedelta(days=current_weekday + 7)
     last_week_days = [(last_week_monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     last_week_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in last_week_days)
 
-    # 4. 최근 7일 누적
+    # 최근 7일 누적
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
@@ -923,12 +950,12 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
         title=f"🎙️ {target.display_name} 님의 통화방 시간표",
         color=discord.Color.teal()
     )
-    embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}** (기준: 1시간)", inline=True)
+    embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**", inline=True)
     embed.add_field(name="🗓️ 이번 주 누적 (월~오늘)", value=f"**{format_seconds(this_week_sec)}** (기준: 11시간)", inline=True)
     embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
     embed.add_field(name="📊 최근 7일 누적", value=f"**{format_seconds(recent_7_sec)}**", inline=True)
     embed.add_field(name="📌 실시간 상태", value=current_status, inline=False)
-    embed.set_footer(text="통화방에 2명 이상 모여야 측정되며, 혼자 있거나 헤드셋을 끄면 측정되지 않습니다.")
+    embed.set_footer(text="잠수방, 혼자 있는 경우, 헤드셋 끔 상태에서는 시간이 측정되지 않습니다.")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -988,7 +1015,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
     add_chunked_fields(embed, "미달자 목록", failed_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎙️ [통화 알림 채널 설정 - 관리자 전용 / 서버별 분리]
+# 🎙️ [통화 알림 채널 설정 - 관리자 전용]
 @bot.tree.command(name="통화알림채널설정", description="[관리자 전용] 매주 월요일 자정 주간 정산 브리핑이 전송될 채널을 설정합니다.")
 @app_commands.describe(채널="브리핑이 올라갈 텍스트 채널")
 async def set_voice_notice_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
@@ -1255,6 +1282,10 @@ async def on_ready():
             VOICE_DAILY_CACHE[guild.id] = v_records
 
             for vc in guild.voice_channels:
+                # 봇 재부팅 시 잠수방에 있는 인원은 시작 세션에서 배제
+                if is_afk_channel(vc):
+                    continue
+
                 humans = [m for m in vc.members if not m.bot]
                 has_enough = len(humans) >= 2
                 for m in humans:

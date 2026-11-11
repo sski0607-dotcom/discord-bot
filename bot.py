@@ -58,6 +58,8 @@ TARGET_ROLES = [
     "은월 수습생"
 ]
 
+ALL_GUILD_ROLES = TARGET_ROLES + ["커뮤니티"]
+
 def is_target_member(member: discord.Member) -> bool:
     """지정된 길드원/수습생 역할을 하나라도 가지고 있는지 확인"""
     return any(role.name in TARGET_ROLES for role in member.roles)
@@ -82,6 +84,24 @@ VERIFY_ADMIN_CHANNELS: Dict[int, int] = {}
 VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
 VOICE_DAILY_CACHE: Dict[int, Dict[str, Dict[str, int]]] = {}
 SERVER_AUDIT_FLAGS: Dict[int, Dict[str, str]] = {}
+
+# 🏖️ 통화 예외/휴가 메모리 {guild_id: {user_id_str: {"until": "YYYY-MM-DD", "reason": str}}}
+VOICE_EXEMPTIONS: Dict[int, Dict[str, dict]] = {}
+
+def is_voice_exempt(guild_id: int, user_id: int) -> Optional[dict]:
+    """해당 유저가 현재 날짜 기준 통화 출결 예외(휴가) 상태인지 확인"""
+    guild_exempts = VOICE_EXEMPTIONS.get(guild_id, {})
+    exempt_info = guild_exempts.get(str(user_id))
+    if not exempt_info:
+        return None
+    try:
+        until_date = datetime.strptime(exempt_info["until"], "%Y-%m-%d").date()
+        today_date = datetime.now(KST).date()
+        if today_date <= until_date:
+            return exempt_info
+    except Exception:
+        pass
+    return None
 
 def is_admin_or_mod(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions
@@ -141,7 +161,7 @@ def add_chunked_fields(embed: discord.Embed, base_title: str, lines: List[str], 
         title = base_title if field_index == 1 else f"{base_title} ({field_index})"
         embed.add_field(name=title, value="\n".join(current_chunk), inline=False)
 
-# --- 🖼️ 黑夜 테마 임베드 생성 헬퍼 ---
+# --- 🖼️ 黑夜 테마 환영 임베드 ---
 def create_welcome_embed(guild: discord.Guild) -> discord.Embed:
     description_text = (
         "**黑夜 | 달빛 아래에 오신 것을 환영합니다.**\n\n"
@@ -177,6 +197,7 @@ async def fetch_database_from_channel(guild: discord.Guild):
 
     warnings = {}
     voice_records: Dict[str, Dict[str, int]] = {}
+    exempts: Dict[str, dict] = {}
 
     try:
         raw_messages = []
@@ -223,6 +244,19 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
+                elif footer_text.startswith("VOICE_EXEMPT:"):
+                    try:
+                        data = json.loads(footer_text.replace("VOICE_EXEMPT:", "").strip())
+                        u_id = str(data["user_id"])
+                        action = data.get("action", "add")
+                        if action == "add":
+                            exempts[u_id] = {"until": data["until"], "reason": data["reason"]}
+                        elif action == "remove":
+                            if u_id in exempts:
+                                del exempts[u_id]
+                    except Exception:
+                        continue
+
                 elif footer_text.startswith("VOICE_CONFIG:"):
                     try:
                         cfg = json.loads(footer_text.replace("VOICE_CONFIG:", "").strip())
@@ -261,6 +295,8 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
+        VOICE_EXEMPTIONS[guild.id] = exempts
+
     except Exception as e:
         await send_error_log(guild, "fetch_database_from_channel", traceback.format_exc())
 
@@ -278,6 +314,27 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     payload = {"user_id": user_id, "action": action, **data}
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
+
+async def log_voice_exempt_action(guild: discord.Guild, user_id: int, action: str, data: dict):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID) or await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    embed = discord.Embed(title=f"🏖️ [통화 예외 DB 로그] {action.upper()}", color=discord.Color.teal())
+    embed.add_field(name="Target User ID", value=str(user_id), inline=True)
+    embed.add_field(name="Action", value=action, inline=True)
+    payload = {"user_id": user_id, "action": action, **data}
+    embed.set_footer(text=f"VOICE_EXEMPT:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+    if guild.id not in VOICE_EXEMPTIONS:
+        VOICE_EXEMPTIONS[guild.id] = {}
+    u_str = str(user_id)
+    if action == "add":
+        VOICE_EXEMPTIONS[guild.id][u_str] = {"until": data["until"], "reason": data["reason"]}
+    elif action == "remove" and u_str in VOICE_EXEMPTIONS[guild.id]:
+        del VOICE_EXEMPTIONS[guild.id][u_str]
 
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
@@ -517,6 +574,7 @@ async def daily_voice_check():
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
 
+            # 매주 월요일 자정 결산 (휴가/사유서 예외자 자동 면제)
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -549,6 +607,10 @@ async def daily_voice_check():
                         past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
 
                         for member in target_members:
+                            # 🏖️ 통화 예외/휴가자 필터링 (결산 및 태그에서 제외)
+                            if is_voice_exempt(guild.id, member.id):
+                                continue
+
                             week_spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in past_7_days)
                             if week_spent < 39600:
                                 weekly_failed.append(f"• {member.mention} ({member.display_name}) - `{format_seconds(week_spent)}` / 11시간")
@@ -556,7 +618,7 @@ async def daily_voice_check():
 
                         embed_weekly = discord.Embed(
                             title="📊 [주간 통화시간 결산] 지난주 종합",
-                            description="길드원/수습생 대상 지난주(월~일) 최소 **11시간** 통화방 참여 미달자 명단입니다.",
+                            description="길드원/수습생 대상 지난주(월~일) 최소 **11시간** 통화방 참여 미달자 명단입니다.\n*(휴가 및 사유서 인정자는 집계에서 제외되었습니다)*",
                             color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
                         )
                         if weekly_failed:
@@ -737,7 +799,6 @@ class ReviewView(discord.ui.View):
             await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
             return
 
-        # 관리자가 드롭다운에서 선택한 역할 또는 신청 시 적은 길드 기반 역할
         chosen_role_name = self.selected_role or f"{guild_target} 수습생"
         role_to_give = discord.utils.get(guild.roles, name=chosen_role_name)
         if not role_to_give:
@@ -758,7 +819,7 @@ class ReviewView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
-        # 1. 관리자 검토 메시지 상태 갱신
+        # 1. 관리자 신청서 메시지 상태 갱신
         embed.color = discord.Color.green()
         embed.title = "🛡️ [인증 신청 - 승인 완료]"
         embed.add_field(name="부여된 직급", value=f"{role_to_give.mention if role_to_give else chosen_role_name}", inline=True)
@@ -769,13 +830,9 @@ class ReviewView(discord.ui.View):
 
         await interaction.message.edit(embed=embed, view=self)
 
-        # 2. [스크린샷 일치] 인증 안내/환영 채널에 "黑夜 | 인증 완료" 공개 브리핑 전송
-        target_public_channel = None
-        welcome_id = WELCOME_CHANNELS.get(guild.id)
-        if welcome_id:
-            target_public_channel = guild.get_channel(welcome_id)
-        if not target_public_channel:
-            target_public_channel = interaction.channel
+        # 2. 관리자 인증관리 채널에 "黑夜 | 인증 완료" 브리핑 발송
+        admin_channel_id = VERIFY_ADMIN_CHANNELS.get(guild.id) or WARN_LOG_CHANNEL_ID
+        admin_channel = guild.get_channel(admin_channel_id) or interaction.channel
 
         complete_embed = discord.Embed(
             title="黑夜 | 인증 완료",
@@ -791,7 +848,7 @@ class ReviewView(discord.ui.View):
         complete_embed.set_footer(text="黑夜 · 月影 × 影月 | 두 개의 길드, 하나의 밤")
 
         try:
-            await target_public_channel.send(embed=complete_embed)
+            await admin_channel.send(embed=complete_embed)
         except Exception:
             pass
 
@@ -856,7 +913,6 @@ class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서"):
         except discord.Forbidden:
             nick_change_status = "\n⚠️ (서버장 또는 관리자 권한이 있어 닉네임 자동 변경 불가)"
 
-        # 관리자 승인 채널 탐색: 1순위 전용 설정 채널, 2순위 WARN_LOG_CHANNEL_ID
         review_channel_id = VERIFY_ADMIN_CHANNELS.get(guild.id) or WARN_LOG_CHANNEL_ID
         review_channel = guild.get_channel(review_channel_id)
         if not review_channel:
@@ -960,29 +1016,142 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🛡️ [신규: 인증 관리 채널 설정 - 관리자 전용]
-@bot.tree.command(name="인증관리채널설정", description="[관리자 전용] 유저들의 인증 신청서와 직급 선택 메시지가 도착할 관리자 채널을 설정합니다.")
-@app_commands.describe(채널="신청서 검토가 올라올 관리자 비공개 텍스트 채널")
+# 🧹 [신규: 인증 초기화 - 관리자 전용]
+@bot.tree.command(name="인증초기화", description="[관리자 전용] 특정 유저의 길드원/무기/직업 역할을 모두 회수하고 닉네임을 초기화합니다.")
+@app_commands.describe(유저="인증을 초기화할 대상 멤버")
+async def reset_user_verification(interaction: discord.Interaction, 유저: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    removed_roles = []
+    # 1. 길드 역할 및 무기/직업 역할 회수
+    all_target_names = set(ALL_GUILD_ROLES + WEAPONS + JOBS)
+    for r in list(유저.roles):
+        if r.name in all_target_names:
+            try:
+                await 유저.remove_roles(r)
+                removed_roles.append(r.name)
+            except discord.Forbidden:
+                pass
+
+    # 2. 닉네임 태그 정리
+    current_nick = 유저.display_name
+    cleaned_nick = re.sub(r'^\[.*?\]\s*', '', current_nick)
+    cleaned_nick = cleaned_nick.split('/')[0].strip()
+
+    try:
+        await 유저.edit(nick=cleaned_nick if cleaned_nick else None)
+        nick_msg = f"닉네임이 **{cleaned_nick}**(으)로 초기화되었습니다."
+    except discord.Forbidden:
+        nick_msg = "권한 부족으로 닉네임 자동 변경은 실패했습니다."
+
+    embed = discord.Embed(
+        title="🧹 [길드원 인증 초기화 완료]",
+        description=f"{유저.mention} 님의 인증이 초기화되었습니다.\n\n• 회수된 역할: {', '.join(removed_roles) if removed_roles else '없음'}\n• {nick_msg}",
+        color=discord.Color.dark_grey()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 🏖️ [신규: 통화 예외/휴가 등록 - 관리자 전용]
+@bot.tree.command(name="통화예외등록", description="[관리자 전용] 특정 유저를 지정한 날짜까지 통화 출결 체크에서 예외(면제) 처리합니다.")
+@app_commands.describe(유저="출결 예외 대상 멤버", 종료일="예외 인정 종료일 (형식: YYYY-MM-DD)", 사유="휴가 및 예외 사유")
+async def add_voice_exemption(interaction: discord.Interaction, 유저: discord.Member, 종료일: str, 사유: str):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    try:
+        until_date = datetime.strptime(종료일.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        await interaction.followup.send("❌ 날짜 형식이 올바르지 않습니다. 반드시 `YYYY-MM-DD` 형식으로 입력해 주세요. (예: 2026-11-20)", ephemeral=True)
+        return
+
+    if until_date < datetime.now(KST).date():
+        await interaction.followup.send("❌ 종료일은 오늘 또는 미래 날짜여야 합니다.", ephemeral=True)
+        return
+
+    payload = {"until": 종료일.strip(), "reason": 사유.strip()}
+    await log_voice_exempt_action(interaction.guild, 유저.id, "add", payload)
+
+    embed = discord.Embed(
+        title="🏖️ [통화 출결 예외(휴가) 등록 완료]",
+        description=f"{유저.mention} 님이 **{종료일.strip()}**까지 통화 출결 집계 및 미달자 태그에서 제외됩니다.",
+        color=discord.Color.teal()
+    )
+    embed.add_field(name="종료 예정일", value=f"`{종료일.strip()}` 자정까지", inline=True)
+    embed.add_field(name="등록 사유", value=사유.strip(), inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 🏖️ [신규: 통화 예외 해제 - 관리자 전용]
+@bot.tree.command(name="통화예외해제", description="[관리자 전용] 등록된 통화 출결 예외(휴가)를 즉시 해제합니다.")
+@app_commands.describe(유저="예외를 해제할 멤버")
+async def remove_voice_exemption(interaction: discord.Interaction, 유저: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if not is_voice_exempt(interaction.guild.id, 유저.id):
+        await interaction.followup.send("⚠️ 해당 멤버는 현재 통화 예외자로 등록되어 있지 않습니다.", ephemeral=True)
+        return
+
+    await log_voice_exempt_action(interaction.guild, 유저.id, "remove", {})
+    await interaction.followup.send(f"✅ {유저.mention} 님의 통화 출결 예외 상태가 해제되어 정상 집계됩니다.", ephemeral=True)
+
+# 🏖️ [신규: 통화 예외 목록 조회 - 관리자 전용]
+@bot.tree.command(name="통화예외목록", description="[관리자 전용] 현재 통화 출결 체크에서 면제 중인 휴가자 명단을 조회합니다.")
+async def list_voice_exemptions(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    guild_exempts = VOICE_EXEMPTIONS.get(interaction.guild.id, {})
+    active_lines = []
+    today = datetime.now(KST).date()
+
+    for uid, info in guild_exempts.items():
+        try:
+            u_date = datetime.strptime(info["until"], "%Y-%m-%d").date()
+            if today <= u_date:
+                active_lines.append(f"• <@{uid}> - `{info['until']}`까지 ({info['reason']})")
+        except Exception:
+            continue
+
+    if not active_lines:
+        await interaction.followup.send("✨ 현재 통화 출결 예외(휴가)로 등록된 멤버가 없습니다.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🏖️ [통화 출결 예외/휴가자 목록] (총 {len(active_lines)}명)",
+        description="\n".join(active_lines),
+        color=discord.Color.teal()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="인증관리채널설정", description="[관리자 전용] 유저들의 인증 신청서와 인증 완료 알림이 도착할 관리자 채널을 설정합니다.")
+@app_commands.describe(채널="신청서 검토 및 완료 알림이 올라올 관리자 비공개 텍스트 채널")
 async def set_verify_admin_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
     await log_verify_admin_config(interaction.guild, 채널.id)
-    await interaction.response.send_message(f"✅ 앞으로 유저들의 인증 신청서가 {채널.mention} 채널로 도착합니다!", ephemeral=True)
+    await interaction.response.send_message(f"✅ 앞으로 유저들의 인증 신청서와 인증 완료 메시지가 {채널.mention} 채널로 도착합니다!", ephemeral=True)
 
-# 🌙 [환영/인증 채널 설정 - 관리자 전용]
-@bot.tree.command(name="환영채널설정", description="[관리자 전용] 새 멤버가 들어왔을 때 환영/인증 메시지 및 완료 브리핑이 전송될 채널을 지정합니다.")
-@app_commands.describe(채널="환영 및 인증 완료 메시지가 전송될 텍스트 채널")
+@bot.tree.command(name="환영채널설정", description="[관리자 전용] 새 멤버가 들어왔을 때 환영/인증 안내 메시지가 자동 전송될 채널을 지정합니다.")
+@app_commands.describe(채널="환영 안내 메시지가 전송될 텍스트 채널")
 async def set_welcome_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
     await log_welcome_config(interaction.guild, 채널.id)
-    await interaction.response.send_message(f"✅ 새 멤버 입장 및 인증 완료 브리핑이 {채널.mention} 채널로 자동 발송됩니다!", ephemeral=True)
+    await interaction.response.send_message(f"✅ 새 멤버 입장 시 {채널.mention} 채널로 환영/인증 메시지가 자동 발송됩니다!", ephemeral=True)
 
-# 🎫 [인증 안내 메시지 수동 전송 - 관리자 전용]
 @bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 사진과 동일한 환영/인증 안내 메시지를 전송합니다.")
 @app_commands.describe(채널="인증 메시지를 보낼 텍스트 채널")
 async def send_verification_message(interaction: discord.Interaction, 채널: discord.TextChannel):
@@ -997,7 +1166,6 @@ async def send_verification_message(interaction: discord.Interaction, 채널: di
     except discord.Forbidden:
         await interaction.response.send_message(f"⚠️ {채널.mention} 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
 
-# 👥 [인원 카운터 채널 설정 - 관리자 전용]
 @bot.tree.command(name="인원수채널설정", description="[관리자 전용] 실시간 전체 이용자 수가 표시될 음성 채널을 지정합니다.")
 @app_commands.describe(채널="전체 인원수가 표시될 음성 채널")
 async def set_member_counter_channel(interaction: discord.Interaction, 채널: discord.VoiceChannel):
@@ -1009,7 +1177,6 @@ async def set_member_counter_channel(interaction: discord.Interaction, 채널: d
     await update_member_counter(interaction.guild)
     await interaction.response.send_message(f"✅ {채널.mention} 채널이 실시간 전체 인원수 카운터로 설정되었습니다!", ephemeral=True)
 
-# 📢 [공지 이모지 미반응자 확인]
 @bot.tree.command(name="공지미확인", description="[관리자 전용] 공지 채널의 @everyone 공지에 이모지를 안 단 길드원 목록을 확인합니다.")
 @app_commands.describe(메시지id="특정 공지 글을 확인할 경우 메시지 ID 입력 (비워두면 본인의 가장 최근 @everyone 공지)")
 async def check_notice_reactions(interaction: discord.Interaction, 메시지id: Optional[str] = None):
@@ -1090,7 +1257,6 @@ async def check_notice_reactions(interaction: discord.Interaction, 메시지id: 
         )
         await interaction.followup.send(embed=view.get_current_embed(), view=view, ephemeral=True)
 
-# 🪜 [사다리 타기]
 @bot.tree.command(name="사다리", description="현재 통화방에 있는 인원으로 사다리 타기를 진행합니다.")
 @app_commands.describe(당첨인원="당첨될 인원수", 당첨항목="당첨 항목 이름 (기본값: 🎉 당첨)", 꽝항목="꽝 항목 이름 (기본값: ❌ 꽝)")
 async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당첨항목: str = "🎉 당첨", 꽝항목: str = "❌ 꽝"):
@@ -1134,7 +1300,6 @@ async def ladder_game(interaction: discord.Interaction, 당첨인원: int, 당�
     embed.add_field(name="🏆 최종 당첨자", value=", ".join(winners), inline=False)
     await interaction.followup.send(embed=embed)
 
-# 🎙️ [통화 시간 조회]
 @bot.tree.command(name="통화시간", description="오늘, 이번 주 요일별 참여 시간, 지난 주 기록 등을 확인합니다.")
 @app_commands.describe(유저="조회할 멤버 (비워두면 본인)")
 async def check_voice_time(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
@@ -1179,6 +1344,9 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
+    # 🏖️ 통화 출결 예외(휴가) 여부 확인
+    exempt_info = is_voice_exempt(guild_id, target.id)
+
     current_weekday = now.weekday()
     monday_date = now - timedelta(days=current_weekday)
     weekdays_ko = ["월", "화", "수", "목", "금", "토", "일"]
@@ -1209,13 +1377,16 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**", inline=True)
     embed.add_field(name="🗓️ 이번 주 총합 (월~오늘)", value=f"**{format_seconds(this_week_sec)}** (기준: 11시간)", inline=True)
     embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
+    
+    if exempt_info:
+        embed.add_field(name="🏖️ 출결 예외 상태", value=f"**{exempt_info['until']}**까지 면제 ({exempt_info['reason']})", inline=False)
+
     embed.add_field(name="📊 이번 주 요일별 상세 기록", value="\n".join(daily_breakdown), inline=False)
     embed.add_field(name="📈 최근 7일 이동 합계", value=f"**{format_seconds(recent_7_sec)}**", inline=True)
     embed.add_field(name="📌 실시간 상태", value=current_status, inline=True)
     embed.set_footer(text="잠수방, 혼자 있는 경우, 헤드셋 끔 상태에서는 시간이 측정되지 않습니다.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎙️ [통화 기준 미달자 확인 - 관리자용]
 @bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 최근 7일 11시간 미달자를 확인합니다.")
 @app_commands.describe(구분="확인할 기준 (일일 or 주간)")
 @app_commands.choices(구분=[
@@ -1243,6 +1414,8 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
     if 구분.value == "일일":
         today_records = guild_data.get(today_str, {})
         for member in target_members:
+            if is_voice_exempt(guild.id, member.id):
+                continue
             spent = today_records.get(str(member.id), 0)
             if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
                 spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
@@ -1252,6 +1425,8 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
     else:
         past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
         for member in target_members:
+            if is_voice_exempt(guild.id, member.id):
+                continue
             spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in past_7_days)
             if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
                 spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
@@ -1260,14 +1435,13 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         title = f"📊 최근 7일 통화방 11시간 미달자 ({len(failed_lines)}명)"
 
     if not failed_lines:
-        await interaction.followup.send("🎉 전원 기준 달성 완료! 미달자가 없습니다.", ephemeral=True)
+        await interaction.followup.send("🎉 전원 기준 달성 완료! (휴가자 제외) 미달자가 없습니다.", ephemeral=True)
         return
 
     embed = discord.Embed(title=title, color=discord.Color.red())
     add_chunked_fields(embed, "미달자 목록", failed_lines)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎙️ [통화 알림 채널 설정 - 관리자 전용]
 @bot.tree.command(name="통화알림채널설정", description="[관리자 전용] 매주 월요일 자정 주간 정산 브리핑이 전송될 채널을 설정합니다.")
 @app_commands.describe(채널="브리핑이 올라갈 텍스트 채널")
 async def set_voice_notice_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
@@ -1277,7 +1451,6 @@ async def set_voice_notice_channel(interaction: discord.Interaction, 채널: dis
     await log_voice_config(interaction.guild, 채널.id)
     await interaction.response.send_message(f"✅ 매주 월요일 자정 주간 미달자 결산 브리핑이 {채널.mention} 채널로 전송됩니다!", ephemeral=True)
 
-# ⚔️ [무기 & 직업 선택 UI]
 @bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1307,7 +1480,6 @@ async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[
         return
     await process_loadout_selection(interaction, 무기, 직업)
 
-# 📢 [공지 작성 - 관리자 전용]
 @bot.tree.command(name="공지", description="[관리자 전용] 팝업창을 열어 공지사항을 작성합니다.")
 async def create_notice(interaction: discord.Interaction):
     if not is_admin_or_mod(interaction):
@@ -1315,7 +1487,6 @@ async def create_notice(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(NoticeModal())
 
-# 🧹 [청소 - 관리자 전용]
 @bot.tree.command(name="청소", description="[관리자 전용] 지정한 개수만큼 메시지를 삭제합니다.")
 @app_commands.describe(개수="삭제할 메시지 개수 (1~100개)")
 async def clear_messages(interaction: discord.Interaction, 개수: int):
@@ -1332,7 +1503,6 @@ async def clear_messages(interaction: discord.Interaction, 개수: int):
     except discord.Forbidden:
         await interaction.followup.send("⚠️ 봇에 '메시지 관리' 권한이 없습니다.", ephemeral=True)
 
-# 📋 [멤버 멘션 추출 - 관리자 전용]
 @bot.tree.command(name="멤버멘션추출", description="[관리자 전용] 특정 역할을 가진 멤버들의 닉네임을 복사용 텍스트로 출력합니다.")
 @app_commands.describe(역할="목록을 추출할 역할")
 async def extract_role_mentions(interaction: discord.Interaction, 역할: discord.Role):
@@ -1347,7 +1517,6 @@ async def extract_role_mentions(interaction: discord.Interaction, 역할: discor
     msg = f"📋 **{역할.name}** 멤버 닉네임 목록 (총 {len(members)}명):\n\n```text\n{name_list}\n```"
     await interaction.response.send_message(msg, ephemeral=True)
 
-# ⚠️ [경고 관리]
 @bot.tree.command(name="경고", description="[관리자 전용] 유저에게 경고를 부여합니다.")
 @app_commands.describe(유저="대상 멤버", 사유="경고 사유")
 async def warn_user(interaction: discord.Interaction, 유저: discord.Member, 사유: str):

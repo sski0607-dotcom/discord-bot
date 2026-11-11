@@ -78,6 +78,7 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
 # 서버별 설정 매핑 {guild_id: channel_id}
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
 MEMBER_COUNTER_CHANNELS: Dict[int, int] = {}
+WELCOME_CHANNELS: Dict[int, int] = {}
 
 # 통화방 세션 메모리 {user_id: {"active": bool, "start_time": datetime, "guild_id": int}}
 VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
@@ -145,6 +146,28 @@ def add_chunked_fields(embed: discord.Embed, base_title: str, lines: List[str], 
     if current_chunk:
         title = base_title if field_index == 1 else f"{base_title} ({field_index})"
         embed.add_field(name=title, value="\n".join(current_chunk), inline=False)
+
+# --- 🖼️ 黑夜 테마 환영/인증 임베드 생성 헬퍼 ---
+def create_welcome_embed(guild: discord.Guild) -> discord.Embed:
+    description_text = (
+        "**黑夜 | 달빛 아래에 오신 것을 환영합니다.**\n\n"
+        "월영과 영월, 그리고 다양한 게임을 함께 즐기는 모두를 위한 공간입니다.\n\n"
+        "길드 활동부터 자유로운 게임과 소통까지, 각자의 방식으로 편안하게 즐겨주세요.\n\n"
+        "아래 인증 신청 버튼을 통해 원하시는 소속을 선택하실 수 있습니다.\n\n"
+        "• **月影 월영** · 생활 길드\n"
+        "• **影月 영월** · 전투 길드\n"
+        "• **커뮤니티** · 종합게임 이용자\n\n"
+        "**두 개의 길드, 그리고 하나의 커뮤니티.**"
+    )
+    embed = discord.Embed(
+        title="黑夜 | 달 아래의 새로운 인연",
+        description=description_text,
+        color=0x800020  # 고급스러운 버건디/와인색
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.set_footer(text="黑夜 · 月影 × 影月 | 두 개의 길드, 하나의 밤")
+    return embed
 
 # --- 채널 기반 영구 데이터 관리 ---
 async def fetch_database_from_channel(guild: discord.Guild):
@@ -236,7 +259,17 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
-                # 5. 정산 플래그 복원
+                # 5. 환영/인증 채널 ID 복원
+                elif footer_text.startswith("WELCOME_CONFIG:"):
+                    try:
+                        raw_data = footer_text.replace("WELCOME_CONFIG:", "").strip()
+                        cfg = json.loads(raw_data)
+                        g_id = cfg.get("guild_id", guild.id)
+                        WELCOME_CHANNELS[g_id] = cfg.get("channel_id")
+                    except Exception:
+                        continue
+
+                # 6. 정산 플래그 복원
                 elif footer_text.startswith("AUDIT_FLAG:"):
                     try:
                         raw_data = footer_text.replace("AUDIT_FLAG:", "").strip()
@@ -346,6 +379,27 @@ async def log_counter_config(guild: discord.Guild, channel_id: int):
     embed.set_footer(text=f"COUNTER_CONFIG:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
     MEMBER_COUNTER_CHANNELS[guild.id] = channel_id
+
+async def log_welcome_config(guild: discord.Guild, channel_id: int):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    embed = discord.Embed(
+        title="🌙 [환영/인증 설정 DB 로그] WELCOME_CHANNEL",
+        color=discord.Color.purple()
+    )
+    embed.add_field(name="Guild ID", value=str(guild.id), inline=True)
+    embed.add_field(name="Welcome Channel ID", value=str(channel_id), inline=True)
+    payload = {"guild_id": guild.id, "channel_id": channel_id}
+    embed.set_footer(text=f"WELCOME_CONFIG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+    WELCOME_CHANNELS[guild.id] = channel_id
 
 async def log_audit_flag(guild: discord.Guild, flag_type: str, date_str: str):
     if WARN_LOG_CHANNEL_ID == 0:
@@ -482,10 +536,34 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await update_voice_channel_members(after.channel)
 
 
-# --- 🏷️ 멤버 입장/퇴장/역할 변경 리스너 ---
+# --- 🏷️ 멤버 입장/퇴장/역할 변경 리스너 (처음 서버 입장 시 환영/인증 자동 전송) ---
 @bot.event
 async def on_member_join(member: discord.Member):
+    # 1. 서버 인원수 카운터 갱신
     await update_member_counter(member.guild)
+
+    # 2. 처음 서버에 들어온 유저에게 환영/인증 안내 메시지 자동 전송
+    welcome_channel_id = WELCOME_CHANNELS.get(member.guild.id)
+    channel = member.guild.get_channel(welcome_channel_id) if welcome_channel_id else member.guild.system_channel
+    
+    if not channel:
+        # 시스템 채널이 없는 경우 첫 번째 메시지 전송 가능 채널 탐색
+        for ch in member.guild.text_channels:
+            if ch.permissions_for(member.guild.me).send_messages:
+                channel = ch
+                break
+
+    if channel:
+        try:
+            embed = create_welcome_embed(member.guild)
+            await channel.send(
+                content=member.mention,
+                embed=embed,
+                view=ApplyView(),
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except Exception:
+            pass
 
 @bot.event
 async def on_member_remove(member: discord.Member):
@@ -731,9 +809,9 @@ class LoadoutSelectView(discord.ui.View):
         self.add_item(LoadoutConfirmButton())
 
 
-# --- 🛡️ [고도화된 인증 & 검토 시스템: ApplyView, ApplyModal, ReviewView] ---
+# --- 🛡️ [黑夜 디자인 일치 인증 및 승인 시스템] ---
 
-# 1. 관리자 검토 뷰 (승인 / 거절)
+# 1. 관리자 검토 뷰
 class ReviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -746,7 +824,6 @@ class ReviewView(discord.ui.View):
             return
 
         embed = interaction.message.embeds[0]
-        # 임베드 Footer에 보관된 user_id 및 닉네임 추출
         footer_parts = embed.footer.text.split("|")
         target_user_id = int(footer_parts[0].replace("USER_ID:", "").strip())
         new_nick = footer_parts[1].replace("NICK:", "").strip() if len(footer_parts) > 1 else None
@@ -759,10 +836,9 @@ class ReviewView(discord.ui.View):
             try:
                 member = await guild.fetch_member(target_user_id)
             except Exception:
-                await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다 (서버를 퇴장했을 수 있습니다).", ephemeral=True)
+                await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
                 return
 
-        # 역할 지급 (지원한 길드에 맞게 또는 기본 역할)
         role_to_give = discord.utils.get(guild.roles, name=f"{guild_target} 길드원") or discord.utils.get(guild.roles, name=DEFAULT_VERIFIED_ROLE)
         if not role_to_give:
             try:
@@ -776,14 +852,12 @@ class ReviewView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
-        # 닉네임 자동 설정
         if new_nick:
             try:
                 await member.edit(nick=new_nick[:32])
             except discord.Forbidden:
                 pass
 
-        # 임베드 갱신
         embed.color = discord.Color.green()
         embed.title = "🛡️ [인증 신청 - 승인 완료]"
         embed.add_field(name="처리자", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=False)
@@ -794,7 +868,7 @@ class ReviewView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=self)
 
         try:
-            await member.send(f"🎉 **{guild.name}** 서버의 길드원 인증이 승인되었습니다! 채널을 자유롭게 이용하실 수 있습니다.")
+            await member.send(f"🎉 **{guild.name}** 서버의 인증이 승인되었습니다! 채널을 자유롭게 이용하실 수 있습니다.")
         except Exception:
             pass
 
@@ -822,16 +896,16 @@ class ReviewView(discord.ui.View):
         member = guild.get_member(target_user_id)
         if member:
             try:
-                await member.send(f"⚠️ **{guild.name}** 서버의 길드원 인증 신청이 관리자에 의해 거절되었습니다. 관리자에게 문의해 주세요.")
+                await member.send(f"⚠️ **{guild.name}** 서버의 인증 신청이 관리자에 의해 거절되었습니다.")
             except Exception:
                 pass
 
 
 # 2. 신청 모달 UI
-class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서 작성"):
+class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서"):
     name = discord.ui.TextInput(label="이름 (또는 별명)", placeholder="예: 쨈", required=True, max_length=15)
     mc_name = discord.ui.TextInput(label="마인크래프트 닉네임", placeholder="예: _s2_jammy", required=True, max_length=25)
-    guild_name = discord.ui.TextInput(label="소속 길드 (월영 / 영월 / 은월 등)", placeholder="예: 월영", required=True, max_length=15)
+    guild_name = discord.ui.TextInput(label="소속 길드 (월영 / 영월 / 커뮤니티 등)", placeholder="예: 월영", required=True, max_length=15)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -854,7 +928,7 @@ class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서 작성"):
                 review_channel = None
 
         if not review_channel:
-            await interaction.followup.send("❌ 관리자 승인 채널을 찾을 수 없어 신청서를 제출하지 못했습니다. 관리자에게 문의해 주세요.", ephemeral=True)
+            await interaction.followup.send("❌ 관리자 승인 채널을 찾을 수 없어 신청서를 제출하지 못했습니다.", ephemeral=True)
             return
 
         review_embed = discord.Embed(
@@ -863,10 +937,10 @@ class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서 작성"):
             color=discord.Color.gold(),
             timestamp=datetime.now(KST)
         )
-        review_embed.add_field(name="신청자 디스코드", value=f"{user.display_name} (`{user.id}`)", inline=True)
+        review_embed.add_field(name="신청자", value=f"{user.display_name} (`{user.id}`)", inline=True)
         review_embed.add_field(name="이름 / 별명", value=clean_name, inline=True)
         review_embed.add_field(name="마인크래프트 닉네임", value=clean_mc, inline=True)
-        review_embed.add_field(name="소속 길드", value=clean_guild, inline=True)
+        review_embed.add_field(name="선택 소속", value=clean_guild, inline=True)
         review_embed.add_field(name="적용될 닉네임", value=f"`{formatted_nick}`", inline=False)
         review_embed.set_footer(text=f"USER_ID:{user.id}|NICK:{formatted_nick}|GUILD:{clean_guild}")
 
@@ -874,12 +948,12 @@ class ApplyModal(discord.ui.Modal, title="길드원 인증 신청서 작성"):
         await interaction.followup.send("✅ 인증 신청서가 관리자에게 제출되었습니다! 검토 완료 후 자동으로 닉네임과 역할이 적용됩니다.", ephemeral=True)
 
 
-# 3. 유저가 누르는 인증 신청 시작 뷰
+# 3. 유저가 누르는 인증 신청 시작 뷰 (디자인: 회색 '인증 신청' 버튼)
 class ApplyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📝 길드원 인증 신청하기", style=discord.ButtonStyle.primary, custom_id="btn_guild_apply_start")
+    @discord.ui.button(label="인증 신청", style=discord.ButtonStyle.secondary, custom_id="btn_guild_apply_start")
     async def apply_start(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ApplyModal())
 
@@ -979,26 +1053,26 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🎫 [인증 안내 메시지 전송 - 관리자 전용]
-@bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 길드원 인증 신청 버튼 임베드를 전송합니다.")
+# 🌙 [환영/인증 채널 설정 - 관리자 전용]
+@bot.tree.command(name="환영채널설정", description="[관리자 전용] 새 멤버가 들어왔을 때 환영/인증 메시지가 자동 전송될 채널을 지정합니다.")
+@app_commands.describe(채널="환영 메시지가 전송될 텍스트 채널")
+async def set_welcome_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    await log_welcome_config(interaction.guild, 채널.id)
+    await interaction.response.send_message(f"✅ 새 멤버 입장 시 {채널.mention} 채널로 환영/인증 메시지가 자동 발송됩니다!", ephemeral=True)
+
+# 🎫 [인증 안내 메시지 수동 전송 - 관리자 전용]
+@bot.tree.command(name="인증메시지전송", description="[관리자 전용] 지정한 채널에 사진과 동일한 환영/인증 안내 메시지를 전송합니다.")
 @app_commands.describe(채널="인증 메시지를 보낼 텍스트 채널")
 async def send_verification_message(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not is_admin_or_mod(interaction):
         await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title="🌙 [길드원 서버 인증 신청]",
-        description=(
-            "**라스트 트래블러** 서버에 오신 것을 환영합니다!\n\n"
-            "원활한 길드 활동과 채널 이용을 위해 아래 **[📝 길드원 인증 신청하기]** 버튼을 눌러 양식을 작성해 주세요.\n\n"
-            "• 관리자 확인 후 닉네임 설정 및 길드원 역할이 자동으로 지급됩니다.\n"
-            "• 양식: **이름(별명) / 마크 닉네임 / 소속 길드**"
-        ),
-        color=discord.Color.dark_purple()
-    )
-    embed.set_footer(text="버튼을 눌러 신청서를 작성해 주세요.")
-
+    embed = create_welcome_embed(interaction.guild)
     try:
         await 채널.send(embed=embed, view=ApplyView())
         await interaction.response.send_message(f"✅ {채널.mention} 채널에 인증 신청 메시지를 전송했습니다!", ephemeral=True)
@@ -1550,7 +1624,7 @@ async def sync_permission_error(ctx, error):
 # --- 🌟 봇 시작 이벤트 (영구 View 등록 및 세션 보존) ---
 @bot.event
 async def on_ready():
-    # 영구 View 등록: 무기/직업, 인증 신청, 관리자 승인 검토
+    # 영구 View 등록
     bot.add_view(LoadoutSelectView())
     bot.add_view(ApplyView())
     bot.add_view(ReviewView())

@@ -51,6 +51,9 @@ KST = timezone(timedelta(hours=9))
 # 기본 주간 목표 시간 (11시간 = 39600초)
 DEFAULT_WEEKLY_GOAL_SEC = 39600
 
+# 기본 수습 기간 일수 (명령어로 언제든 변경 가능)
+DEFAULT_PROBATION_DAYS = 14
+
 # --- 통화방 시간 및 공지 확인 대상 역할 목록 ---
 TARGET_ROLES = [
     "월영 길드원",
@@ -60,6 +63,12 @@ TARGET_ROLES = [
     "은월 길드원",
     "은월 수습생"
 ]
+
+PROBATION_ROLE_MAP = {
+    "월영 수습생": "월영 길드원",
+    "영월 수습생": "영월 길드원",
+    "은월 수습생": "은월 길드원"
+}
 
 ALL_GUILD_ROLES = TARGET_ROLES + ["커뮤니티"]
 WEEKDAY_MAP = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
@@ -77,53 +86,50 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
         return True
     return False
 
-# 서버별 설정 매핑 {guild_id: channel_id}
+# 서버별 설정 매핑
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
 MEMBER_COUNTER_CHANNELS: Dict[int, int] = {}
 WELCOME_CHANNELS: Dict[int, int] = {}
 VERIFY_ADMIN_CHANNELS: Dict[int, int] = {}
+PROBATION_DAYS_CONFIG: Dict[int, int] = {}
 
 # 통화방 세션 및 캐시
 VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
 VOICE_DAILY_CACHE: Dict[int, Dict[str, Dict[str, int]]] = {}
 SERVER_AUDIT_FLAGS: Dict[int, Dict[str, str]] = {}
 
-# 🏖️ 통화 예외/휴가 메모리 {guild_id: {user_id_str: {"until": "YYYY-MM-DD", "reason": str}}}
+# 🏖️ 통화 예외/휴가 메모리
 VOICE_EXEMPTIONS: Dict[int, Dict[str, dict]] = {}
 
-# 🎯 주간 개별 목표 시간 설정 (1회성 주간) {guild_id: {user_id_str: {"week_start": "YYYY-MM-DD", "target_sec": int, "reason": str}}}
+# 🎯 주간 개별 목표 시간 설정 (1회성 주간)
 VOICE_CUSTOM_GOALS: Dict[int, Dict[str, dict]] = {}
 
-# 🌐 주간 전체(길드 일괄) 목표 시간 설정 {guild_id: {"week_start": "YYYY-MM-DD", "target_sec": int, "reason": str}}
+# 🌐 주간 전체(길드 일괄) 목표 시간 설정
 VOICE_GLOBAL_GOALS: Dict[int, dict] = {}
 
-# 📅 매주 정기 불가 요일 설정 {guild_id: {user_id_str: {"days": List[int], "reason": str}}}
+# 📅 매주 정기 불가 요일 설정
 VOICE_RECURRING_DAYS: Dict[int, Dict[str, dict]] = {}
+
+# 🌱 수습생 입단일 및 알림 발송 기록 {guild_id: {user_id_str: {"join_date": "YYYY-MM-DD", "notified": bool}}}
+PROBATION_RECORDS: Dict[int, Dict[str, dict]] = {}
+
+def get_probation_days(guild_id: int) -> int:
+    return PROBATION_DAYS_CONFIG.get(guild_id, DEFAULT_PROBATION_DAYS)
 
 def get_current_week_monday(dt: datetime) -> str:
     monday = dt - timedelta(days=dt.weekday())
     return monday.strftime("%Y-%m-%d")
 
 def get_user_weekly_goal(guild_id: int, user_id: int, reference_dt: Optional[datetime] = None) -> tuple[int, Optional[str]]:
-    """
-    해당 주의 유저 목표 시간(초)과 사유를 반환
-    우선순위:
-    1. 이번 주 개별 목표 설정 (/통화목표설정, /통화목표자동감면)
-    2. 매주 정기 불가 요일 설정 (/정기요일제외설정) -> 공통 기준에서 (제외일수/7) 만큼 비례 감면
-    3. 이번 주 전체(길드 일괄) 목표 설정 (/전체통화목표설정)
-    4. 기본 11시간 (39600초)
-    """
     now = reference_dt or datetime.now(KST)
     current_monday = get_current_week_monday(now)
     u_str = str(user_id)
 
-    # 1순위: 이번 주 개별 설정
     guild_goals = VOICE_CUSTOM_GOALS.get(guild_id, {})
     goal_info = guild_goals.get(u_str)
     if goal_info and goal_info.get("week_start") == current_monday:
         return int(goal_info["target_sec"]), goal_info.get("reason")
 
-    # 공통 기준 시간 확인 (전체 감면이 있으면 해당 시간, 없으면 11시간)
     base_sec = DEFAULT_WEEKLY_GOAL_SEC
     base_reason = None
     global_info = VOICE_GLOBAL_GOALS.get(guild_id)
@@ -131,7 +137,6 @@ def get_user_weekly_goal(guild_id: int, user_id: int, reference_dt: Optional[dat
         base_sec = int(global_info["target_sec"])
         base_reason = global_info.get("reason")
 
-    # 2순위: 매주 정기 불가 요일 설정 반영
     rec_info = VOICE_RECURRING_DAYS.get(guild_id, {}).get(u_str)
     if rec_info and rec_info.get("days"):
         excluded_days: List[int] = rec_info["days"]
@@ -148,11 +153,9 @@ def get_user_weekly_goal(guild_id: int, user_id: int, reference_dt: Optional[dat
             reason_text += f" + {base_reason}"
         return calc_sec, reason_text
 
-    # 3순위: 전체 공통 기준
     if base_reason:
         return base_sec, base_reason
 
-    # 4순위: 기본 11시간
     return DEFAULT_WEEKLY_GOAL_SEC, None
 
 def is_voice_exempt(guild_id: int, user_id: int) -> Optional[dict]:
@@ -270,6 +273,7 @@ async def fetch_database_from_channel(guild: discord.Guild):
     exempts: Dict[str, dict] = {}
     custom_goals: Dict[str, dict] = {}
     recurring_days: Dict[str, dict] = {}
+    probation_recs: Dict[str, dict] = {}
     global_goal: Optional[dict] = None
 
     try:
@@ -378,6 +382,29 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
+                elif footer_text.startswith("PROBATION_LOG:"):
+                    try:
+                        data = json.loads(footer_text.replace("PROBATION_LOG:", "").strip())
+                        u_id = str(data["user_id"])
+                        action = data.get("action", "start")
+                        if action == "start":
+                            probation_recs[u_id] = {"join_date": data["join_date"], "notified": False}
+                        elif action == "notified":
+                            if u_id in probation_recs:
+                                probation_recs[u_id]["notified"] = True
+                        elif action == "promoted":
+                            if u_id in probation_recs:
+                                del probation_recs[u_id]
+                    except Exception:
+                        continue
+
+                elif footer_text.startswith("PROBATION_CONFIG:"):
+                    try:
+                        cfg = json.loads(footer_text.replace("PROBATION_CONFIG:", "").strip())
+                        PROBATION_DAYS_CONFIG[cfg.get("guild_id", guild.id)] = int(cfg.get("days", DEFAULT_PROBATION_DAYS))
+                    except Exception:
+                        continue
+
                 elif footer_text.startswith("VOICE_CONFIG:"):
                     try:
                         cfg = json.loads(footer_text.replace("VOICE_CONFIG:", "").strip())
@@ -419,6 +446,7 @@ async def fetch_database_from_channel(guild: discord.Guild):
         VOICE_EXEMPTIONS[guild.id] = exempts
         VOICE_CUSTOM_GOALS[guild.id] = custom_goals
         VOICE_RECURRING_DAYS[guild.id] = recurring_days
+        PROBATION_RECORDS[guild.id] = probation_recs
         if global_goal:
             VOICE_GLOBAL_GOALS[guild.id] = global_goal
         elif guild.id in VOICE_GLOBAL_GOALS:
@@ -524,6 +552,40 @@ async def log_voice_recurring_day_action(guild: discord.Guild, user_id: int, act
     elif action == "remove" and u_str in VOICE_RECURRING_DAYS[guild.id]:
         del VOICE_RECURRING_DAYS[guild.id][u_str]
 
+async def log_probation_action(guild: discord.Guild, user_id: int, action: str, data: dict = None):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID) or await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    data = data or {}
+    embed = discord.Embed(title=f"🌱 [수습생 DB 로그] {action.upper()}", color=discord.Color.green())
+    payload = {"user_id": user_id, "action": action, **data}
+    embed.set_footer(text=f"PROBATION_LOG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+    if guild.id not in PROBATION_RECORDS:
+        PROBATION_RECORDS[guild.id] = {}
+    u_str = str(user_id)
+    if action == "start":
+        PROBATION_RECORDS[guild.id][u_str] = {"join_date": data["join_date"], "notified": False}
+    elif action == "notified" and u_str in PROBATION_RECORDS[guild.id]:
+        PROBATION_RECORDS[guild.id][u_str]["notified"] = True
+    elif action == "promoted" and u_str in PROBATION_RECORDS[guild.id]:
+        del PROBATION_RECORDS[guild.id][u_str]
+
+async def log_probation_config(guild: discord.Guild, days: int):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID) or await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    embed = discord.Embed(title="🌱 [수습 기간 설정 DB 로그] PROBATION_DAYS", color=discord.Color.green())
+    payload = {"guild_id": guild.id, "days": days}
+    embed.set_footer(text=f"PROBATION_CONFIG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+    PROBATION_DAYS_CONFIG[guild.id] = days
+
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
         return
@@ -621,6 +683,72 @@ async def update_member_counter(guild: discord.Guild):
         try:
             await channel.edit(name=new_name)
         except (discord.Forbidden, discord.HTTPException):
+            pass
+
+# --- 🌱 [수습생 승급 버튼 UI] ---
+class PromoteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="⬆️ 정식 길드원 승급", style=discord.ButtonStyle.success, custom_id="btn_probation_promote")
+    async def promote_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if not is_admin_or_mod(interaction):
+            await interaction.followup.send("❌ 관리자만 승급 처리를 할 수 있습니다.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        footer_text = embed.footer.text or ""
+        if not footer_text.startswith("PROMOTE_ID:"):
+            await interaction.followup.send("❌ 대상 유저 정보를 읽을 수 없습니다.", ephemeral=True)
+            return
+
+        target_user_id = int(footer_text.replace("PROMOTE_ID:", "").strip())
+        guild = interaction.guild
+        member = guild.get_member(target_user_id) or await guild.fetch_member(target_user_id)
+
+        if not member:
+            await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        promoted_from = None
+        promoted_to = None
+
+        for role in list(member.roles):
+            if role.name in PROBATION_ROLE_MAP:
+                promoted_from = role.name
+                promoted_to = PROBATION_ROLE_MAP[role.name]
+                try:
+                    await member.remove_roles(role)
+                except discord.Forbidden:
+                    pass
+                new_role = discord.utils.get(guild.roles, name=promoted_to) or await guild.create_role(name=promoted_to)
+                if new_role:
+                    try:
+                        await member.add_roles(new_role)
+                    except discord.Forbidden:
+                        pass
+                break
+
+        if not promoted_to:
+            await interaction.followup.send("⚠️ 해당 유저는 현재 수습생 역할을 가지고 있지 않습니다.", ephemeral=True)
+            return
+
+        await log_probation_action(guild, member.id, "promoted")
+
+        embed.color = discord.Color.green()
+        embed.title = f"🎉 [수습생 승급 완료] {member.display_name}"
+        embed.add_field(name="승급 내역", value=f"`{promoted_from}` ➔ **{promoted_to}**", inline=True)
+        embed.add_field(name="승급 처리자", value=f"{interaction.user.mention}", inline=True)
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        try:
+            await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다!")
+        except Exception:
             pass
 
 async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
@@ -738,6 +866,14 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 date_str = sess["start_time"].strftime("%Y-%m-%d")
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
+    # 수습생 역할이 수동으로 부여되었을 때도 입단일 자동 기록
+    before_prob = any(r.name in PROBATION_ROLE_MAP for r in before.roles)
+    after_prob = any(r.name in PROBATION_ROLE_MAP for r in after.roles)
+    if not before_prob and after_prob:
+        if str(after.id) not in PROBATION_RECORDS.get(after.guild.id, {}):
+            today_str = datetime.now(KST).strftime("%Y-%m-%d")
+            await log_probation_action(after.guild, after.id, "start", {"join_date": today_str})
+
 @tasks.loop(minutes=10)
 async def update_member_counter_loop():
     for guild in bot.guilds:
@@ -762,6 +898,49 @@ async def daily_voice_check():
                         if before_midnight > 0:
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
+
+            # 🌱 매일 낮 12시(12:00) 수습생 승급 만료 여부 자동 체크
+            if now.hour == 12 and now.minute == 0:
+                req_days = get_probation_days(guild.id)
+                admin_ch_id = VERIFY_ADMIN_CHANNELS.get(guild.id) or WARN_LOG_CHANNEL_ID
+                admin_ch = guild.get_channel(admin_ch_id)
+
+                if admin_ch:
+                    guild_prob_recs = PROBATION_RECORDS.get(guild.id, {})
+                    for member in guild.members:
+                        if member.bot:
+                            continue
+                        prob_role = next((r.name for r in member.roles if r.name in PROBATION_ROLE_MAP), None)
+                        if not prob_role:
+                            continue
+
+                        u_str = str(member.id)
+                        rec = guild_prob_recs.get(u_str)
+                        if rec:
+                            join_date = datetime.strptime(rec["join_date"], "%Y-%m-%d").date()
+                            already_notified = rec.get("notified", False)
+                        else:
+                            join_date = member.joined_at.astimezone(KST).date() if member.joined_at else now.date()
+                            already_notified = False
+
+                        elapsed_days = (now.date() - join_date).days
+                        if elapsed_days >= req_days and not already_notified:
+                            target_role_name = PROBATION_ROLE_MAP[prob_role]
+                            embed_prom = discord.Embed(
+                                title="🔔 [수습 기간 만료 - 정식 길드원 승급 알림]",
+                                description=(
+                                    f"{member.mention} (`{member.display_name}`) 님이 수습 기준 기간(**{req_days}일**)을 채웠습니다!\n"
+                                    f"아래 버튼을 누르면 **{target_role_name}** 역할로 즉시 승급됩니다."
+                                ),
+                                color=discord.Color.green(),
+                                timestamp=now
+                            )
+                            embed_prom.add_field(name="현재 직급", value=prob_role, inline=True)
+                            embed_prom.add_field(name="입단일 / 경과일", value=f"{join_date} (**{elapsed_days}일차**)", inline=True)
+                            embed_prom.set_footer(text=f"PROMOTE_ID:{member.id}")
+
+                            await admin_ch.send(embed=embed_prom, view=PromoteView())
+                            await log_probation_action(guild, member.id, "notified")
 
             # 매주 월요일 자정 결산
             if now.hour == 0 and now.weekday() == 0:
@@ -1005,6 +1184,11 @@ class ReviewView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
+        # 🌱 수습생 직급으로 승인된 경우 입단일 자동 기록
+        if chosen_role_name in PROBATION_ROLE_MAP:
+            today_str = datetime.now(KST).strftime("%Y-%m-%d")
+            await log_probation_action(guild, member.id, "start", {"join_date": today_str})
+
         if new_nick:
             try:
                 await member.edit(nick=new_nick[:32])
@@ -1206,7 +1390,67 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 📅 [신규: 매주 정기 불가 요일 설정]
+# 🌱 [신규: 수습생 승급 기준 일수 커스텀 설정]
+@bot.tree.command(name="수습기간설정", description="[관리자 전용] 수습생이 정식 길드원으로 승급되는 기준 일수(기본 14일)를 변경합니다.")
+@app_commands.describe(일수="승급 알림이 울릴 수습 기간 일수 (예: 7, 10, 14 등)")
+async def set_probation_period(interaction: discord.Interaction, 일수: int):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if 일수 < 1 or 일수 > 365:
+        await interaction.followup.send("❌ 일수는 `1`일 이상 `365`일 이하로 입력해 주세요.", ephemeral=True)
+        return
+
+    await log_probation_config(interaction.guild, 일수)
+    await interaction.followup.send(f"✅ 수습생 정식 승급 기준 기간이 **{일수}일**로 설정되었습니다! (매일 낮 12시에 만료자를 자동 체크합니다)", ephemeral=True)
+
+# 🌱 [신규: 현재 수습생 현황 및 남은 일수 조회]
+@bot.tree.command(name="수습생현황", description="[관리자 전용] 현재 수습생들의 입단일과 정식 길드원 승급까지 남은 일수를 조회합니다.")
+async def check_probation_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    now_date = datetime.now(KST).date()
+    req_days = get_probation_days(guild.id)
+    guild_prob_recs = PROBATION_RECORDS.get(guild.id, {})
+
+    lines = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        prob_role = next((r.name for r in member.roles if r.name in PROBATION_ROLE_MAP), None)
+        if not prob_role:
+            continue
+
+        u_str = str(member.id)
+        rec = guild_prob_recs.get(u_str)
+        if rec:
+            join_date = datetime.strptime(rec["join_date"], "%Y-%m-%d").date()
+        else:
+            join_date = member.joined_at.astimezone(KST).date() if member.joined_at else now_date
+
+        elapsed = (now_date - join_date).days
+        remain = req_days - elapsed
+        status_badge = "🔔 **승급 대상 도달!**" if remain <= 0 else f"D-{remain} ({elapsed}/{req_days}일)"
+        lines.append(f"• {member.mention} (`{prob_role}`) - 입단: `{join_date}` ➔ {status_badge}")
+
+    if not lines:
+        await interaction.followup.send("✨ 현재 서버에 수습생 직급을 가진 멤버가 없습니다.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🌱 [수습생 승급 현황] (기준: {req_days}일)",
+        description="\n".join(lines),
+        color=discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 📅 [매주 정기 불가 요일 설정]
 @bot.tree.command(name="정기요일제외설정", description="[관리자 전용] 학원·알바 등으로 매주 특정 요일마다 참여 불가한 유저의 목표 시간을 자동 비례 감면합니다.")
 @app_commands.describe(유저="정기 요일 제외 대상 멤버", 제외요일="매주 제외할 요일 (쉼표로 구분, 예: 화,목 또는 수)", 사유="사유 (예: 학원, 알바)")
 async def set_recurring_excluded_days(interaction: discord.Interaction, 유저: discord.Member, 제외요일: str, 사유: str = "정기 일정"):
@@ -1250,7 +1494,6 @@ async def set_recurring_excluded_days(interaction: discord.Interaction, 유저: 
     embed.set_footer(text="해제 명령어(/정기요일제외해제)를 실행하기 전까지 매주 자동 적용됩니다.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 📅 [신규: 매주 정기 불가 요일 해제]
 @bot.tree.command(name="정기요일제외해제", description="[관리자 전용] 등록된 매주 정기 요일 면제 설정을 해제합니다.")
 @app_commands.describe(유저="정기 요일 면제를 해제할 멤버")
 async def remove_recurring_excluded_days(interaction: discord.Interaction, 유저: discord.Member):
@@ -1266,7 +1509,6 @@ async def remove_recurring_excluded_days(interaction: discord.Interaction, 유�
     await log_voice_recurring_day_action(interaction.guild, 유저.id, "remove", {})
     await interaction.followup.send(f"✅ {유저.mention} 님의 매주 정기 요일 제외 설정이 해제되었습니다.", ephemeral=True)
 
-# 📅 [신규: 정기 요일 면제자 목록 조회]
 @bot.tree.command(name="정기요일제외목록", description="[관리자 전용] 매주 특정 요일마다 면제를 받고 있는 멤버 목록을 확인합니다.")
 async def list_recurring_excluded_days(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1293,7 +1535,6 @@ async def list_recurring_excluded_days(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🌐 [전체(길드 일괄) 주간 목표 시간 조정]
 @bot.tree.command(name="전체통화목표설정", description="[관리자 전용] 수요일 봇 도입 등 길드 전체의 이번 주 목표 통화 시간(기본 11시간)을 일괄 조정합니다.")
 @app_commands.describe(목표시간="이번 주 전체 기준 시간(숫자만 입력, 예: 7.5 또는 8)", 사유="전체 조정 사유 (예: 수요일 봇 기능 도입)")
 async def set_global_weekly_goal(interaction: discord.Interaction, 목표시간: float, 사유: str = "주중 봇 도입/전체 감면"):
@@ -1384,7 +1625,6 @@ async def view_weekly_goal_status(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎯 [주간 목표 시간 개별 수동 조절]
 @bot.tree.command(name="통화목표설정", description="[관리자 전용] 특정 유저 1명의 이번 주 목표 통화 시간(기본 11시간)을 개별 조정합니다.")
 @app_commands.describe(유저="목표 시간을 조정할 멤버", 목표시간="이번 주 목표 시간(숫자만 입력, 예: 6 또는 5.5)", 사유="조정 사유 (예: 목요일 신규 가입)")
 async def set_custom_weekly_goal(interaction: discord.Interaction, 유저: discord.Member, 목표시간: float, 사유: str = "주중 가입 감면"):
@@ -1417,7 +1657,6 @@ async def set_custom_weekly_goal(interaction: discord.Interaction, 유저: disco
     embed.add_field(name="조정 사유", value=사유.strip(), inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎯 [가입일 기준 자동 일할 계산 감면]
 @bot.tree.command(name="통화목표자동감면", description="[관리자 전용] 길드원의 서버 가입일을 기준으로 이번 주 남은 일수에 맞춰 목표 시간을 자동 계산합니다.")
 @app_commands.describe(유저="목표 시간을 자동 일할 계산할 신규 멤버")
 async def auto_calculate_weekly_goal(interaction: discord.Interaction, 유저: discord.Member):
@@ -1459,7 +1698,6 @@ async def auto_calculate_weekly_goal(interaction: discord.Interaction, 유저: d
     embed.add_field(name="적용 내역", value=reason_str, inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🎯 [개별 목표 시간 초기화]
 @bot.tree.command(name="통화목표초기화", description="[관리자 전용] 개별 조정된 유저 1명의 1회성 목표 시간을 해제합니다.")
 @app_commands.describe(유저="개별 목표 조정을 해제할 멤버")
 async def reset_custom_weekly_goal(interaction: discord.Interaction, 유저: discord.Member):
@@ -1471,7 +1709,6 @@ async def reset_custom_weekly_goal(interaction: discord.Interaction, 유저: dis
     await log_voice_goal_action(interaction.guild, 유저.id, "reset", {})
     await interaction.followup.send(f"✅ {유저.mention} 님의 1회성 개별 목표 시간 조정이 해제되었습니다.", ephemeral=True)
 
-# 🧹 [인증 초기화]
 @bot.tree.command(name="인증초기화", description="[관리자 전용] 특정 유저의 길드원/무기/직업 역할을 모두 회수하고 닉네임을 초기화합니다.")
 @app_commands.describe(유저="인증을 초기화할 대상 멤버")
 async def reset_user_verification(interaction: discord.Interaction, 유저: discord.Member):
@@ -1507,7 +1744,6 @@ async def reset_user_verification(interaction: discord.Interaction, 유저: disc
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🏖️ [통화 예외/휴가 등록]
 @bot.tree.command(name="통화예외등록", description="[관리자 전용] 특정 유저를 지정한 날짜까지 통화 출결 체크에서 예외(면제) 처리합니다.")
 @app_commands.describe(유저="출결 예외 대상 멤버", 종료일="예외 인정 종료일 (형식: YYYY-MM-DD)", 사유="휴가 및 예외 사유")
 async def add_voice_exemption(interaction: discord.Interaction, 유저: discord.Member, 종료일: str, 사유: str):
@@ -2106,6 +2342,7 @@ async def on_ready():
     bot.add_view(LoadoutSelectView())
     bot.add_view(ApplyView())
     bot.add_view(ReviewView())
+    bot.add_view(PromoteView())
 
     if not daily_voice_check.is_running():
         daily_voice_check.start()

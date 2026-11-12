@@ -62,6 +62,8 @@ TARGET_ROLES = [
 ]
 
 ALL_GUILD_ROLES = TARGET_ROLES + ["커뮤니티"]
+WEEKDAY_MAP = {"월": 0, "화": 1, "수": 2, "목": 3, "금": 4, "토": 5, "일": 6}
+WEEKDAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 def is_target_member(member: discord.Member) -> bool:
     return any(role.name in TARGET_ROLES for role in member.roles)
@@ -89,11 +91,14 @@ SERVER_AUDIT_FLAGS: Dict[int, Dict[str, str]] = {}
 # 🏖️ 통화 예외/휴가 메모리 {guild_id: {user_id_str: {"until": "YYYY-MM-DD", "reason": str}}}
 VOICE_EXEMPTIONS: Dict[int, Dict[str, dict]] = {}
 
-# 🎯 주간 개별 목표 시간 설정 {guild_id: {user_id_str: {"week_start": "YYYY-MM-DD", "target_sec": int, "reason": str}}}
+# 🎯 주간 개별 목표 시간 설정 (1회성 주간) {guild_id: {user_id_str: {"week_start": "YYYY-MM-DD", "target_sec": int, "reason": str}}}
 VOICE_CUSTOM_GOALS: Dict[int, Dict[str, dict]] = {}
 
 # 🌐 주간 전체(길드 일괄) 목표 시간 설정 {guild_id: {"week_start": "YYYY-MM-DD", "target_sec": int, "reason": str}}
 VOICE_GLOBAL_GOALS: Dict[int, dict] = {}
+
+# 📅 매주 정기 불가 요일 설정 {guild_id: {user_id_str: {"days": List[int], "reason": str}}}
+VOICE_RECURRING_DAYS: Dict[int, Dict[str, dict]] = {}
 
 def get_current_week_monday(dt: datetime) -> str:
     monday = dt - timedelta(days=dt.weekday())
@@ -102,23 +107,52 @@ def get_current_week_monday(dt: datetime) -> str:
 def get_user_weekly_goal(guild_id: int, user_id: int, reference_dt: Optional[datetime] = None) -> tuple[int, Optional[str]]:
     """
     해당 주의 유저 목표 시간(초)과 사유를 반환
-    우선순위: 1. 개별 목표 설정 -> 2. 전체(길드 일괄) 목표 설정 -> 3. 기본 11시간(39600초)
+    우선순위:
+    1. 이번 주 개별 목표 설정 (/통화목표설정, /통화목표자동감면)
+    2. 매주 정기 불가 요일 설정 (/정기요일제외설정) -> 공통 기준에서 (제외일수/7) 만큼 비례 감면
+    3. 이번 주 전체(길드 일괄) 목표 설정 (/전체통화목표설정)
+    4. 기본 11시간 (39600초)
     """
     now = reference_dt or datetime.now(KST)
     current_monday = get_current_week_monday(now)
+    u_str = str(user_id)
 
-    # 1순위: 개별 설정
+    # 1순위: 이번 주 개별 설정
     guild_goals = VOICE_CUSTOM_GOALS.get(guild_id, {})
-    goal_info = guild_goals.get(str(user_id))
+    goal_info = guild_goals.get(u_str)
     if goal_info and goal_info.get("week_start") == current_monday:
         return int(goal_info["target_sec"]), goal_info.get("reason")
 
-    # 2순위: 전체(길드 일괄) 설정
+    # 공통 기준 시간 확인 (전체 감면이 있으면 해당 시간, 없으면 11시간)
+    base_sec = DEFAULT_WEEKLY_GOAL_SEC
+    base_reason = None
     global_info = VOICE_GLOBAL_GOALS.get(guild_id)
     if global_info and global_info.get("week_start") == current_monday:
-        return int(global_info["target_sec"]), global_info.get("reason")
+        base_sec = int(global_info["target_sec"])
+        base_reason = global_info.get("reason")
 
-    # 3순위: 기본 11시간
+    # 2순위: 매주 정기 불가 요일 설정 반영
+    rec_info = VOICE_RECURRING_DAYS.get(guild_id, {}).get(u_str)
+    if rec_info and rec_info.get("days"):
+        excluded_days: List[int] = rec_info["days"]
+        active_days = max(0, 7 - len(excluded_days))
+        raw_hours = (base_sec / 3600.0) * (active_days / 7.0)
+        rounded_hours = round(raw_hours * 2) / 2
+        calc_sec = int(rounded_hours * 3600)
+
+        day_labels = ",".join(WEEKDAYS_KO[d] for d in sorted(excluded_days))
+        reason_text = f"매주 {day_labels} 제외"
+        if rec_info.get("reason"):
+            reason_text += f"·{rec_info['reason']}"
+        if base_reason:
+            reason_text += f" + {base_reason}"
+        return calc_sec, reason_text
+
+    # 3순위: 전체 공통 기준
+    if base_reason:
+        return base_sec, base_reason
+
+    # 4순위: 기본 11시간
     return DEFAULT_WEEKLY_GOAL_SEC, None
 
 def is_voice_exempt(guild_id: int, user_id: int) -> Optional[dict]:
@@ -235,6 +269,7 @@ async def fetch_database_from_channel(guild: discord.Guild):
     voice_records: Dict[str, Dict[str, int]] = {}
     exempts: Dict[str, dict] = {}
     custom_goals: Dict[str, dict] = {}
+    recurring_days: Dict[str, dict] = {}
     global_goal: Optional[dict] = None
 
     try:
@@ -327,6 +362,22 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
+                elif footer_text.startswith("VOICE_RECURRING_DAY:"):
+                    try:
+                        data = json.loads(footer_text.replace("VOICE_RECURRING_DAY:", "").strip())
+                        u_id = str(data["user_id"])
+                        action = data.get("action", "set")
+                        if action == "set":
+                            recurring_days[u_id] = {
+                                "days": [int(d) for d in data.get("days", [])],
+                                "reason": data.get("reason", "")
+                            }
+                        elif action == "remove":
+                            if u_id in recurring_days:
+                                del recurring_days[u_id]
+                    except Exception:
+                        continue
+
                 elif footer_text.startswith("VOICE_CONFIG:"):
                     try:
                         cfg = json.loads(footer_text.replace("VOICE_CONFIG:", "").strip())
@@ -367,6 +418,7 @@ async def fetch_database_from_channel(guild: discord.Guild):
 
         VOICE_EXEMPTIONS[guild.id] = exempts
         VOICE_CUSTOM_GOALS[guild.id] = custom_goals
+        VOICE_RECURRING_DAYS[guild.id] = recurring_days
         if global_goal:
             VOICE_GLOBAL_GOALS[guild.id] = global_goal
         elif guild.id in VOICE_GLOBAL_GOALS:
@@ -449,6 +501,28 @@ async def log_voice_global_goal_action(guild: discord.Guild, action: str, data: 
         }
     elif action == "reset" and guild.id in VOICE_GLOBAL_GOALS:
         del VOICE_GLOBAL_GOALS[guild.id]
+
+async def log_voice_recurring_day_action(guild: discord.Guild, user_id: int, action: str, data: dict):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID) or await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    embed = discord.Embed(title=f"📅 [정기 요일 제외 DB 로그] {action.upper()}", color=discord.Color.purple())
+    payload = {"user_id": user_id, "action": action, **data}
+    embed.set_footer(text=f"VOICE_RECURRING_DAY:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+    if guild.id not in VOICE_RECURRING_DAYS:
+        VOICE_RECURRING_DAYS[guild.id] = {}
+    u_str = str(user_id)
+    if action == "set":
+        VOICE_RECURRING_DAYS[guild.id][u_str] = {
+            "days": [int(d) for d in data.get("days", [])],
+            "reason": data.get("reason", "")
+        }
+    elif action == "remove" and u_str in VOICE_RECURRING_DAYS[guild.id]:
+        del VOICE_RECURRING_DAYS[guild.id][u_str]
 
 async def log_voice_duration(guild: discord.Guild, user_id: int, date_str: str, duration_sec: int):
     if WARN_LOG_CHANNEL_ID == 0 or duration_sec <= 0:
@@ -689,7 +763,7 @@ async def daily_voice_check():
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
 
-            # 매주 월요일 자정 결산 (지난주 기준 전체/개별 목표치 모두 반영)
+            # 매주 월요일 자정 결산
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -725,7 +799,6 @@ async def daily_voice_check():
                             if is_voice_exempt(guild.id, member.id):
                                 continue
 
-                            # 🎯 지난주 월요일 기준 (개별 > 전체 > 기본 11시간)
                             goal_sec, goal_reason = get_user_weekly_goal(guild.id, member.id, yesterday_dt)
                             week_spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in past_7_days)
                             
@@ -737,7 +810,7 @@ async def daily_voice_check():
 
                         embed_weekly = discord.Embed(
                             title="📊 [주간 통화시간 결산] 지난주 종합",
-                            description="길드원/수습생 대상 지난주(월~일) 통화방 참여 미달자 명단입니다.\n*(휴가자 제외 및 전체/중도 가입자 감면 목표 시간 반영 완료)*",
+                            description="길드원/수습생 대상 지난주(월~일) 통화방 참여 미달자 명단입니다.\n*(휴가자 제외 및 정기 요일 면제·중도 가입 감면 반영 완료)*",
                             color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
                         )
                         if weekly_failed:
@@ -1133,7 +1206,94 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🌐 [신규: 전체(길드 일괄) 주간 목표 시간 조정 - 수요일 봇 도입 등 전체 변수 컨트롤]
+# 📅 [신규: 매주 정기 불가 요일 설정]
+@bot.tree.command(name="정기요일제외설정", description="[관리자 전용] 학원·알바 등으로 매주 특정 요일마다 참여 불가한 유저의 목표 시간을 자동 비례 감면합니다.")
+@app_commands.describe(유저="정기 요일 제외 대상 멤버", 제외요일="매주 제외할 요일 (쉼표로 구분, 예: 화,목 또는 수)", 사유="사유 (예: 학원, 알바)")
+async def set_recurring_excluded_days(interaction: discord.Interaction, 유저: discord.Member, 제외요일: str, 사유: str = "정기 일정"):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    raw_tokens = [tok.strip().replace("요일", "") for tok in 제외요일.split(",") if tok.strip()]
+    parsed_days = []
+    for tok in raw_tokens:
+        if tok not in WEEKDAY_MAP:
+            await interaction.followup.send(f"❌ 올바른 요일을 입력해 주세요. (`월, 화, 수, 목, 금, 토, 일` 중 선택, 예: `화,목`)", ephemeral=True)
+            return
+        day_idx = WEEKDAY_MAP[tok]
+        if day_idx not in parsed_days:
+            parsed_days.append(day_idx)
+
+    if not parsed_days or len(parsed_days) >= 7:
+        await interaction.followup.send("❌ 제외할 요일은 최소 1개 이상, 최대 6개 이하로 지정해야 합니다.", ephemeral=True)
+        return
+
+    parsed_days.sort()
+    payload = {
+        "days": parsed_days,
+        "reason": 사유.strip()
+    }
+    await log_voice_recurring_day_action(interaction.guild, 유저.id, "set", payload)
+
+    new_goal_sec, _ = get_user_weekly_goal(interaction.guild.id, 유저.id)
+    day_names = ", ".join(f"{WEEKDAYS_KO[d]}요일" for d in parsed_days)
+
+    embed = discord.Embed(
+        title="📅 [매주 정기 요일 면제 설정 완료]",
+        description=f"{유저.mention} 님은 앞으로 매주 **{day_names}**이 제외되어 주간 목표 시간이 자동 비례 감면됩니다.",
+        color=discord.Color.purple()
+    )
+    embed.add_field(name="제외된 정기 요일", value=f"{day_names} (주 {len(parsed_days)}일 제외)", inline=True)
+    embed.add_field(name="산출된 주간 목표", value=f"**{format_hours_short(new_goal_sec)}** / 11시간", inline=True)
+    embed.add_field(name="등록 사유", value=사유.strip(), inline=False)
+    embed.set_footer(text="해제 명령어(/정기요일제외해제)를 실행하기 전까지 매주 자동 적용됩니다.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 📅 [신규: 매주 정기 불가 요일 해제]
+@bot.tree.command(name="정기요일제외해제", description="[관리자 전용] 등록된 매주 정기 요일 면제 설정을 해제합니다.")
+@app_commands.describe(유저="정기 요일 면제를 해제할 멤버")
+async def remove_recurring_excluded_days(interaction: discord.Interaction, 유저: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if str(유저.id) not in VOICE_RECURRING_DAYS.get(interaction.guild.id, {}):
+        await interaction.followup.send("⚠️ 해당 멤버는 정기 요일 제외 대상자로 등록되어 있지 않습니다.", ephemeral=True)
+        return
+
+    await log_voice_recurring_day_action(interaction.guild, 유저.id, "remove", {})
+    await interaction.followup.send(f"✅ {유저.mention} 님의 매주 정기 요일 제외 설정이 해제되었습니다.", ephemeral=True)
+
+# 📅 [신규: 정기 요일 면제자 목록 조회]
+@bot.tree.command(name="정기요일제외목록", description="[관리자 전용] 매주 특정 요일마다 면제를 받고 있는 멤버 목록을 확인합니다.")
+async def list_recurring_excluded_days(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    rec_map = VOICE_RECURRING_DAYS.get(guild_id, {})
+    if not rec_map:
+        await interaction.followup.send("✨ 현재 정기 요일 제외로 등록된 멤버가 없습니다.", ephemeral=True)
+        return
+
+    lines = []
+    for uid, info in rec_map.items():
+        days_str = ",".join(WEEKDAYS_KO[d] for d in sorted(info.get("days", [])))
+        goal_sec, _ = get_user_weekly_goal(guild_id, int(uid))
+        lines.append(f"• <@{uid}> : 매주 **{days_str}** 제외 ➔ 목표 **{format_hours_short(goal_sec)}** ({info.get('reason', '')})")
+
+    embed = discord.Embed(
+        title=f"📅 [매주 정기 요일 면제자 목록] (총 {len(lines)}명)",
+        description="\n".join(lines),
+        color=discord.Color.purple()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+# 🌐 [전체(길드 일괄) 주간 목표 시간 조정]
 @bot.tree.command(name="전체통화목표설정", description="[관리자 전용] 수요일 봇 도입 등 길드 전체의 이번 주 목표 통화 시간(기본 11시간)을 일괄 조정합니다.")
 @app_commands.describe(목표시간="이번 주 전체 기준 시간(숫자만 입력, 예: 7.5 또는 8)", 사유="전체 조정 사유 (예: 수요일 봇 기능 도입)")
 async def set_global_weekly_goal(interaction: discord.Interaction, 목표시간: float, 사유: str = "주중 봇 도입/전체 감면"):
@@ -1164,10 +1324,9 @@ async def set_global_weekly_goal(interaction: discord.Interaction, 목표시간:
     )
     embed.add_field(name="전체 적용 목표 시간", value=f"**{format_hours_short(target_sec)}** (기존 11시간)", inline=True)
     embed.add_field(name="조정 사유", value=사유.strip(), inline=True)
-    embed.set_footer(text="개별 감면 설정된 유저는 개별 설정이 우선되며, 다음 주 월요일에 모두 11시간으로 자동 복구됩니다.")
+    embed.set_footer(text="정기 요일 제외 및 개별 감면 설정된 유저는 해당 비율에 맞춰 자동 추가 반영됩니다.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 🌐 [신규: 전체 목표 시간 기본 11시간으로 즉시 복구]
 @bot.tree.command(name="전체통화목표초기화", description="[관리자 전용] 일괄 조정된 길드 전체 목표 시간을 기본 11시간으로 되돌립니다.")
 async def reset_global_weekly_goal(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1178,8 +1337,7 @@ async def reset_global_weekly_goal(interaction: discord.Interaction):
     await log_voice_global_goal_action(interaction.guild, "reset", {})
     await interaction.followup.send("✅ 길드 전체의 이번 주 목표 통화 시간이 기본 **11시간**으로 복구되었습니다.", ephemeral=True)
 
-# 📋 [신규: 현재 적용 중인 전체/개별 목표 시간 현황판]
-@bot.tree.command(name="통화목표현황", description="[관리자 전용] 현재 이번 주에 적용 중인 전체 목표 시간 및 개별 감면 인원 목록을 확인합니다.")
+@bot.tree.command(name="통화목표현황", description="[관리자 전용] 현재 이번 주에 적용 중인 전체 목표 시간 및 개별/정기 감면 현황을 확인합니다.")
 async def view_weekly_goal_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not is_admin_or_mod(interaction):
@@ -1202,14 +1360,26 @@ async def view_weekly_goal_status(interaction: discord.Interaction):
         if info.get("week_start") == current_monday:
             custom_lines.append(f"• <@{uid}> : **{format_hours_short(info['target_sec'])}** ({info['reason']})")
 
+    rec_map = VOICE_RECURRING_DAYS.get(guild_id, {})
+    rec_lines = []
+    for uid, info in rec_map.items():
+        days_str = ",".join(WEEKDAYS_KO[d] for d in sorted(info.get("days", [])))
+        goal_sec, _ = get_user_weekly_goal(guild_id, int(uid), now)
+        rec_lines.append(f"• <@{uid}> : 매주 **{days_str}** 제외 ➔ **{format_hours_short(goal_sec)}** ({info.get('reason', '')})")
+
     embed = discord.Embed(
         title=f"🎯 [이번 주 통화 목표 기준 현황] ({current_monday} 주간)",
         color=discord.Color.gold()
     )
     embed.add_field(name="🌐 길드 전체 공통 기준", value=global_text, inline=False)
     embed.add_field(
-        name=f"👤 개별 감면 적용자 ({len(custom_lines)}명)",
-        value="\n".join(custom_lines) if custom_lines else "없음 (전원 공통 기준 적용 중)",
+        name=f"📅 매주 정기 요일 면제자 ({len(rec_lines)}명)",
+        value="\n".join(rec_lines) if rec_lines else "없음",
+        inline=False
+    )
+    embed.add_field(
+        name=f"👤 이번 주 1회성 개별 감면자 ({len(custom_lines)}명)",
+        value="\n".join(custom_lines) if custom_lines else "없음",
         inline=False
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1266,8 +1436,7 @@ async def auto_calculate_weekly_goal(interaction: discord.Interaction, 유저: d
         ref_weekday = join_dt.weekday()
 
     remaining_days = 7 - ref_weekday
-    weekdays_ko = ["월", "화", "수", "목", "금", "토", "일"]
-    day_name = weekdays_ko[ref_weekday]
+    day_name = WEEKDAYS_KO[ref_weekday]
 
     raw_hours = 11.0 * (remaining_days / 7.0)
     rounded_hours = round(raw_hours * 2) / 2
@@ -1291,7 +1460,7 @@ async def auto_calculate_weekly_goal(interaction: discord.Interaction, 유저: d
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 # 🎯 [개별 목표 시간 초기화]
-@bot.tree.command(name="통화목표초기화", description="[관리자 전용] 개별 조정된 유저 1명의 목표 시간을 공통 기준으로 되돌립니다.")
+@bot.tree.command(name="통화목표초기화", description="[관리자 전용] 개별 조정된 유저 1명의 1회성 목표 시간을 해제합니다.")
 @app_commands.describe(유저="개별 목표 조정을 해제할 멤버")
 async def reset_custom_weekly_goal(interaction: discord.Interaction, 유저: discord.Member):
     await interaction.response.defer(ephemeral=True)
@@ -1300,7 +1469,7 @@ async def reset_custom_weekly_goal(interaction: discord.Interaction, 유저: dis
         return
 
     await log_voice_goal_action(interaction.guild, 유저.id, "reset", {})
-    await interaction.followup.send(f"✅ {유저.mention} 님의 개별 목표 시간 조정이 해제되어 공통 기준으로 복구되었습니다.", ephemeral=True)
+    await interaction.followup.send(f"✅ {유저.mention} 님의 1회성 개별 목표 시간 조정이 해제되었습니다.", ephemeral=True)
 
 # 🧹 [인증 초기화]
 @bot.tree.command(name="인증초기화", description="[관리자 전용] 특정 유저의 길드원/무기/직업 역할을 모두 회수하고 닉네임을 초기화합니다.")
@@ -1632,7 +1801,6 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
 
     current_weekday = now.weekday()
     monday_date = now - timedelta(days=current_weekday)
-    weekdays_ko = ["월", "화", "수", "목", "금", "토", "일"]
 
     daily_breakdown = []
     this_week_sec = 0
@@ -1646,7 +1814,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             day_spent += cur_live_diff
 
         this_week_sec += day_spent
-        day_label = f"**{weekdays_ko[i]}요일**" + (" *(오늘)*" if i == current_weekday else "")
+        day_label = f"**{WEEKDAYS_KO[i]}요일**" + (" *(오늘)*" if i == current_weekday else "")
         daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
 
     last_week_monday = now - timedelta(days=current_weekday + 7)

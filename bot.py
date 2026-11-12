@@ -428,7 +428,7 @@ async def update_member_counter(guild: discord.Guild):
     if not channel or not isinstance(channel, discord.VoiceChannel):
         return
     human_count = len([m for m in guild.members if not m.bot])
-    new_name = f"👥│전체 인원: {human_count}명"
+    new_name = f"₍₍👥⁾⁾┇ 전체인원: {human_count}명"
     if channel.name != new_name:
         try:
             await channel.edit(name=new_name)

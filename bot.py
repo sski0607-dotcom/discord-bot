@@ -5,7 +5,7 @@ import random
 import threading
 import asyncio
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List, Dict
 from flask import Flask
 import discord
@@ -51,8 +51,11 @@ KST = timezone(timedelta(hours=9))
 # 기본 주간 목표 시간 (11시간 = 39600초)
 DEFAULT_WEEKLY_GOAL_SEC = 39600
 
-# 기본 수습 기간 일수 (명령어로 언제든 변경 가능)
-DEFAULT_PROBATION_DAYS = 14
+# 기본 수습 기간 일수 (1주일 = 7일)
+DEFAULT_PROBATION_DAYS = 7
+
+# 📌 신규 수습생 일일 1시간 의무 적용 기준일 (2026년 11월 14일 이후 가입 수습생부터 적용)
+DAILY_RULE_CUTOFF_DATE = date(2026, 11, 14)
 
 # --- 통화방 시간 및 공지 확인 대상 역할 목록 ---
 TARGET_ROLES = [
@@ -77,6 +80,9 @@ WEEKDAYS_KO = ["월", "화", "수", "목", "금", "토", "일"]
 def is_target_member(member: discord.Member) -> bool:
     return any(role.name in TARGET_ROLES for role in member.roles)
 
+def is_probation_member(member: discord.Member) -> bool:
+    return any(role.name in PROBATION_ROLE_MAP for role in member.roles)
+
 def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
     if not channel:
         return False
@@ -96,6 +102,7 @@ PROBATION_DAYS_CONFIG: Dict[int, int] = {}
 # 통화방 세션 및 캐시
 VOICE_ACTIVE_SESSIONS: Dict[int, dict] = {}
 VOICE_DAILY_CACHE: Dict[int, Dict[str, Dict[str, int]]] = {}
+WARN_CACHE: Dict[str, list] = {}
 SERVER_AUDIT_FLAGS: Dict[int, Dict[str, str]] = {}
 
 # 🏖️ 통화 예외/휴가 메모리
@@ -110,11 +117,33 @@ VOICE_GLOBAL_GOALS: Dict[int, dict] = {}
 # 📅 매주 정기 불가 요일 설정
 VOICE_RECURRING_DAYS: Dict[int, Dict[str, dict]] = {}
 
-# 🌱 수습생 입단일 및 알림 발송 기록 {guild_id: {user_id_str: {"join_date": "YYYY-MM-DD", "notified": bool}}}
+# 🌱 수습생 입단일 및 연장/알림 기록 {guild_id: {user_id_str: {"join_date": "YYYY-MM-DD", "extra_days": int, "notified": bool}}}
 PROBATION_RECORDS: Dict[int, Dict[str, dict]] = {}
 
 def get_probation_days(guild_id: int) -> int:
     return PROBATION_DAYS_CONFIG.get(guild_id, DEFAULT_PROBATION_DAYS)
+
+def get_member_effective_join_date(guild_id: int, member: discord.Member) -> date:
+    """수습 기록의 입단일 또는 디스코드 서버 합류일을 반환"""
+    rec = PROBATION_RECORDS.get(guild_id, {}).get(str(member.id))
+    if rec and rec.get("join_date"):
+        try:
+            return datetime.strptime(rec["join_date"], "%Y-%m-%d").date()
+        except Exception:
+            pass
+    if member.joined_at:
+        return member.joined_at.astimezone(KST).date()
+    return datetime.now(KST).date()
+
+def requires_daily_one_hour(guild_id: int, member: discord.Member) -> bool:
+    """
+    11월 14일 이후 가입한 수습생만 일일 최소 1시간 참여 의무 적용.
+    정식 길드원 및 11월 14일 이전 가입자는 일일 제한 없음(False).
+    """
+    if not is_probation_member(member):
+        return False
+    join_dt = get_member_effective_join_date(guild_id, member)
+    return join_dt >= DAILY_RULE_CUTOFF_DATE
 
 def get_current_week_monday(dt: datetime) -> str:
     monday = dt - timedelta(days=dt.weekday())
@@ -388,7 +417,22 @@ async def fetch_database_from_channel(guild: discord.Guild):
                         u_id = str(data["user_id"])
                         action = data.get("action", "start")
                         if action == "start":
-                            probation_recs[u_id] = {"join_date": data["join_date"], "notified": False}
+                            probation_recs[u_id] = {
+                                "join_date": data["join_date"],
+                                "extra_days": int(data.get("extra_days", 0)),
+                                "notified": False
+                            }
+                        elif action == "extend":
+                            add_d = int(data.get("add_days", 7))
+                            if u_id not in probation_recs:
+                                probation_recs[u_id] = {
+                                    "join_date": data.get("join_date", datetime.now(KST).strftime("%Y-%m-%d")),
+                                    "extra_days": add_d,
+                                    "notified": False
+                                }
+                            else:
+                                probation_recs[u_id]["extra_days"] = probation_recs[u_id].get("extra_days", 0) + add_d
+                                probation_recs[u_id]["notified"] = False
                         elif action == "notified":
                             if u_id in probation_recs:
                                 probation_recs[u_id]["notified"] = True
@@ -447,6 +491,8 @@ async def fetch_database_from_channel(guild: discord.Guild):
         VOICE_CUSTOM_GOALS[guild.id] = custom_goals
         VOICE_RECURRING_DAYS[guild.id] = recurring_days
         PROBATION_RECORDS[guild.id] = probation_recs
+        WARN_CACHE.clear()
+        WARN_CACHE.update(warnings)
         if global_goal:
             VOICE_GLOBAL_GOALS[guild.id] = global_goal
         elif guild.id in VOICE_GLOBAL_GOALS:
@@ -467,6 +513,15 @@ async def log_warning_action(guild: discord.Guild, user_id: int, action: str, da
     payload = {"user_id": user_id, "action": action, **data}
     embed.set_footer(text=f"WARN_DATA:{json.dumps(payload, ensure_ascii=False)}")
     await channel.send(embed=embed)
+
+    u_str = str(user_id)
+    if action == "add":
+        WARN_CACHE.setdefault(u_str, []).append({"reason": data["reason"], "moderator": data["moderator"], "date": data["date"]})
+    elif action == "remove" and u_str in WARN_CACHE:
+        deduct = data.get("count", 1)
+        WARN_CACHE[u_str] = WARN_CACHE[u_str][:-deduct]
+    elif action == "clear" and u_str in WARN_CACHE:
+        WARN_CACHE[u_str] = []
 
 async def log_voice_exempt_action(guild: discord.Guild, user_id: int, action: str, data: dict):
     if WARN_LOG_CHANNEL_ID == 0:
@@ -568,7 +623,22 @@ async def log_probation_action(guild: discord.Guild, user_id: int, action: str, 
         PROBATION_RECORDS[guild.id] = {}
     u_str = str(user_id)
     if action == "start":
-        PROBATION_RECORDS[guild.id][u_str] = {"join_date": data["join_date"], "notified": False}
+        PROBATION_RECORDS[guild.id][u_str] = {
+            "join_date": data["join_date"],
+            "extra_days": int(data.get("extra_days", 0)),
+            "notified": False
+        }
+    elif action == "extend":
+        add_d = int(data.get("add_days", 7))
+        if u_str not in PROBATION_RECORDS[guild.id]:
+            PROBATION_RECORDS[guild.id][u_str] = {
+                "join_date": data.get("join_date", datetime.now(KST).strftime("%Y-%m-%d")),
+                "extra_days": add_d,
+                "notified": False
+            }
+        else:
+            PROBATION_RECORDS[guild.id][u_str]["extra_days"] = PROBATION_RECORDS[guild.id][u_str].get("extra_days", 0) + add_d
+            PROBATION_RECORDS[guild.id][u_str]["notified"] = False
     elif action == "notified" and u_str in PROBATION_RECORDS[guild.id]:
         PROBATION_RECORDS[guild.id][u_str]["notified"] = True
     elif action == "promoted" and u_str in PROBATION_RECORDS[guild.id]:
@@ -685,7 +755,7 @@ async def update_member_counter(guild: discord.Guild):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-# --- 🌱 [수습생 승급 버튼 UI] ---
+# --- 🌱 [수습생 승급 & 1주 연장 버튼 UI] ---
 class PromoteView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -747,9 +817,46 @@ class PromoteView(discord.ui.View):
         await interaction.message.edit(embed=embed, view=self)
 
         try:
-            await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다!")
+            await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다! (정식 길드원은 일일 최소 시간 제한 없이 주간 11시간 기준만 적용됩니다.)")
         except Exception:
             pass
+
+    @discord.ui.button(label="⏳ 수습 1주 연장 (+7일)", style=discord.ButtonStyle.secondary, custom_id="btn_probation_extend")
+    async def extend_probation(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        if not is_admin_or_mod(interaction):
+            await interaction.followup.send("❌ 관리자만 수습 연장 처리를 할 수 있습니다.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        footer_text = embed.footer.text or ""
+        if not footer_text.startswith("PROMOTE_ID:"):
+            await interaction.followup.send("❌ 대상 유저 정보를 읽을 수 없습니다.", ephemeral=True)
+            return
+
+        target_user_id = int(footer_text.replace("PROMOTE_ID:", "").strip())
+        guild = interaction.guild
+        member = guild.get_member(target_user_id) or await guild.fetch_member(target_user_id)
+
+        if not member:
+            await interaction.followup.send("❌ 해당 유저를 서버에서 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        eff_join_str = get_member_effective_join_date(guild.id, member).strftime("%Y-%m-%d")
+        await log_probation_action(guild, member.id, "extend", {"add_days": 7, "join_date": eff_join_str})
+
+        rec = PROBATION_RECORDS.get(guild.id, {}).get(str(member.id), {})
+        total_req = get_probation_days(guild.id) + rec.get("extra_days", 7)
+
+        embed.color = discord.Color.orange()
+        embed.title = f"⏳ [수습 기간 1주 연장 완료] {member.display_name}"
+        embed.add_field(name="연장 내역", value=f"+7일 연장됨 (총 목표 수습 기간: **{total_req}일**)", inline=True)
+        embed.add_field(name="연장 처리자", value=f"{interaction.user.mention}", inline=True)
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.message.edit(embed=embed, view=self)
 
 async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
     if not channel:
@@ -866,13 +973,12 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                 date_str = sess["start_time"].strftime("%Y-%m-%d")
                 await log_voice_duration(after.guild, after.id, date_str, duration)
 
-    # 수습생 역할이 수동으로 부여되었을 때도 입단일 자동 기록
     before_prob = any(r.name in PROBATION_ROLE_MAP for r in before.roles)
     after_prob = any(r.name in PROBATION_ROLE_MAP for r in after.roles)
     if not before_prob and after_prob:
         if str(after.id) not in PROBATION_RECORDS.get(after.guild.id, {}):
             today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            await log_probation_action(after.guild, after.id, "start", {"join_date": today_str})
+            await log_probation_action(after.guild, after.id, "start", {"join_date": today_str, "extra_days": 0})
 
 @tasks.loop(minutes=10)
 async def update_member_counter_loop():
@@ -901,7 +1007,7 @@ async def daily_voice_check():
 
             # 🌱 매일 낮 12시(12:00) 수습생 승급 만료 여부 자동 체크
             if now.hour == 12 and now.minute == 0:
-                req_days = get_probation_days(guild.id)
+                base_req_days = get_probation_days(guild.id)
                 admin_ch_id = VERIFY_ADMIN_CHANNELS.get(guild.id) or WARN_LOG_CHANNEL_ID
                 admin_ch = guild.get_channel(admin_ch_id)
 
@@ -915,22 +1021,21 @@ async def daily_voice_check():
                             continue
 
                         u_str = str(member.id)
-                        rec = guild_prob_recs.get(u_str)
-                        if rec:
-                            join_date = datetime.strptime(rec["join_date"], "%Y-%m-%d").date()
-                            already_notified = rec.get("notified", False)
-                        else:
-                            join_date = member.joined_at.astimezone(KST).date() if member.joined_at else now.date()
-                            already_notified = False
+                        rec = guild_prob_recs.get(u_str, {})
+                        join_date = get_member_effective_join_date(guild.id, member)
+                        extra_days = int(rec.get("extra_days", 0))
+                        already_notified = rec.get("notified", False)
+                        total_req_days = base_req_days + extra_days
 
                         elapsed_days = (now.date() - join_date).days
-                        if elapsed_days >= req_days and not already_notified:
+                        if elapsed_days >= total_req_days and not already_notified:
                             target_role_name = PROBATION_ROLE_MAP[prob_role]
+                            ext_note = f" (기본 {base_req_days}일 + 연장 {extra_days}일)" if extra_days > 0 else ""
                             embed_prom = discord.Embed(
-                                title="🔔 [수습 기간 만료 - 정식 길드원 승급 알림]",
+                                title="🔔 [수습 기간 만료 - 승급 또는 연장 선택]",
                                 description=(
-                                    f"{member.mention} (`{member.display_name}`) 님이 수습 기준 기간(**{req_days}일**)을 채웠습니다!\n"
-                                    f"아래 버튼을 누르면 **{target_role_name}** 역할로 즉시 승급됩니다."
+                                    f"{member.mention} (`{member.display_name}`) 님이 수습 기간(**{total_req_days}일**{ext_note})을 채웠습니다!\n"
+                                    f"아래 버튼으로 **{target_role_name} 승급** 또는 **수습 1주 연장(+7일)**을 선택해 주세요."
                                 ),
                                 color=discord.Color.green(),
                                 timestamp=now
@@ -942,7 +1047,7 @@ async def daily_voice_check():
                             await admin_ch.send(embed=embed_prom, view=PromoteView())
                             await log_probation_action(guild, member.id, "notified")
 
-            # 매주 월요일 자정 결산
+            # 📊 매주 월요일 자정 주간 결산 (정식 길드원: 주간 11시간만 / 11월 14일 이후 수습생: 일일 1시간 + 주간 11시간)
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -972,24 +1077,54 @@ async def daily_voice_check():
 
                         weekly_failed = []
                         weekly_pings = []
-                        past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, 8)]
+                        last_monday_dt = (now - timedelta(days=7)).date()
+                        past_7_dates = [last_monday_dt + timedelta(days=i) for i in range(7)]
+                        past_7_strs = [d.strftime("%Y-%m-%d") for d in past_7_dates]
 
                         for member in target_members:
                             if is_voice_exempt(guild.id, member.id):
                                 continue
 
+                            u_str = str(member.id)
                             goal_sec, goal_reason = get_user_weekly_goal(guild.id, member.id, yesterday_dt)
-                            week_spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in past_7_days)
+                            week_spent = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_strs)
                             
-                            if week_spent < goal_sec:
+                            # 11월 14일 이후 가입 수습생인지 확인
+                            daily_req = requires_daily_one_hour(guild.id, member)
+                            missed_days_ko = []
+                            if daily_req:
+                                join_dt = get_member_effective_join_date(guild.id, member)
+                                rec_excluded = VOICE_RECURRING_DAYS.get(guild.id, {}).get(u_str, {}).get("days", [])
+                                for idx, d_obj in enumerate(past_7_dates):
+                                    if d_obj < join_dt or d_obj < DAILY_RULE_CUTOFF_DATE:
+                                        continue
+                                    if idx in rec_excluded:
+                                        continue
+                                    d_spent = guild_data.get(d_obj.strftime("%Y-%m-%d"), {}).get(u_str, 0)
+                                    if d_spent < 3600:
+                                        missed_days_ko.append(WEEKDAYS_KO[idx])
+
+                            is_week_failed = week_spent < goal_sec
+                            is_daily_failed = len(missed_days_ko) > 0
+
+                            if is_week_failed or is_daily_failed:
                                 goal_label = format_hours_short(goal_sec)
                                 reason_tag = f" *({goal_reason})*" if goal_reason else ""
-                                weekly_failed.append(f"• {member.mention} ({member.display_name}) - `{format_seconds(week_spent)}` / {goal_label}{reason_tag}")
+                                fail_details = []
+                                if is_week_failed:
+                                    fail_details.append(f"주간 `{format_seconds(week_spent)}` / {goal_label}{reason_tag}")
+                                if is_daily_failed:
+                                    fail_details.append(f"수습 일일 1시간 미달({','.join(missed_days_ko)})")
+                                weekly_failed.append(f"• {member.mention} ({member.display_name}) - " + " | ".join(fail_details))
                                 weekly_pings.append(member.mention)
 
                         embed_weekly = discord.Embed(
                             title="📊 [주간 통화시간 결산] 지난주 종합",
-                            description="길드원/수습생 대상 지난주(월~일) 통화방 참여 미달자 명단입니다.\n*(휴가자 제외 및 정기 요일 면제·중도 가입 감면 반영 완료)*",
+                            description=(
+                                "• **정식 길드원**: 주간 누적 11시간 기준 (일일 제한 없음)\n"
+                                "• **11/14 이후 가입 수습생**: 일일 최소 1시간 + 주간 누적 11시간 기준\n"
+                                "*(휴가자 제외 및 정기 요일 면제·중도 가입 감면 반영 완료)*"
+                            ),
                             color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
                         )
                         if weekly_failed:
@@ -1187,7 +1322,7 @@ class ReviewView(discord.ui.View):
         # 🌱 수습생 직급으로 승인된 경우 입단일 자동 기록
         if chosen_role_name in PROBATION_ROLE_MAP:
             today_str = datetime.now(KST).strftime("%Y-%m-%d")
-            await log_probation_action(guild, member.id, "start", {"join_date": today_str})
+            await log_probation_action(guild, member.id, "start", {"join_date": today_str, "extra_days": 0})
 
         if new_nick:
             try:
@@ -1390,9 +1525,9 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🌱 [신규: 수습생 승급 기준 일수 커스텀 설정]
-@bot.tree.command(name="수습기간설정", description="[관리자 전용] 수습생이 정식 길드원으로 승급되는 기준 일수(기본 14일)를 변경합니다.")
-@app_commands.describe(일수="승급 알림이 울릴 수습 기간 일수 (예: 7, 10, 14 등)")
+# 🌱 [수습생 승급 기준 일수 설정 (기본 7일)]
+@bot.tree.command(name="수습기간설정", description="[관리자 전용] 수습생 기본 수습 기간 일수(기본 7일)를 변경합니다.")
+@app_commands.describe(일수="승급 알림이 울릴 기본 수습 기간 일수 (기본값: 7)")
 async def set_probation_period(interaction: discord.Interaction, 일수: int):
     await interaction.response.defer(ephemeral=True)
     if not is_admin_or_mod(interaction):
@@ -1404,10 +1539,38 @@ async def set_probation_period(interaction: discord.Interaction, 일수: int):
         return
 
     await log_probation_config(interaction.guild, 일수)
-    await interaction.followup.send(f"✅ 수습생 정식 승급 기준 기간이 **{일수}일**로 설정되었습니다! (매일 낮 12시에 만료자를 자동 체크합니다)", ephemeral=True)
+    await interaction.followup.send(f"✅ 수습생 기본 수습 기간이 **{일수}일**로 설정되었습니다! (매일 낮 12시에 만료자를 자동 체크합니다)", ephemeral=True)
 
-# 🌱 [신규: 현재 수습생 현황 및 남은 일수 조회]
-@bot.tree.command(name="수습생현황", description="[관리자 전용] 현재 수습생들의 입단일과 정식 길드원 승급까지 남은 일수를 조회합니다.")
+# ⏳ [신규: 수습 기간 1주일(+7일) 수동 연장 명령어]
+@bot.tree.command(name="수습연장", description="[관리자 전용] 특정 수습생의 수습 기간을 1주일(+7일) 연장합니다.")
+@app_commands.describe(유저="수습 기간을 연장할 수습생", 일수="추가할 연장 일수 (기본 7일)")
+async def extend_member_probation(interaction: discord.Interaction, 유저: discord.Member, 일수: int = 7):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if not is_probation_member(유저):
+        await interaction.followup.send("⚠️ 해당 멤버는 현재 수습생 역할을 가지고 있지 않습니다.", ephemeral=True)
+        return
+
+    if 일수 < 1 or 일수 > 90:
+        await interaction.followup.send("❌ 연장 일수는 1~90일 사이로 입력해 주세요.", ephemeral=True)
+        return
+
+    eff_join = get_member_effective_join_date(interaction.guild.id, 유저).strftime("%Y-%m-%d")
+    await log_probation_action(interaction.guild, 유저.id, "extend", {"add_days": 일수, "join_date": eff_join})
+
+    rec = PROBATION_RECORDS.get(interaction.guild.id, {}).get(str(유저.id), {})
+    total_req = get_probation_days(interaction.guild.id) + rec.get("extra_days", 일수)
+
+    await interaction.followup.send(
+        f"⏳ {유저.mention} 님의 수습 기간이 **+{일수}일** 연장되었습니다! (총 목표 수습 기간: **{total_req}일**)",
+        ephemeral=True
+    )
+
+# 🌱 [수습생 현황 및 남은 일수 조회]
+@bot.tree.command(name="수습생현황", description="[관리자 전용] 현재 수습생들의 입단일, 연장 여부, 정식 승급까지 남은 일수를 조회합니다.")
 async def check_probation_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not is_admin_or_mod(interaction):
@@ -1416,7 +1579,7 @@ async def check_probation_status(interaction: discord.Interaction):
 
     guild = interaction.guild
     now_date = datetime.now(KST).date()
-    req_days = get_probation_days(guild.id)
+    base_req_days = get_probation_days(guild.id)
     guild_prob_recs = PROBATION_RECORDS.get(guild.id, {})
 
     lines = []
@@ -1428,23 +1591,24 @@ async def check_probation_status(interaction: discord.Interaction):
             continue
 
         u_str = str(member.id)
-        rec = guild_prob_recs.get(u_str)
-        if rec:
-            join_date = datetime.strptime(rec["join_date"], "%Y-%m-%d").date()
-        else:
-            join_date = member.joined_at.astimezone(KST).date() if member.joined_at else now_date
+        rec = guild_prob_recs.get(u_str, {})
+        join_date = get_member_effective_join_date(guild.id, member)
+        extra_days = int(rec.get("extra_days", 0))
+        total_req = base_req_days + extra_days
 
         elapsed = (now_date - join_date).days
-        remain = req_days - elapsed
-        status_badge = "🔔 **승급 대상 도달!**" if remain <= 0 else f"D-{remain} ({elapsed}/{req_days}일)"
-        lines.append(f"• {member.mention} (`{prob_role}`) - 입단: `{join_date}` ➔ {status_badge}")
+        remain = total_req - elapsed
+        ext_tag = f" *(+{extra_days}일 연장됨)*" if extra_days > 0 else ""
+        rule_tag = "📌[일일1h+주간11h]" if requires_daily_one_hour(guild.id, member) else "📌[주간11h]"
+        status_badge = "🔔 **승급 대상 도달!**" if remain <= 0 else f"D-{remain} ({elapsed}/{total_req}일)"
+        lines.append(f"• {member.mention} (`{prob_role}`) {rule_tag} - 입단: `{join_date}` ➔ {status_badge}{ext_tag}")
 
     if not lines:
         await interaction.followup.send("✨ 현재 서버에 수습생 직급을 가진 멤버가 없습니다.", ephemeral=True)
         return
 
     embed = discord.Embed(
-        title=f"🌱 [수습생 승급 현황] (기준: {req_days}일)",
+        title=f"🌱 [수습생 승급 현황] (기본 수습 기간: {base_req_days}일)",
         description="\n".join(lines),
         color=discord.Color.green()
     )
@@ -2034,6 +2198,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     exempt_info = is_voice_exempt(guild_id, target.id)
     goal_sec, goal_reason = get_user_weekly_goal(guild_id, target.id, now)
     goal_label = format_hours_short(goal_sec)
+    daily_req = requires_daily_one_hour(guild_id, target)
 
     current_weekday = now.weekday()
     monday_date = now - timedelta(days=current_weekday)
@@ -2051,7 +2216,12 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
 
         this_week_sec += day_spent
         day_label = f"**{WEEKDAYS_KO[i]}요일**" + (" *(오늘)*" if i == current_weekday else "")
-        daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
+
+        if daily_req and i <= current_weekday:
+            icon = "✅" if day_spent >= 3600 else "⚠️"
+            daily_breakdown.append(f"{icon} {day_label} : `{format_seconds(day_spent)}`")
+        else:
+            daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
 
     last_week_monday = now - timedelta(days=current_weekday + 7)
     last_week_days = [(last_week_monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
@@ -2061,9 +2231,15 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
     goal_note = f" (기준: **{goal_label}** - {goal_reason})" if goal_reason else f" (기준: {goal_label})"
+    if daily_req:
+        today_sub = "✅ 일일 1시간 달성" if today_sec >= 3600 else "⚠️ 일일 1시간 미달 (신규 수습 기준)"
+        rule_desc = "📌 적용 규칙: **일일 최소 1시간 + 주간 누적 11시간** (11/14 이후 가입 수습생)"
+    else:
+        today_sub = "*(일일 최소 시간 제한 없음)*"
+        rule_desc = "📌 적용 규칙: **주간 누적 11시간 이상** (일일 최소 시간 제한 없음)"
 
-    embed = discord.Embed(title=f"🎙️ {target.display_name} 님의 통화방 시간표", color=discord.Color.teal())
-    embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**", inline=True)
+    embed = discord.Embed(title=f"🎙️ {target.display_name} 님의 통화방 시간표", description=rule_desc, color=discord.Color.teal())
+    embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**\n{today_sub}", inline=True)
     embed.add_field(name="🗓️ 이번 주 총합 (월~오늘)", value=f"**{format_seconds(this_week_sec)}**{goal_note}", inline=True)
     embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
     
@@ -2076,11 +2252,11 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     embed.set_footer(text="잠수방, 혼자 있는 경우, 헤드셋 끔 상태에서는 시간이 측정되지 않습니다.")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자 또는 이번 주 목표 미달자를 확인합니다.")
+@bot.tree.command(name="통화미달목록", description="[관리자 전용] 오늘 1시간 미달자(11/14 이후 수습생 대상) 또는 이번 주 목표 미달자를 확인합니다.")
 @app_commands.describe(구분="확인할 기준 (일일 or 주간)")
 @app_commands.choices(구분=[
-    app_commands.Choice(name="📅 오늘 1시간 미달자", value="일일"),
-    app_commands.Choice(name="📊 이번 주 목표시간 미달자", value="주간")
+    app_commands.Choice(name="📅 오늘 1시간 미달자 (11/14 이후 가입 수습생만 해당)", value="일일"),
+    app_commands.Choice(name="📊 이번 주 주간 목표시간 미달자 (전원 해당)", value="주간")
 ])
 async def list_voice_failed(interaction: discord.Interaction, 구분: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
@@ -2102,15 +2278,24 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
 
     if 구분.value == "일일":
         today_records = guild_data.get(today_str, {})
+        current_weekday = now.weekday()
         for member in target_members:
             if is_voice_exempt(guild.id, member.id):
                 continue
+            # 정식 길드원 및 11/14 이전 수습생은 일일 1시간 제한이 없으므로 스킵
+            if not requires_daily_one_hour(guild.id, member):
+                continue
+            # 정기 제외 요일이면 일일 체크 스킵
+            rec_excluded = VOICE_RECURRING_DAYS.get(guild.id, {}).get(str(member.id), {}).get("days", [])
+            if current_weekday in rec_excluded:
+                continue
+
             spent = today_records.get(str(member.id), 0)
             if member.id in VOICE_ACTIVE_SESSIONS and VOICE_ACTIVE_SESSIONS[member.id]["active"]:
                 spent += int((now - VOICE_ACTIVE_SESSIONS[member.id]["start_time"]).total_seconds())
             if spent < 3600:
-                failed_lines.append(f"• {member.mention} ({member.display_name}) : `{format_seconds(spent)}`")
-        title = f"📋 오늘 길드 통화방 1시간 미달자 ({len(failed_lines)}명)"
+                failed_lines.append(f"• {member.mention} ({member.display_name}) : `{format_seconds(spent)}` / 1시간")
+        title = f"📋 오늘 일일 1시간 미달 수습생 ({len(failed_lines)}명) [11/14 이후 가입 수습생 대상]"
     else:
         current_weekday = now.weekday()
         this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(current_weekday + 1)]
@@ -2225,8 +2410,7 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
     warn_entry = {"reason": 사유, "moderator": interaction.user.display_name, "date": now_str}
     await log_warning_action(interaction.guild, 유저.id, "add", warn_entry)
     
-    warnings, _ = await fetch_database_from_channel(interaction.guild)
-    count = len(warnings.get(str(유저.id), []))
+    count = len(WARN_CACHE.get(str(유저.id), []))
 
     embed = discord.Embed(title="⚠️ 경고가 부여되었습니다", description=f"{유저.mention} 님에게 경고가 1회 누적되었습니다.", color=discord.Color.red())
     embed.add_field(name="👤 대상자", value=유저.display_name, inline=True)
@@ -2240,8 +2424,9 @@ async def warn_user(interaction: discord.Interaction, 유저: discord.Member, �
 async def check_warnings(interaction: discord.Interaction, 유저: Optional[discord.Member] = None):
     await interaction.response.defer(ephemeral=True)
     target = 유저 if 유저 else interaction.user
-    warnings, _ = await fetch_database_from_channel(interaction.guild)
-    records = warnings.get(str(target.id), [])
+    if not WARN_CACHE:
+        await fetch_database_from_channel(interaction.guild)
+    records = WARN_CACHE.get(str(target.id), [])
     count = len(records)
     if count == 0:
         await interaction.followup.send(f"✨ **{target.display_name}** 님은 경고가 없습니다! (0회)", ephemeral=True)
@@ -2256,8 +2441,9 @@ async def show_all_warnings(interaction: discord.Interaction):
     if not is_admin_or_mod(interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
-    warnings, _ = await fetch_database_from_channel(interaction.guild)
-    active_warns = {uid: recs for uid, recs in warnings.items() if len(recs) > 0}
+    if not WARN_CACHE:
+        await fetch_database_from_channel(interaction.guild)
+    active_warns = {uid: recs for uid, recs in WARN_CACHE.items() if len(recs) > 0}
     if not active_warns:
         await interaction.followup.send("✨ 현재 서버에 경고를 받은 유저가 한 명도 없습니다!", ephemeral=True)
         return
@@ -2280,14 +2466,15 @@ async def remove_warn(interaction: discord.Interaction, 유저: discord.Member, 
     if count_to_deduct <= 0:
         await interaction.followup.send("❌ 차감할 개수는 **1 이상**의 양수여야 합니다.", ephemeral=True)
         return
-    warnings, _ = await fetch_database_from_channel(interaction.guild)
+    if not WARN_CACHE:
+        await fetch_database_from_channel(interaction.guild)
     u_id = str(유저.id)
-    if u_id not in warnings or len(warnings[u_id]) == 0:
+    if u_id not in WARN_CACHE or len(WARN_CACHE[u_id]) == 0:
         await interaction.followup.send("❌ 차감할 경고가 없습니다.", ephemeral=True)
         return
-    deduct = min(count_to_deduct, len(warnings[u_id]))
+    deduct = min(count_to_deduct, len(WARN_CACHE[u_id]))
     await log_warning_action(interaction.guild, 유저.id, "remove", {"count": deduct})
-    new_count = len(warnings[u_id]) - deduct
+    new_count = len(WARN_CACHE.get(u_id, []))
     await interaction.followup.send(f"✅ **{유저.display_name}** 님의 경고가 **{deduct}회** 차감되었습니다. (현재: **{new_count}회**)", ephemeral=True)
 
 @bot.tree.command(name="경고초기화", description="[관리자 전용] 경고를 초기화합니다.")
@@ -2314,7 +2501,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @commands.has_permissions(administrator=True)
 async def manual_sync(ctx):
     try:
-        # 👇 설명에 '[관리자 전용]'이 들어간 모든 명령어를 자동으로 일반 유저에게 숨김 처리!
         for cmd in ctx.bot.tree.get_commands():
             if "[관리자 전용]" in cmd.description:
                 cmd.default_permissions = discord.Permissions(manage_guild=True)

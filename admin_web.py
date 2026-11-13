@@ -157,7 +157,6 @@ def init_admin_web(app, bot, b):
         if guild is None:
             raise RuntimeError('대상 Discord 서버를 찾을 수 없습니다.')
 
-        # 캐시가 비어있거나 강제 동기화(sync=1) 요청일 때만 채널 히스토리 스캔
         if force_sync or guild.id not in b['VOICE_DAILY_CACHE'] or 'WARN_CACHE' not in b:
             warnings, records = await b['fetch_database_from_channel'](guild)
             b['VOICE_DAILY_CACHE'][guild.id] = records
@@ -211,14 +210,32 @@ def init_admin_web(app, bot, b):
         if action != 'notice' and (not member or member.bot or not b['is_target_member'](member)):
             raise ValueError('관리 대상 길드원이 아닙니다.')
         now = datetime.now(b['KST'])
+
         if action == 'warn_add':
             reason = str(value.get('reason', '')).strip()
             if not 1 <= len(reason) <= 250:
                 raise ValueError('경고 사유를 1~250자로 입력하세요.')
             warn_entry = {'reason': reason, 'moderator': actor, 'date': now.strftime('%Y-%m-%d %H:%M')}
+            # log_warning_action 내부에서 WARN_CACHE에 자동 반영되므로 중복 추가하지 않음
             await b['log_warning_action'](guild, uid, 'add', warn_entry)
-            if 'WARN_CACHE' in b:
-                b['WARN_CACHE'].setdefault(str(uid), []).append(warn_entry)
+
+        elif action == 'warn_remove':
+            try:
+                count = int(value.get('count', 1))
+            except (TypeError, ValueError):
+                count = 1
+            if count < 1:
+                raise ValueError('차감할 개수는 1 이상이어야 합니다.')
+            u_str = str(uid)
+            cur_warns = b.get('WARN_CACHE', {}).get(u_str, [])
+            if not cur_warns:
+                raise ValueError('현재 차감할 경고가 없습니다.')
+            deduct = min(count, len(cur_warns))
+            await b['log_warning_action'](guild, uid, 'remove', {'count': deduct})
+
+        elif action == 'warn_clear':
+            await b['log_warning_action'](guild, uid, 'clear', {})
+
         elif action == 'exempt_add':
             until = str(value.get('until', ''))
             try:
@@ -231,8 +248,10 @@ def init_admin_web(app, bot, b):
             if not 1 <= len(reason) <= 200:
                 raise ValueError('휴가 사유는 1~200자로 입력하세요.')
             await b['log_voice_exempt_action'](guild, uid, 'add', {'until': until, 'reason': reason})
+
         elif action == 'exempt_remove':
             await b['log_voice_exempt_action'](guild, uid, 'remove', {})
+
         elif action == 'goal_set':
             try:
                 hours = float(value.get('hours'))
@@ -245,6 +264,7 @@ def init_admin_web(app, bot, b):
                 raise ValueError('사유는 200자 이하여야 합니다.')
             await b['log_voice_goal_action'](guild, uid, 'set', {
                 'week_start': b['get_current_week_monday'](now), 'target_sec': int(hours * 3600), 'reason': reason})
+
         elif action == 'notice':
             title = str(value.get('title', '')).strip()
             content = str(value.get('content', '')).strip()

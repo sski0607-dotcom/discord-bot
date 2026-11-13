@@ -5,7 +5,7 @@ const $ = s => document.querySelector(s);
 let data = null, page = 'ranking', selected = null;
 const pages = {ranking:'주간 통화 랭킹',daily:'요일별 상세 기록',roster:'길드원 접속 명부',notice:'공지 발송'};
 const secs = n => `${Math.floor(n / 3600)}시간 ${Math.floor((n % 3600) / 60)}분`;
-const esc = t => String(t ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+const esc = t => String(t ?? '').replace(/[&<>"']/g, s => ({'&':'&','<':'<','>':'>','"':'"',"'":'''}[s]));
 const showError = e => {$('#alert').textContent = e; window.scrollTo({top:0,behavior:'smooth'});};
 async function api(path, options={}) {
   const r = await fetch('/admin/api/'+path, {credentials:'same-origin',...options});
@@ -60,17 +60,43 @@ async function post(action, extra, userId=0){
     alert(r.message); $('#member-dialog').close(); await load();
   }catch(e){showError(e.message);}
 }
-document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>{page=b.dataset.page;render();}));
-$('#refresh').addEventListener('click',load);
-document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',async()=>{
+async function handleMemberAction(action){
   if(!selected)return;
-  const action=b.dataset.action; let extra={};
+  let extra={};
   if(action==='warn_add'){const v=prompt('경고 사유 (1~250자)');if(v===null)return;extra.reason=v;}
+  if(action==='warn_remove'){
+    if(!selected.warn_count){alert('현재 차감할 경고가 없습니다.');return;}
+    const v=prompt(`차감할 경고 횟수를 입력하세요 (현재 ${selected.warn_count}회):`,'1');
+    if(v===null)return;
+    extra.count=Number(v)||1;
+  }
+  if(action==='warn_clear'){
+    if(!selected.warn_count){alert('현재 초기화할 경고가 없습니다.');return;}
+    if(!confirm(`[${selected.name}] 님의 모든 경고(${selected.warn_count}회)를 초기화할까요?`))return;
+  }
   if(action==='exempt_add'){const until=prompt('휴가 종료일 (YYYY-MM-DD)');if(until===null)return;const reason=prompt('휴가 사유');if(reason===null)return;extra={until,reason};}
   if(action==='goal_set'){const hours=prompt('주간 목표 시간 (0~11)');if(hours===null)return;const reason=prompt('조정 사유','개별 조정');if(reason===null)return;extra={hours,reason};}
   if(action==='exempt_remove'&&!confirm('이 길드원의 휴가를 해제할까요?'))return;
   await post(action,extra,selected.id);
-}));
+}
+// 팝업창의 기존 버튼 영역(.actions)에 [경고 차감] 및 [경고 초기화] 버튼 자동 추가
+const actionBox = document.querySelector('#member-dialog .actions');
+if(actionBox && !actionBox.querySelector('[data-action="warn_remove"]')){
+  const btnRemove = document.createElement('button');
+  btnRemove.type = 'button';
+  btnRemove.dataset.action = 'warn_remove';
+  btnRemove.textContent = '➖ 경고 차감';
+  actionBox.appendChild(btnRemove);
+
+  const btnClear = document.createElement('button');
+  btnClear.type = 'button';
+  btnClear.dataset.action = 'warn_clear';
+  btnClear.textContent = '🧹 경고 초기화';
+  actionBox.appendChild(btnClear);
+}
+document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>{page=b.dataset.page;render();}));
+$('#refresh').addEventListener('click',load);
+document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>handleMemberAction(b.dataset.action)));
 $('#send-notice').addEventListener('click',async()=>{
   const title=$('#notice-title').value.trim(),content=$('#notice-content').value.trim(),everyone=$('#mention-everyone').checked;
   if(!title||!content)return showError('제목과 내용을 입력하세요.');

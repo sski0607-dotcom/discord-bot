@@ -2314,11 +2314,16 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @commands.has_permissions(administrator=True)
 async def manual_sync(ctx):
     try:
+        # 👇 설명에 '[관리자 전용]'이 들어간 모든 명령어를 자동으로 일반 유저에게 숨김 처리!
+        for cmd in ctx.bot.tree.get_commands():
+            if "[관리자 전용]" in cmd.description:
+                cmd.default_permissions = discord.Permissions(manage_guild=True)
+
         ctx.bot.tree.copy_global_to(guild=ctx.guild)
         synced = await ctx.bot.tree.sync(guild=ctx.guild)
         _, v_records = await fetch_database_from_channel(ctx.guild)
         VOICE_DAILY_CACHE[ctx.guild.id] = v_records
-        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 등록했습니다! 디스코드 새로고침(Ctrl+R) 후 확인해 보세요.")
+        await ctx.send(f"✅ 이 서버에 **{len(synced)}개**의 슬래시 명령어를 등록했습니다! (관리자 명령어 숨김 적용 완료)")
     except Exception as e:
         await ctx.send(f"❌ 동기화 실패: {e}")
 

@@ -36,7 +36,6 @@ def init_admin_web(app, bot, b):
     oauth_secret = os.environ['DISCORD_CLIENT_SECRET']
     guild_id = b['GUILD_ID']
     allowed_ids = {int(x.strip()) for x in os.environ.get('ADMIN_ALLOWED_USER_IDS', '').split(',') if x.strip().isdigit()}
-    # Optional explicit allowlist of administrator Discord user IDs. If empty, use server permission check only.
 
     def on_bot(coro):
         if not bot.is_ready() or bot.loop is None or not bot.loop.is_running():
@@ -153,12 +152,20 @@ def init_admin_web(app, bot, b):
     def admin_index():
         return render_template('dashboard.html', user=session.get('display'), csrf=session['csrf'])
 
-    async def get_snapshot():
+    async def get_snapshot(force_sync=False):
         guild = bot.get_guild(guild_id)
         if guild is None:
             raise RuntimeError('대상 Discord 서버를 찾을 수 없습니다.')
-        warnings, records = await b['fetch_database_from_channel'](guild)
-        b['VOICE_DAILY_CACHE'][guild.id] = records
+
+        # 캐시가 비어있거나 강제 동기화(sync=1) 요청일 때만 채널 히스토리 스캔
+        if force_sync or guild.id not in b['VOICE_DAILY_CACHE'] or 'WARN_CACHE' not in b:
+            warnings, records = await b['fetch_database_from_channel'](guild)
+            b['VOICE_DAILY_CACHE'][guild.id] = records
+            b['WARN_CACHE'] = warnings
+        else:
+            records = b['VOICE_DAILY_CACHE'][guild.id]
+            warnings = b['WARN_CACHE']
+
         now = datetime.now(b['KST'])
         monday = now - timedelta(days=now.weekday())
         days = [(monday + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
@@ -167,7 +174,6 @@ def init_admin_web(app, bot, b):
             if m.bot or not b['is_target_member'](m):
                 continue
             daily = [records.get(day, {}).get(str(m.id), 0) for day in days]
-            # Live uncommitted time is visible as part of the current day, without double counting logged sessions.
             sess = b['VOICE_ACTIVE_SESSIONS'].get(m.id)
             if sess and sess.get('active') and sess.get('guild_id') == guild_id and sess.get('start_time'):
                 daily[now.weekday()] += max(0, int((now - sess['start_time']).total_seconds()))
@@ -191,7 +197,8 @@ def init_admin_web(app, bot, b):
     @require_admin
     def snapshot():
         try:
-            return jsonify(on_bot(get_snapshot()))
+            force = request.args.get('sync') == '1'
+            return jsonify(on_bot(get_snapshot(force_sync=force)))
         except Exception:
             app.logger.exception('snapshot failed')
             return jsonify(error='길드 데이터 조회에 실패했습니다. 잠시 후 새로고침하세요.'), 503
@@ -208,19 +215,22 @@ def init_admin_web(app, bot, b):
             reason = str(value.get('reason', '')).strip()
             if not 1 <= len(reason) <= 250:
                 raise ValueError('경고 사유를 1~250자로 입력하세요.')
-            await b['log_warning_action'](guild, uid, 'add', {'reason':reason, 'moderator': actor, 'date':now.strftime('%Y-%m-%d %H:%M')})
+            warn_entry = {'reason': reason, 'moderator': actor, 'date': now.strftime('%Y-%m-%d %H:%M')}
+            await b['log_warning_action'](guild, uid, 'add', warn_entry)
+            if 'WARN_CACHE' in b:
+                b['WARN_CACHE'].setdefault(str(uid), []).append(warn_entry)
         elif action == 'exempt_add':
-            until = str(value.get('until',''))
+            until = str(value.get('until', ''))
             try:
                 until_date = datetime.strptime(until, '%Y-%m-%d').date()
             except ValueError:
                 raise ValueError('종료일은 YYYY-MM-DD 형식이어야 합니다.')
             if until_date < now.date() or (until_date - now.date()).days > 365:
                 raise ValueError('종료일은 오늘부터 365일 이내여야 합니다.')
-            reason = str(value.get('reason','')).strip()
+            reason = str(value.get('reason', '')).strip()
             if not 1 <= len(reason) <= 200:
                 raise ValueError('휴가 사유는 1~200자로 입력하세요.')
-            await b['log_voice_exempt_action'](guild, uid, 'add', {'until':until, 'reason':reason})
+            await b['log_voice_exempt_action'](guild, uid, 'add', {'until': until, 'reason': reason})
         elif action == 'exempt_remove':
             await b['log_voice_exempt_action'](guild, uid, 'remove', {})
         elif action == 'goal_set':
@@ -230,14 +240,14 @@ def init_admin_web(app, bot, b):
                 raise ValueError('목표 시간을 숫자로 입력하세요.')
             if not 0 <= hours <= 11 or hours != hours:
                 raise ValueError('목표는 0~11시간이어야 합니다.')
-            reason = str(value.get('reason','')).strip()
+            reason = str(value.get('reason', '')).strip()
             if len(reason) > 200:
                 raise ValueError('사유는 200자 이하여야 합니다.')
             await b['log_voice_goal_action'](guild, uid, 'set', {
-                'week_start':b['get_current_week_monday'](now), 'target_sec':int(hours * 3600), 'reason':reason})
+                'week_start': b['get_current_week_monday'](now), 'target_sec': int(hours * 3600), 'reason': reason})
         elif action == 'notice':
-            title = str(value.get('title','')).strip()
-            content = str(value.get('content','')).strip()
+            title = str(value.get('title', '')).strip()
+            content = str(value.get('content', '')).strip()
             everyone = value.get('everyone', False)
             if not isinstance(everyone, bool):
                 raise ValueError('멘션 설정이 올바르지 않습니다.')
@@ -246,13 +256,13 @@ def init_admin_web(app, bot, b):
             channel = guild.get_channel(b['ANNOUNCEMENT_CHANNEL_ID'])
             if channel is None or not isinstance(channel, discord.TextChannel):
                 raise ValueError('공지 채널을 찾지 못했습니다.')
-            msg = f'📢 **[공지] {discord.utils.escape_mentions(title)}**\n\n{discord.utils.escape_mentions(content)}'
+            msg = f'# 📢 [공지] {discord.utils.escape_mentions(title)}\n\n{discord.utils.escape_mentions(content)}'
             if everyone:
                 msg += '\n\n@everyone'
             await channel.send(msg, allowed_mentions=discord.AllowedMentions(everyone=everyone, users=False, roles=False))
         else:
             raise ValueError('지원하지 않는 작업입니다.')
-        return {'ok': True, 'message':'정상 처리되었습니다.'}
+        return {'ok': True, 'message': '정상 처리되었습니다.'}
 
     @app.route('/admin/api/action', methods=['POST'])
     @require_admin
@@ -265,7 +275,7 @@ def init_admin_web(app, bot, b):
             uid = int(data.get('user_id', 0)) if action_type != 'notice' else 0
             if uid < 0:
                 raise ValueError('잘못된 사용자 ID')
-            result = on_bot(run_action(action_type, uid, data, session.get('display','관리자') + ' (' + str(session['uid']) + ')'))
+            result = on_bot(run_action(action_type, uid, data, session.get('display', '관리자') + ' (' + str(session['uid']) + ')'))
             return jsonify(result)
         except (ValueError, TypeError) as exc:
             return jsonify(error=str(exc)), 400

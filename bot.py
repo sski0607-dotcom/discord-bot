@@ -2387,6 +2387,9 @@ async def on_ready():
             
     print(f"로그인 완료: {bot.user.name}")
 
+from admin_web import init_admin_web
+init_admin_web(app, bot, globals())
+
 if __name__ == "__main__":
     keep_alive()
     token = os.getenv("DISCORD_TOKEN")

@@ -2573,6 +2573,72 @@ async def on_ready():
             
     print(f"로그인 완료: {bot.user.name}")
 
+# --- 🔒 [명령어 전용 채널 제한 & 일반 채팅 자동 삭제] ---
+COMMAND_CHANNEL_RULES = {
+    "통화시간": 1569704533905383475,
+    "경고확인": 1571529725241987232,
+}
+COMMAND_ONLY_CHANNEL_IDS = {
+    1569704533905383475: "/통화시간",
+    1571529725241987232: "/경고확인",
+}
+
+@bot.tree.interaction_check
+async def restrict_command_channels(interaction: discord.Interaction) -> bool:
+    if not interaction.command:
+        return True
+    # 관리진은 모든 채널에서 모든 명령어 자유 사용 가능
+    if is_admin_or_mod(interaction):
+        return True
+
+    cmd_name = interaction.command.name
+    ch_id = interaction.channel_id
+
+    # 1. /통화시간 또는 /경고확인을 지정된 채널이 아닌 다른 곳에서 쳤을 때 차단
+    if cmd_name in COMMAND_CHANNEL_RULES:
+        req_ch_id = COMMAND_CHANNEL_RULES[cmd_name]
+        if ch_id != req_ch_id:
+            await interaction.response.send_message(
+                f"❌ `/{cmd_name}` 명령어는 <#{req_ch_id}> 채널에서만 사용할 수 있습니다!",
+                ephemeral=True
+            )
+            return False
+
+    # 2. 통화시간/경고확인 전용 채널에서 엉뚱한 다른 명령어(/무기직업 등)를 쳤을 때 차단
+    if ch_id in COMMAND_ONLY_CHANNEL_IDS:
+        allowed_cmd = COMMAND_ONLY_CHANNEL_IDS[ch_id].lstrip("/")
+        if cmd_name != allowed_cmd:
+            await interaction.response.send_message(
+                f"❌ 이 채널에서는 `{COMMAND_ONLY_CHANNEL_IDS[ch_id]}` 명령어만 사용할 수 있습니다!",
+                ephemeral=True
+            )
+            return False
+
+    return True
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    # 지정된 두 채널에서 관리진이 아닌 일반 길드원이 일반 채팅을 치면 즉시 삭제
+    if message.channel.id in COMMAND_ONLY_CHANNEL_IDS:
+        perms = message.author.guild_permissions
+        is_mod = perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
+        if not is_mod:
+            try:
+                await message.delete()
+                allowed_cmd = COMMAND_ONLY_CHANNEL_IDS[message.channel.id]
+                await message.channel.send(
+                    f"{message.author.mention} ❌ 이 채널은 **`{allowed_cmd}` 명령어 전용 채널**입니다. 일반 채팅은 입력할 수 없습니다!",
+                    delete_after=4.0
+                )
+            except discord.Forbidden:
+                pass
+            return
+
+    await bot.process_commands(message)
+
 from admin_web import init_admin_web
 init_admin_web(app, bot, globals())
 

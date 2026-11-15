@@ -5,7 +5,7 @@ import asyncio
 import hmac
 import os
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from functools import wraps
 from urllib.parse import urlencode
 
@@ -166,26 +166,55 @@ def init_admin_web(app, bot, b):
             warnings = b['WARN_CACHE']
 
         now = datetime.now(b['KST'])
-        monday = now - timedelta(days=now.weekday())
-        days = [(monday + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+        cur_weekday = now.weekday()
+        monday_dt = (now - timedelta(days=cur_weekday)).date()
+        day_objs = [monday_dt + timedelta(days=i) for i in range(7)]
+        days = [d.strftime('%Y-%m-%d') for d in day_objs]
+        cutoff_date = b.get('DAILY_RULE_CUTOFF_DATE', date(2026, 11, 14))
+        weekdays_ko = b.get('WEEKDAYS_KO', ['월', '화', '수', '목', '금', '토', '일'])
+
         members = []
         for m in guild.members:
             if m.bot or not b['is_target_member'](m):
                 continue
-            daily = [records.get(day, {}).get(str(m.id), 0) for day in days]
+            u_str = str(m.id)
+            daily = [records.get(day, {}).get(u_str, 0) for day in days]
             sess = b['VOICE_ACTIVE_SESSIONS'].get(m.id)
             if sess and sess.get('active') and sess.get('guild_id') == guild_id and sess.get('start_time'):
-                daily[now.weekday()] += max(0, int((now - sess['start_time']).total_seconds()))
+                daily[cur_weekday] += max(0, int((now - sess['start_time']).total_seconds()))
+
             target, reason = b['get_user_weekly_goal'](guild_id, m.id, now)
             ex = b['is_voice_exempt'](guild_id, m.id)
+
+            # 11/14 이후 가입 수습생 여부 및 요일별 1시간 달성 상태 계산
+            daily_req = b['requires_daily_one_hour'](guild_id, m) if 'requires_daily_one_hour' in b else False
+            join_dt = b['get_member_effective_join_date'](guild_id, m) if 'get_member_effective_join_date' in b else monday_dt
+            rec_excluded = b.get('VOICE_RECURRING_DAYS', {}).get(guild_id, {}).get(u_str, {}).get('days', [])
+
+            daily_flags = []
+            missed_days = []
+            for idx, d_obj in enumerate(day_objs):
+                if not daily_req or idx > cur_weekday:
+                    daily_flags.append('')
+                elif ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
+                    daily_flags.append('exempt')
+                elif daily[idx] >= 3600:
+                    daily_flags.append('ok')
+                else:
+                    daily_flags.append('fail')
+                    missed_days.append(weekdays_ko[idx])
+
             members.append({
-                'id': str(m.id), 'name': m.display_name,
+                'id': u_str, 'name': m.display_name,
                 'roles': [r.name for r in m.roles if r.name in b['TARGET_ROLES']],
                 'daily_secs': daily, 'week_sec': sum(daily),
                 'goal_sec': target, 'goal_reason': reason or '',
+                'daily_req': daily_req,
+                'daily_flags': daily_flags,
+                'missed_days': missed_days,
                 'is_exempt': bool(ex), 'exempt_desc': (f"~{ex['until']} | {ex['reason']}" if ex else ''),
                 'voice': m.voice.channel.name if m.voice and m.voice.channel else None,
-                'warn_count': len(warnings.get(str(m.id), []))
+                'warn_count': len(warnings.get(u_str, []))
             })
         members.sort(key=lambda x: (x['is_exempt'], -x['week_sec']))
         global_goal = b['VOICE_GLOBAL_GOALS'].get(guild_id)
@@ -216,7 +245,6 @@ def init_admin_web(app, bot, b):
             if not 1 <= len(reason) <= 250:
                 raise ValueError('경고 사유를 1~250자로 입력하세요.')
             warn_entry = {'reason': reason, 'moderator': actor, 'date': now.strftime('%Y-%m-%d %H:%M')}
-            # log_warning_action 내부에서 WARN_CACHE에 자동 반영되므로 중복 추가하지 않음
             await b['log_warning_action'](guild, uid, 'add', warn_entry)
 
         elif action == 'warn_remove':

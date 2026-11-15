@@ -117,14 +117,13 @@ VOICE_GLOBAL_GOALS: Dict[int, dict] = {}
 # 📅 매주 정기 불가 요일 설정
 VOICE_RECURRING_DAYS: Dict[int, Dict[str, dict]] = {}
 
-# 🌱 수습생 입단일 및 연장/알림 기록 {guild_id: {user_id_str: {"join_date": "YYYY-MM-DD", "extra_days": int, "notified": bool}}}
+# 🌱 수습생 입단일 및 연장/알림 기록
 PROBATION_RECORDS: Dict[int, Dict[str, dict]] = {}
 
 def get_probation_days(guild_id: int) -> int:
     return PROBATION_DAYS_CONFIG.get(guild_id, DEFAULT_PROBATION_DAYS)
 
 def get_member_effective_join_date(guild_id: int, member: discord.Member) -> date:
-    """수습 기록의 입단일 또는 디스코드 서버 합류일을 반환"""
     rec = PROBATION_RECORDS.get(guild_id, {}).get(str(member.id))
     if rec and rec.get("join_date"):
         try:
@@ -136,10 +135,6 @@ def get_member_effective_join_date(guild_id: int, member: discord.Member) -> dat
     return datetime.now(KST).date()
 
 def requires_daily_one_hour(guild_id: int, member: discord.Member) -> bool:
-    """
-    11월 14일 이후 가입한 수습생만 일일 최소 1시간 참여 의무 적용.
-    정식 길드원 및 11월 14일 이전 가입자는 일일 제한 없음(False).
-    """
     if not is_probation_member(member):
         return False
     join_dt = get_member_effective_join_date(guild_id, member)
@@ -1005,7 +1000,6 @@ async def daily_voice_check():
                             await log_voice_duration(guild, u_id, yesterday_str, before_midnight)
                         sess["start_time"] = exact_midnight
 
-            # 🌱 매일 낮 12시(12:00) 수습생 승급 만료 여부 자동 체크
             if now.hour == 12 and now.minute == 0:
                 base_req_days = get_probation_days(guild.id)
                 admin_ch_id = VERIFY_ADMIN_CHANNELS.get(guild.id) or WARN_LOG_CHANNEL_ID
@@ -1047,7 +1041,6 @@ async def daily_voice_check():
                             await admin_ch.send(embed=embed_prom, view=PromoteView())
                             await log_probation_action(guild, member.id, "notified")
 
-            # 📊 매주 월요일 자정 주간 결산 (정식 길드원: 주간 11시간만 / 11월 14일 이후 수습생: 일일 1시간 + 주간 11시간)
             if now.hour == 0 and now.weekday() == 0:
                 if guild.id not in VOICE_DAILY_CACHE:
                     _, v_records = await fetch_database_from_channel(guild)
@@ -1089,7 +1082,6 @@ async def daily_voice_check():
                             goal_sec, goal_reason = get_user_weekly_goal(guild.id, member.id, yesterday_dt)
                             week_spent = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_strs)
                             
-                            # 11월 14일 이후 가입 수습생인지 확인
                             daily_req = requires_daily_one_hour(guild.id, member)
                             missed_days_ko = []
                             if daily_req:
@@ -1319,7 +1311,6 @@ class ReviewView(discord.ui.View):
             except discord.Forbidden:
                 pass
 
-        # 🌱 수습생 직급으로 승인된 경우 입단일 자동 기록
         if chosen_role_name in PROBATION_ROLE_MAP:
             today_str = datetime.now(KST).strftime("%Y-%m-%d")
             await log_probation_action(guild, member.id, "start", {"join_date": today_str, "extra_days": 0})
@@ -1525,7 +1516,6 @@ class NoticePaginationView(discord.ui.View):
 
 # --- 슬래시 명령어 세트 ---
 
-# 🌱 [수습생 승급 기준 일수 설정 (기본 7일)]
 @bot.tree.command(name="수습기간설정", description="[관리자 전용] 수습생 기본 수습 기간 일수(기본 7일)를 변경합니다.")
 @app_commands.describe(일수="승급 알림이 울릴 기본 수습 기간 일수 (기본값: 7)")
 async def set_probation_period(interaction: discord.Interaction, 일수: int):
@@ -1541,7 +1531,6 @@ async def set_probation_period(interaction: discord.Interaction, 일수: int):
     await log_probation_config(interaction.guild, 일수)
     await interaction.followup.send(f"✅ 수습생 기본 수습 기간이 **{일수}일**로 설정되었습니다! (매일 낮 12시에 만료자를 자동 체크합니다)", ephemeral=True)
 
-# ⏳ [신규: 수습 기간 1주일(+7일) 수동 연장 명령어]
 @bot.tree.command(name="수습연장", description="[관리자 전용] 특정 수습생의 수습 기간을 1주일(+7일) 연장합니다.")
 @app_commands.describe(유저="수습 기간을 연장할 수습생", 일수="추가할 연장 일수 (기본 7일)")
 async def extend_member_probation(interaction: discord.Interaction, 유저: discord.Member, 일수: int = 7):
@@ -1569,7 +1558,6 @@ async def extend_member_probation(interaction: discord.Interaction, 유저: disc
         ephemeral=True
     )
 
-# 🌱 [수습생 현황 및 남은 일수 조회]
 @bot.tree.command(name="수습생현황", description="[관리자 전용] 현재 수습생들의 입단일, 연장 여부, 정식 승급까지 남은 일수를 조회합니다.")
 async def check_probation_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -1614,7 +1602,6 @@ async def check_probation_status(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-# 📅 [매주 정기 불가 요일 설정]
 @bot.tree.command(name="정기요일제외설정", description="[관리자 전용] 학원·알바 등으로 매주 특정 요일마다 참여 불가한 유저의 목표 시간을 자동 비례 감면합니다.")
 @app_commands.describe(유저="정기 요일 제외 대상 멤버", 제외요일="매주 제외할 요일 (쉼표로 구분, 예: 화,목 또는 수)", 사유="사유 (예: 학원, 알바)")
 async def set_recurring_excluded_days(interaction: discord.Interaction, 유저: discord.Member, 제외요일: str, 사유: str = "정기 일정"):
@@ -1627,7 +1614,7 @@ async def set_recurring_excluded_days(interaction: discord.Interaction, 유저: 
     parsed_days = []
     for tok in raw_tokens:
         if tok not in WEEKDAY_MAP:
-            await interaction.followup.send(f"❌ 올바른 요일을 입력해 주세요. (`월, 화, 수, 목, 금, 토, 일` 중 선택, 예: `화,목`)", ephemeral=True)
+            await interaction.followup.send("❌ 올바른 요일을 입력해 주세요. (`월, 화, 수, 목, 금, 토, 일` 중 선택, 예: `화,목`)", ephemeral=True)
             return
         day_idx = WEEKDAY_MAP[tok]
         if day_idx not in parsed_days:
@@ -2282,10 +2269,8 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         for member in target_members:
             if is_voice_exempt(guild.id, member.id):
                 continue
-            # 정식 길드원 및 11/14 이전 수습생은 일일 1시간 제한이 없으므로 스킵
             if not requires_daily_one_hour(guild.id, member):
                 continue
-            # 정기 제외 요일이면 일일 체크 스킵
             rec_excluded = VOICE_RECURRING_DAYS.get(guild.id, {}).get(str(member.id), {}).get("days", [])
             if current_weekday in rec_excluded:
                 continue
@@ -2489,6 +2474,8 @@ async def clear_warn(interaction: discord.Interaction, 유저: discord.Member):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        return
     err_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     await send_error_log(interaction.guild, f"Command Error: /{interaction.command.name if interaction.command else 'Unknown'}", err_text)
     msg = f"❌ 명령어 실행 중 오류가 발생했습니다: `{error}`"
@@ -2583,18 +2570,15 @@ COMMAND_ONLY_CHANNEL_IDS = {
     1571529725241987232: "/경고확인",
 }
 
-@bot.tree.interaction_check
 async def restrict_command_channels(interaction: discord.Interaction) -> bool:
     if not interaction.command:
         return True
-    # 관리진은 모든 채널에서 모든 명령어 자유 사용 가능
     if is_admin_or_mod(interaction):
         return True
 
     cmd_name = interaction.command.name
     ch_id = interaction.channel_id
 
-    # 1. /통화시간 또는 /경고확인을 지정된 채널이 아닌 다른 곳에서 쳤을 때 차단
     if cmd_name in COMMAND_CHANNEL_RULES:
         req_ch_id = COMMAND_CHANNEL_RULES[cmd_name]
         if ch_id != req_ch_id:
@@ -2604,7 +2588,6 @@ async def restrict_command_channels(interaction: discord.Interaction) -> bool:
             )
             return False
 
-    # 2. 통화시간/경고확인 전용 채널에서 엉뚱한 다른 명령어(/무기직업 등)를 쳤을 때 차단
     if ch_id in COMMAND_ONLY_CHANNEL_IDS:
         allowed_cmd = COMMAND_ONLY_CHANNEL_IDS[ch_id].lstrip("/")
         if cmd_name != allowed_cmd:
@@ -2616,12 +2599,14 @@ async def restrict_command_channels(interaction: discord.Interaction) -> bool:
 
     return True
 
+# discord.py 2.7.1 호환 할당 방식
+bot.tree.interaction_check = restrict_command_channels
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # 지정된 두 채널에서 관리진이 아닌 일반 길드원이 일반 채팅을 치면 즉시 삭제
     if message.channel.id in COMMAND_ONLY_CHANNEL_IDS:
         perms = message.author.guild_permissions
         is_mod = perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members

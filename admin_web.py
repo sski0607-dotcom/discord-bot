@@ -1,257 +1,410 @@
-'use strict';
-const app = document.querySelector('#app');
-const csrf = app.dataset.csrf;
-const $ = s => document.querySelector(s);
-let data = null, page = 'ranking', selected = null;
-let currentFilter = 'ALL', searchQuery = '';
+import asyncio
+import hmac
+import os
+import secrets
+from datetime import datetime, timedelta, date
+from functools import wraps
+from urllib.parse import urlencode
 
-const pages = {ranking:'주간 통화 랭킹',daily:'요일별 상세 기록',roster:'길드원 접속 명부',notice:'공지 발송'};
-const secs = n => Math.floor(n / 3600) + '시간 ' + Math.floor((n % 3600) / 60) + '분';
-const esc = t => String(t ?? '').replaceAll('&', '&').replaceAll('<', '<').replaceAll('>', '>').replaceAll('"', '"');
-const showError = e => {$('#alert').textContent = e; window.scrollTo({top:0,behavior:'smooth'});};
+import discord
+import requests
+from flask import abort, jsonify, redirect, render_template, request, session, url_for
 
-function formatRoleLabel(v) {
-  let base = v.roles.join(', ');
-  if (v.is_probation && v.prob_desc) {
-    base += ' [' + v.prob_desc + ']';
-  }
-  if (v.daily_req) {
-    base += ' (일1h)';
-  }
-  return base;
-}
+DISCORD_API = 'https://discord.com/api/v10'
 
-function formatDayCell(v, sec, idx) {
-  const flag = (v.daily_flags && v.daily_flags[idx]) ? v.daily_flags[idx] : '';
-  if (flag === 'ok') return '✅ ' + secs(sec);
-  if (flag === 'fail') return '⚠️ ' + secs(sec);
-  if (flag === 'exempt') return '➖ ' + secs(sec);
-  return secs(sec);
-}
 
-function ensureFilterBar() {
-  const tablePanel = $('#table-panel');
-  if (!tablePanel || $('#filter-bar')) return;
+def init_admin_web(app, bot, b):
+    secret = os.environ.get('WEB_SESSION_SECRET', '')
+    if len(secret) < 32:
+        raise RuntimeError('WEB_SESSION_SECRET 환경변수에 32자 이상의 무작위 문자열을 설정하세요.')
+    if not all(os.environ.get(k) for k in ('DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI')):
+        raise RuntimeError('DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI 설정이 필요합니다.')
+    redirect_uri = os.environ['DISCORD_REDIRECT_URI']
+    if not redirect_uri.startswith('https://'):
+        raise RuntimeError('DISCORD_REDIRECT_URI는 HTTPS 주소여야 합니다.')
+    if not int(b['GUILD_ID']):
+        raise RuntimeError('GUILD_ID 환경변수 설정이 필요합니다.')
 
-  const bar = document.createElement('div');
-  bar.id = 'filter-bar';
-  bar.className = 'actions';
-  bar.style.marginTop = '0';
-  bar.style.marginBottom = '16px';
+    app.secret_key = secret
+    app.config.update(
+        SESSION_COOKIE_SECURE=True,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE='Lax',
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+        MAX_CONTENT_LENGTH=16 * 1024
+    )
+    oauth_id = os.environ['DISCORD_CLIENT_ID']
+    oauth_secret = os.environ['DISCORD_CLIENT_SECRET']
+    guild_id = b['GUILD_ID']
+    allowed_ids = {int(x.strip()) for x in os.environ.get('ADMIN_ALLOWED_USER_IDS', '').split(',') if x.strip().isdigit()}
 
-  const filters = [
-    ['ALL', '전체'],
-    ['월영', '월영'],
-    ['영월', '영월'],
-    ['은월', '은월'],
-    ['PROB', '🌱 수습생만']
-  ];
+    def on_bot(coro):
+        if not bot.is_ready() or bot.loop is None or not bot.loop.is_running():
+            raise RuntimeError('디스코드 봇이 아직 준비되지 않았습니다.')
+        return asyncio.run_coroutine_threadsafe(coro, bot.loop).result(timeout=35)
 
-  filters.forEach(f => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.dataset.filter = f[0];
-    btn.textContent = f[1];
-    if (f[0] === currentFilter) btn.className = 'primary';
-    btn.addEventListener('click', () => {
-      currentFilter = f[0];
-      bar.querySelectorAll('[data-filter]').forEach(b => {
-        b.className = (b.dataset.filter === currentFilter) ? 'primary' : '';
-      });
-      render();
-    });
-    bar.appendChild(btn);
-  });
+    async def auth_member(uid):
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return None
+        try:
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+        perms = member.guild_permissions
+        if not (perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members):
+            return None
+        if allowed_ids and uid not in allowed_ids:
+            return None
+        return member
 
-  const searchInput = document.createElement('input');
-  searchInput.type = 'text';
-  searchInput.id = 'member-search';
-  searchInput.placeholder = '🔍 닉네임 검색...';
-  searchInput.style.marginTop = '0';
-  searchInput.style.maxWidth = '240px';
-  searchInput.addEventListener('input', e => {
-    searchQuery = e.target.value.trim().toLowerCase();
-    render();
-  });
-  bar.appendChild(searchInput);
+    def require_admin(fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            uid = session.get('uid')
+            if not uid:
+                if request.path.startswith('/admin/api/'):
+                    return jsonify(error='로그인이 필요합니다.'), 401
+                return redirect(url_for('admin_login'))
+            try:
+                member = on_bot(auth_member(int(uid)))
+            except (ValueError, RuntimeError, TimeoutError) as exc:
+                return jsonify(error=str(exc)), 503
+            if member is None:
+                session.clear()
+                if request.path.startswith('/admin/api/'):
+                    return jsonify(error='관리자 권한이 없습니다.'), 403
+                return redirect(url_for('admin_denied'))
+            if request.method == 'POST':
+                csrf = request.headers.get('X-CSRF-Token', '')
+                if not csrf or not hmac.compare_digest(csrf, str(session.get('csrf', ''))):
+                    return jsonify(error='CSRF 검증 실패. 새로고침 후 다시 시도하세요.'), 403
+                if not request.is_json:
+                    return jsonify(error='JSON 요청만 허용됩니다.'), 415
+            return fn(*args, **kwargs)
+        return inner
 
-  tablePanel.insertBefore(bar, tablePanel.firstChild);
-}
+    @app.after_request
+    def security_headers(resp):
+        if request.path.startswith('/admin'):
+            resp.headers['Cache-Control'] = 'no-store'
+            resp.headers['X-Content-Type-Options'] = 'nosniff'
+            resp.headers['X-Frame-Options'] = 'DENY'
+            resp.headers['Referrer-Policy'] = 'same-origin'
+            resp.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self' https://discord.com; frame-ancestors 'none'"
+        return resp
 
-function getFilteredMembers(members) {
-  return members.filter(v => {
-    const roleStr = v.roles.join(' ');
-    if (currentFilter === 'PROB' && !v.is_probation) return false;
-    if (currentFilter !== 'ALL' && currentFilter !== 'PROB' && !roleStr.includes(currentFilter)) return false;
-    if (searchQuery && !v.name.toLowerCase().includes(searchQuery)) return false;
-    return true;
-  });
-}
+    @app.route('/admin/login')
+    def admin_login():
+        state = secrets.token_urlsafe(32)
+        session.clear()
+        session['oauth_state'] = state
+        session.permanent = True
+        params = {
+            'client_id': oauth_id,
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'scope': 'identify',
+            'state': state,
+            'prompt': 'none' if request.args.get('silent') == '1' else 'consent'
+        }
+        return redirect('https://discord.com/oauth2/authorize?' + urlencode(params))
 
-async function api(path, options={}) {
-  const r = await fetch('/admin/api/'+path, {credentials:'same-origin',...options});
-  const d = await r.json().catch(()=>({error:'서버 응답 오류'}));
-  if(!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-  return d;
-}
+    @app.route('/admin/callback')
+    def admin_callback():
+        state = session.pop('oauth_state', None)
+        if not state or not hmac.compare_digest(str(state), request.args.get('state', '')):
+            return 'OAuth2 state 검증 실패. /admin/login에서 다시 시도하세요.', 403
+        code = request.args.get('code', '')
+        if not code:
+            return 'Discord 로그인이 취소되었습니다.', 400
+        try:
+            r = requests.post(DISCORD_API + '/oauth2/token', data={
+                'client_id': oauth_id,
+                'client_secret': oauth_secret,
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': redirect_uri
+            }, timeout=12)
+            r.raise_for_status()
+            access_token = r.json()['access_token']
+            u = requests.get(DISCORD_API + '/users/@me', headers={'Authorization': 'Bearer ' + access_token}, timeout=12)
+            u.raise_for_status()
+            user = u.json()
+            uid = int(user['id'])
+            member = on_bot(auth_member(uid))
+            if member is None:
+                session.clear()
+                return redirect(url_for('admin_denied'))
+            session.clear()
+            session.permanent = True
+            session['uid'] = uid
+            session['display'] = user.get('global_name') or user.get('username') or str(uid)
+            session['csrf'] = secrets.token_urlsafe(32)
+            return redirect(url_for('admin_index'))
+        except (requests.RequestException, KeyError, ValueError, RuntimeError, TimeoutError):
+            session.clear()
+            return '로그인 처리에 실패했습니다. Discord 설정 및 봇 연결 상태를 확인하세요.', 502
 
-async function load() {
-  $('#alert').textContent=''; $('#refresh').disabled=true;
-  try {data=await api('snapshot'); render();}
-  catch(e){showError(e.message);}
-  finally{$('#refresh').disabled=false;}
-}
+    @app.route('/admin/denied')
+    def admin_denied():
+        return '접근이 거부되었습니다. 이 서버의 관리 권한이 있는 Discord 계정만 사용할 수 있습니다.', 403
 
-function render() {
-  ensureFilterBar();
-  $('#page-title').textContent=pages[page];
-  $('#last-updated').textContent=data?('최종 조회: ' + data.updated_at + ' (한국시간)'):'데이터 없음';
-  $('#notice-panel').classList.toggle('hidden',page!=='notice');
-  $('#table-panel').classList.toggle('hidden',page==='notice');
-  $('#summary').classList.toggle('hidden',page==='notice');
-  document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page));
-  if(!data || page==='notice') return;
+    @app.route('/admin/logout', methods=['POST'])
+    @require_admin
+    def admin_logout():
+        session.clear()
+        return jsonify(ok=True)
 
-  const allM = data.members;
-  const m = getFilteredMembers(allM);
-  const probCount = allM.filter(v=>v.is_probation).length;
-  const cards=[
-    ['표시 인원 / 전체', m.length + '명 / ' + allM.length + '명'],
-    ['현재 통화 접속', allM.filter(v=>v.voice).length + '명'],
-    ['수습생 / 휴가자', '수습 ' + probCount + '명 · 휴가 ' + allM.filter(v=>v.is_exempt).length + '명'],
-    ['기본 주간 목표', secs(data.week_goal_sec)]
-  ];
-  $('#summary').innerHTML=cards.map(c=>'<div class="stat"><span>'+esc(c[0])+'</span><strong>'+esc(c[1])+'</strong></div>').join('');
+    @app.route('/admin')
+    @require_admin
+    def admin_index():
+        return render_template('dashboard.html', user=session.get('display'), csrf=session['csrf'])
 
-  let head=[], rows=[];
-  if(page==='ranking') {
-    head=['순위','닉네임','소속 / 수습·기준','누적 시간','주간 목표','달성 상태','경고'];
-    let rank=0;
-    rows=m.map(v=>{
-      if(!v.is_exempt)rank++;
-      let pct=v.goal_sec?Math.min(100,Math.floor(v.week_sec/v.goal_sec*100)):100;
-      let statusText = v.is_exempt ? '면제' : (pct + '%');
-      if(!v.is_exempt && v.daily_req && v.missed_days && v.missed_days.length > 0){
-        statusText += ' (⚠️일일미달: ' + v.missed_days.join(',') + ')';
-      }
-      let goalText = secs(v.goal_sec) + (v.daily_req ? ' + 일1h' : '');
-      return [v.is_exempt?'휴가':String(rank),v.name,formatRoleLabel(v),secs(v.week_sec),goalText,statusText,v.warn_count+'회'];
-    });
-  }else if(page==='daily'){
-    head=['닉네임','소속 / 수습·기준',...data.week_days.map((x,i)=>'월화수목금토일'[i]+' ('+x.slice(5)+')'),'주간 합계'];
-    rows=m.map(v=>[v.name,formatRoleLabel(v),...v.daily_secs.map((sec,idx)=>formatDayCell(v,sec,idx)),secs(v.week_sec)]);
-  }else{
-    head=['닉네임','소속 / 수습·기준','현재 음성 채널','출결 상태','경고'];
-    rows=m.map(v=>{
-      let st = v.is_exempt ? ('휴가 ' + v.exempt_desc) : '정상 집계 (주간 11h)';
-      if(!v.is_exempt && v.daily_req){
-        st = (v.missed_days && v.missed_days.length > 0)
-          ? ('⚠️ 일일 1h 미달 (' + v.missed_days.join(',') + ')')
-          : '✅ 일일 1h 정상 달성 중';
-      }
-      return [v.name,formatRoleLabel(v),v.voice||'미접속',st,v.warn_count+'회'];
-    });
-  }
-  $('#table-head').innerHTML='<tr>'+head.map(v=>'<th>'+esc(v)+'</th>').join('')+'</tr>';
-  $('#table-body').innerHTML=rows.map((row,i)=>'<tr class="member-row" data-index="'+i+'">'+row.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('');
-  document.querySelectorAll('[data-index]').forEach(tr=>tr.addEventListener('click',()=>openMember(m[Number(tr.dataset.index)])));
-}
+    async def get_snapshot(force_sync=False):
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            raise RuntimeError('대상 Discord 서버를 찾을 수 없습니다.')
 
-function openMember(m){
-  selected=m;
-  $('#dialog-title').textContent=m.name+' · 관리';
-  const ruleText = m.daily_req ? '일일 1시간 + 주간 ' + secs(m.goal_sec) + ' (11/14 이후 수습)' : '주간 ' + secs(m.goal_sec) + ' (일일 제한 없음)';
-  const dailyStatus = m.daily_req
-    ? ((m.missed_days && m.missed_days.length > 0) ? ('⚠️ 미달 요일: ' + m.missed_days.join(', ')) : '✅ 미달 요일 없음')
-    : '해당 없음 (정식 길드원)';
-  const probStatus = m.is_probation
-    ? ('🌱 ' + m.prob_desc + ' (입단: ' + m.join_date + ')')
-    : '정식 길드원';
+        if force_sync or guild.id not in b['VOICE_DAILY_CACHE'] or 'WARN_CACHE' not in b:
+            warnings, records = await b['fetch_database_from_channel'](guild)
+            b['VOICE_DAILY_CACHE'][guild.id] = records
+            b['WARN_CACHE'] = warnings
+        else:
+            records = b['VOICE_DAILY_CACHE'][guild.id]
+            warnings = b['WARN_CACHE']
 
-  const fields=[
-    ['소속',m.roles.join(', ')],
-    ['수습 상태',probStatus],
-    ['적용 출결 규칙',ruleText],
-    ['주간 누적',secs(m.week_sec)],
-    ['일일 1시간 체크',dailyStatus],
-    ['경고',m.warn_count+'회'],
-    ['음성 채널',m.voice||'미접속'],
-    ['휴가 상태',m.is_exempt?m.exempt_desc:'정상']
-  ];
-  $('#member-content').innerHTML='<div class="detail-grid">'+fields.map(f=>'<div><span>'+esc(f[0])+'</span>'+esc(f[1])+'</div>').join('')+'</div><h4>요일별 시간</h4><p>'+m.daily_secs.map((v,i)=>'월화수목금토일'[i]+': '+formatDayCell(m,v,i)).join(' / ')+'</p>';
+        now = datetime.now(b['KST'])
+        now_date = now.date()
+        cur_weekday = now.weekday()
+        monday_dt = now_date - timedelta(days=cur_weekday)
+        day_objs = [monday_dt + timedelta(days=i) for i in range(7)]
+        days = [d.strftime('%Y-%m-%d') for d in day_objs]
+        cutoff_date = b.get('DAILY_RULE_CUTOFF_DATE', date(2026, 11, 14))
+        weekdays_ko = b.get('WEEKDAYS_KO', ['월', '화', '수', '목', '금', '토', '일'])
+        base_prob_days = b['get_probation_days'](guild_id) if 'get_probation_days' in b else 7
+        prob_recs = b.get('PROBATION_RECORDS', {}).get(guild_id, {})
+        prob_map = b.get('PROBATION_ROLE_MAP', {})
 
-  const btnPromote = document.querySelector('[data-action="prob_promote"]');
-  const btnExtend = document.querySelector('[data-action="prob_extend"]');
-  if (btnPromote) btnPromote.classList.toggle('hidden', !m.is_probation);
-  if (btnExtend) btnExtend.classList.toggle('hidden', !m.is_probation);
+        members = []
+        for m in guild.members:
+            if m.bot or not b['is_target_member'](m):
+                continue
+            u_str = str(m.id)
+            daily = [records.get(day, {}).get(u_str, 0) for day in days]
+            sess = b['VOICE_ACTIVE_SESSIONS'].get(m.id)
+            if sess and sess.get('active') and sess.get('guild_id') == guild_id and sess.get('start_time'):
+                daily[cur_weekday] += max(0, int((now - sess['start_time']).total_seconds()))
 
-  $('#member-dialog').showModal();
-}
+            target, reason = b['get_user_weekly_goal'](guild_id, m.id, now)
+            ex = b['is_voice_exempt'](guild_id, m.id)
 
-async function post(action, extra, userId=0){
-  try{
-    const r=await api('action',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action,user_id:userId,...extra})});
-    alert(r.message); $('#member-dialog').close(); await load();
-  }catch(e){showError(e.message);}
-}
+            daily_req = b['requires_daily_one_hour'](guild_id, m) if 'requires_daily_one_hour' in b else False
+            join_dt = b['get_member_effective_join_date'](guild_id, m) if 'get_member_effective_join_date' in b else monday_dt
+            rec_excluded = b.get('VOICE_RECURRING_DAYS', {}).get(guild_id, {}).get(u_str, {}).get('days', [])
 
-async function handleMemberAction(action){
-  if(!selected)return;
-  let extra={};
-  if(action==='warn_add'){const v=prompt('경고 사유 (1~250자)');if(v===null)return;extra.reason=v;}
-  if(action==='warn_remove'){
-    if(!selected.warn_count){alert('현재 차감할 경고가 없습니다.');return;}
-    const v=prompt('차감할 경고 횟수를 입력하세요 (현재 '+selected.warn_count+'회):','1');
-    if(v===null)return;
-    extra.count=Number(v)||1;
-  }
-  if(action==='warn_clear'){
-    if(!selected.warn_count){alert('현재 초기화할 경고가 없습니다.');return;}
-    if(!confirm('['+selected.name+'] 님의 모든 경고('+selected.warn_count+'회)를 초기화할까요?'))return;
-  }
-  if(action==='prob_promote'){
-    if(!confirm('['+selected.name+'] 님을 정식 길드원으로 즉시 승급할까요?'))return;
-  }
-  if(action==='prob_extend'){
-    const v=prompt('연장할 수습 일수를 입력하세요 (기본 7일):','7');
-    if(v===null)return;
-    extra.days=Number(v)||7;
-  }
-  if(action==='exempt_add'){const until=prompt('휴가 종료일 (YYYY-MM-DD)');if(until===null)return;const reason=prompt('휴가 사유');if(reason===null)return;extra={until,reason};}
-  if(action==='goal_set'){const hours=prompt('주간 목표 시간 (0~11)');if(hours===null)return;const reason=prompt('조정 사유','개별 조정');if(reason===null)return;extra={hours,reason};}
-  if(action==='exempt_remove'&&!confirm('이 길드원의 휴가를 해제할까요?'))return;
-  await post(action,extra,selected.id);
-}
+            is_prob = any(r.name in prob_map for r in m.roles)
+            prob_desc = ''
+            if is_prob:
+                rec = prob_recs.get(u_str, {})
+                extra_d = int(rec.get('extra_days', 0))
+                total_req_d = base_prob_days + extra_d
+                elapsed_d = (now_date - join_dt).days
+                remain_d = total_req_d - elapsed_d
+                ext_note = f' (+{extra_d}일 연장)' if extra_d > 0 else ''
+                if remain_d <= 0:
+                    prob_desc = f'🔔승급대상 ({elapsed_d}/{total_req_d}일){ext_note}'
+                else:
+                    prob_desc = f'D-{remain_d} ({elapsed_d}/{total_req_d}일){ext_note}'
 
-const actionBox = document.querySelector('#member-dialog .actions');
-if(actionBox && !actionBox.querySelector('[data-action="warn_remove"]')){
-  const extraButtons = [
-    ['warn_remove', '➖ 경고 차감', ''],
-    ['warn_clear', '🧹 경고 초기화', ''],
-    ['prob_promote', '⬆️ 정식 승급', 'primary'],
-    ['prob_extend', '⏳ 수습 +7일 연장', '']
-  ];
-  extraButtons.forEach(item => {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.dataset.action = item[0];
-    btn.textContent = item[1];
-    if (item[2]) btn.className = item[2];
-    actionBox.appendChild(btn);
-  });
-}
+            daily_flags = []
+            missed_days = []
+            for idx, d_obj in enumerate(day_objs):
+                if not daily_req or idx > cur_weekday:
+                    daily_flags.append('')
+                elif ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
+                    daily_flags.append('exempt')
+                elif daily[idx] >= 3600:
+                    daily_flags.append('ok')
+                else:
+                    daily_flags.append('fail')
+                    missed_days.append(weekdays_ko[idx])
 
-document.querySelectorAll('[data-page]').forEach(b=>b.addEventListener('click',()=>{page=b.dataset.page;render();}));
-$('#refresh').addEventListener('click',load);
-document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>handleMemberAction(b.dataset.action)));
-$('#send-notice').addEventListener('click',async()=>{
-  const title=$('#notice-title').value.trim(),content=$('#notice-content').value.trim(),everyone=$('#mention-everyone').checked;
-  if(!title||!content)return showError('제목과 내용을 입력하세요.');
-  if(!confirm('공지 채널에 발송할까요? '+(everyone?'(@everyone 포함)':'')))return;
-  await post('notice',{title,content,everyone});
-  $('#notice-title').value='';$('#notice-content').value='';
-});
-$('#logout').addEventListener('click',async()=>{
-  try {await fetch('/admin/logout',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});} finally {location.href='/admin/login';}
-});
-load();
+            members.append({
+                'id': u_str,
+                'name': m.display_name,
+                'roles': [r.name for r in m.roles if r.name in b['TARGET_ROLES']],
+                'daily_secs': daily,
+                'week_sec': sum(daily),
+                'goal_sec': target,
+                'goal_reason': reason or '',
+                'daily_req': daily_req,
+                'daily_flags': daily_flags,
+                'missed_days': missed_days,
+                'is_probation': is_prob,
+                'prob_desc': prob_desc,
+                'join_date': join_dt.strftime('%Y-%m-%d'),
+                'is_exempt': bool(ex),
+                'exempt_desc': (f"~{ex['until']} | {ex['reason']}" if ex else ''),
+                'voice': m.voice.channel.name if m.voice and m.voice.channel else None,
+                'warn_count': len(warnings.get(u_str, []))
+            })
+        members.sort(key=lambda x: (x['is_exempt'], -x['week_sec']))
+        global_goal = b['VOICE_GLOBAL_GOALS'].get(guild_id)
+        base = int(global_goal['target_sec']) if global_goal and global_goal.get('week_start') == b['get_current_week_monday'](now) else b['DEFAULT_WEEKLY_GOAL_SEC']
+        return {
+            'members': members,
+            'week_days': days,
+            'week_goal_sec': base,
+            'updated_at': now.strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+    @app.route('/admin/api/snapshot')
+    @require_admin
+    def snapshot():
+        try:
+            force = request.args.get('sync') == '1'
+            return jsonify(on_bot(get_snapshot(force_sync=force)))
+        except Exception:
+            app.logger.exception('snapshot failed')
+            return jsonify(error='길드 데이터 조회에 실패했습니다. 잠시 후 새로고침하세요.'), 503
+
+    async def run_action(action, uid, value, actor):
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            raise ValueError('길드가 연결되어 있지 않습니다.')
+        member = guild.get_member(uid) if uid else None
+        if action != 'notice' and (not member or member.bot or not b['is_target_member'](member)):
+            raise ValueError('관리 대상 길드원이 아닙니다.')
+        now = datetime.now(b['KST'])
+
+        if action == 'warn_add':
+            reason = str(value.get('reason', '')).strip()
+            if not 1 <= len(reason) <= 250:
+                raise ValueError('경고 사유를 1~250자로 입력하세요.')
+            warn_entry = {'reason': reason, 'moderator': actor, 'date': now.strftime('%Y-%m-%d %H:%M')}
+            await b['log_warning_action'](guild, uid, 'add', warn_entry)
+
+        elif action == 'warn_remove':
+            try:
+                count = int(value.get('count', 1))
+            except (TypeError, ValueError):
+                count = 1
+            if count < 1:
+                raise ValueError('차감할 개수는 1 이상이어야 합니다.')
+            u_str = str(uid)
+            cur_warns = b.get('WARN_CACHE', {}).get(u_str, [])
+            if not cur_warns:
+                raise ValueError('현재 차감할 경고가 없습니다.')
+            deduct = min(count, len(cur_warns))
+            await b['log_warning_action'](guild, uid, 'remove', {'count': deduct})
+
+        elif action == 'warn_clear':
+            await b['log_warning_action'](guild, uid, 'clear', {})
+
+        elif action == 'prob_promote':
+            prob_map = b.get('PROBATION_ROLE_MAP', {})
+            promoted_to = None
+            for role in list(member.roles):
+                if role.name in prob_map:
+                    promoted_to = prob_map[role.name]
+                    try:
+                        await member.remove_roles(role)
+                    except discord.Forbidden:
+                        raise ValueError('봇의 역할 순위가 낮아 수습생 역할을 제거할 수 없습니다.')
+                    new_role = discord.utils.get(guild.roles, name=promoted_to) or await guild.create_role(name=promoted_to)
+                    if new_role:
+                        await member.add_roles(new_role)
+                    break
+            if not promoted_to:
+                raise ValueError('해당 멤버는 현재 수습생 역할을 가지고 있지 않습니다.')
+            await b['log_probation_action'](guild, uid, 'promoted')
+            try:
+                await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다!")
+            except Exception:
+                pass
+            return {'ok': True, 'message': f'[{promoted_to}](으)로 정식 승급 완료되었습니다!'}
+
+        elif action == 'prob_extend':
+            prob_map = b.get('PROBATION_ROLE_MAP', {})
+            if not any(r.name in prob_map for r in member.roles):
+                raise ValueError('해당 멤버는 현재 수습생 역할을 가지고 있지 않습니다.')
+            try:
+                days = int(value.get('days', 7))
+            except (TypeError, ValueError):
+                days = 7
+            if not 1 <= days <= 90:
+                raise ValueError('연장 일수는 1~90일 사이여야 합니다.')
+            eff_join = b['get_member_effective_join_date'](guild_id, member).strftime('%Y-%m-%d')
+            await b['log_probation_action'](guild, uid, 'extend', {'add_days': days, 'join_date': eff_join})
+            return {'ok': True, 'message': f'수습 기간이 +{days}일 연장되었습니다.'}
+
+        elif action == 'exempt_add':
+            until = str(value.get('until', ''))
+            try:
+                until_date = datetime.strptime(until, '%Y-%m-%d').date()
+            except ValueError:
+                raise ValueError('종료일은 YYYY-MM-DD 형식이어야 합니다.')
+            if until_date < now.date() or (until_date - now.date()).days > 365:
+                raise ValueError('종료일은 오늘부터 365일 이내여야 합니다.')
+            reason = str(value.get('reason', '')).strip()
+            if not 1 <= len(reason) <= 200:
+                raise ValueError('휴가 사유는 1~200자로 입력하세요.')
+            await b['log_voice_exempt_action'](guild, uid, 'add', {'until': until, 'reason': reason})
+
+        elif action == 'exempt_remove':
+            await b['log_voice_exempt_action'](guild, uid, 'remove', {})
+
+        elif action == 'goal_set':
+            try:
+                hours = float(value.get('hours'))
+            except (TypeError, ValueError):
+                raise ValueError('목표 시간을 숫자로 입력하세요.')
+            if not 0 <= hours <= 11 or hours != hours:
+                raise ValueError('목표는 0~11시간이어야 합니다.')
+            reason = str(value.get('reason', '')).strip()
+            if len(reason) > 200:
+                raise ValueError('사유는 200자 이하여야 합니다.')
+            await b['log_voice_goal_action'](guild, uid, 'set', {
+                'week_start': b['get_current_week_monday'](now),
+                'target_sec': int(hours * 3600),
+                'reason': reason
+            })
+
+        elif action == 'notice':
+            title = str(value.get('title', '')).strip()
+            content = str(value.get('content', '')).strip()
+            everyone = value.get('everyone', False)
+            if not isinstance(everyone, bool):
+                raise ValueError('멘션 설정이 올바르지 않습니다.')
+            if not 1 <= len(title) <= 100 or not 1 <= len(content) <= 1700:
+                raise ValueError('공지 제목 1~100자, 내용 1~1700자로 입력하세요.')
+            channel = guild.get_channel(b['ANNOUNCEMENT_CHANNEL_ID'])
+            if channel is None or not isinstance(channel, discord.TextChannel):
+                raise ValueError('공지 채널을 찾지 못했습니다.')
+            msg = f'# 📢 [공지] {discord.utils.escape_mentions(title)}\n\n{discord.utils.escape_mentions(content)}'
+            if everyone:
+                msg += '\n\n@everyone'
+            await channel.send(msg, allowed_mentions=discord.AllowedMentions(everyone=everyone, users=False, roles=False))
+        else:
+            raise ValueError('지원하지 않는 작업입니다.')
+        return {'ok': True, 'message': '정상 처리되었습니다.'}
+
+    @app.route('/admin/api/action', methods=['POST'])
+    @require_admin
+    def action():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(error='올바른 JSON 데이터가 아닙니다.'), 400
+        action_type = data.get('action')
+        try:
+            uid = int(data.get('user_id', 0)) if action_type != 'notice' else 0
+            if uid < 0:
+                raise ValueError('잘못된 사용자 ID')
+            result = on_bot(run_action(action_type, uid, data, session.get('display', '관리자') + ' (' + str(session['uid']) + ')'))
+            return jsonify(result)
+        except (ValueError, TypeError) as exc:
+            return jsonify(error=str(exc)), 400
+        except Exception:
+            app.logger.exception('admin action failed')
+            return jsonify(error='작업에 실패했습니다. Discord 권한과 서버 로그를 확인하세요.'), 503

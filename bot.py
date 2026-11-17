@@ -120,6 +120,10 @@ VOICE_RECURRING_DAYS: Dict[int, Dict[str, dict]] = {}
 # 🌱 수습생 입단일 및 연장/알림 기록
 PROBATION_RECORDS: Dict[int, Dict[str, dict]] = {}
 
+# 📒 대여 장부 메모리 {guild_id: {entry_id: dict}}
+LEDGER_RECORDS: Dict[int, Dict[int, dict]] = {}
+LEDGER_NEXT_ID: Dict[int, int] = {}
+
 def get_probation_days(guild_id: int) -> int:
     return PROBATION_DAYS_CONFIG.get(guild_id, DEFAULT_PROBATION_DAYS)
 
@@ -298,6 +302,8 @@ async def fetch_database_from_channel(guild: discord.Guild):
     custom_goals: Dict[str, dict] = {}
     recurring_days: Dict[str, dict] = {}
     probation_recs: Dict[str, dict] = {}
+    ledger_recs: Dict[int, dict] = {}
+    max_ledger_id = 0
     global_goal: Optional[dict] = None
 
     try:
@@ -437,6 +443,37 @@ async def fetch_database_from_channel(guild: discord.Guild):
                     except Exception:
                         continue
 
+                elif footer_text.startswith("LEDGER_LOG:"):
+                    try:
+                        data = json.loads(footer_text.replace("LEDGER_LOG:", "").strip())
+                        lid = int(data["id"])
+                        if lid > max_ledger_id:
+                            max_ledger_id = lid
+                        action = data.get("action", "add")
+                        if action == "add":
+                            ledger_recs[lid] = {
+                                "id": lid,
+                                "lender_id": str(data["lender_id"]),
+                                "lender_name": data.get("lender_name", ""),
+                                "borrower_id": str(data["borrower_id"]),
+                                "borrower_name": data.get("borrower_name", ""),
+                                "item": data.get("item", ""),
+                                "memo": data.get("memo", ""),
+                                "date": data.get("date", ""),
+                                "author_id": str(data.get("author_id", "")),
+                                "status": "active",
+                                "done_date": ""
+                            }
+                        elif action == "done":
+                            if lid in ledger_recs:
+                                ledger_recs[lid]["status"] = "done"
+                                ledger_recs[lid]["done_date"] = data.get("date", "")
+                        elif action == "delete":
+                            if lid in ledger_recs:
+                                del ledger_recs[lid]
+                    except Exception:
+                        continue
+
                 elif footer_text.startswith("PROBATION_CONFIG:"):
                     try:
                         cfg = json.loads(footer_text.replace("PROBATION_CONFIG:", "").strip())
@@ -486,6 +523,8 @@ async def fetch_database_from_channel(guild: discord.Guild):
         VOICE_CUSTOM_GOALS[guild.id] = custom_goals
         VOICE_RECURRING_DAYS[guild.id] = recurring_days
         PROBATION_RECORDS[guild.id] = probation_recs
+        LEDGER_RECORDS[guild.id] = ledger_recs
+        LEDGER_NEXT_ID[guild.id] = max_ledger_id + 1
         WARN_CACHE.clear()
         WARN_CACHE.update(warnings)
         if global_goal:
@@ -497,6 +536,42 @@ async def fetch_database_from_channel(guild: discord.Guild):
         await send_error_log(guild, "fetch_database_from_channel", traceback.format_exc())
 
     return warnings, voice_records
+
+async def log_ledger_action(guild: discord.Guild, action: str, data: dict):
+    if WARN_LOG_CHANNEL_ID == 0:
+        return
+    channel = guild.get_channel(WARN_LOG_CHANNEL_ID) or await bot.fetch_channel(WARN_LOG_CHANNEL_ID)
+    if not channel:
+        return
+    embed = discord.Embed(title=f"📒 [대여 장부 DB 로그] {action.upper()}", color=discord.Color.gold())
+    payload = {"action": action, **data}
+    embed.set_footer(text=f"LEDGER_LOG:{json.dumps(payload, ensure_ascii=False)}")
+    await channel.send(embed=embed)
+
+    if guild.id not in LEDGER_RECORDS:
+        LEDGER_RECORDS[guild.id] = {}
+    lid = int(data["id"])
+    if action == "add":
+        LEDGER_RECORDS[guild.id][lid] = {
+            "id": lid,
+            "lender_id": str(data["lender_id"]),
+            "lender_name": data.get("lender_name", ""),
+            "borrower_id": str(data["borrower_id"]),
+            "borrower_name": data.get("borrower_name", ""),
+            "item": data.get("item", ""),
+            "memo": data.get("memo", ""),
+            "date": data.get("date", ""),
+            "author_id": str(data.get("author_id", "")),
+            "status": "active",
+            "done_date": ""
+        }
+        if lid >= LEDGER_NEXT_ID.get(guild.id, 1):
+            LEDGER_NEXT_ID[guild.id] = lid + 1
+    elif action == "done" and lid in LEDGER_RECORDS[guild.id]:
+        LEDGER_RECORDS[guild.id][lid]["status"] = "done"
+        LEDGER_RECORDS[guild.id][lid]["done_date"] = data.get("date", "")
+    elif action == "delete" and lid in LEDGER_RECORDS[guild.id]:
+        del LEDGER_RECORDS[guild.id][lid]
 
 async def log_warning_action(guild: discord.Guild, user_id: int, action: str, data: dict):
     if WARN_LOG_CHANNEL_ID == 0:
@@ -749,6 +824,54 @@ async def update_member_counter(guild: discord.Guild):
             await channel.edit(name=new_name)
         except (discord.Forbidden, discord.HTTPException):
             pass
+
+# --- 📒 [대여 장부 상환 완료 버튼 UI] ---
+class LedgerDoneView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="✅ 상환 완료 처리", style=discord.ButtonStyle.success, custom_id="btn_ledger_done")
+    async def mark_done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        if not embed or not embed.footer or not embed.footer.text:
+            await interaction.followup.send("❌ 장부 정보를 읽을 수 없습니다.", ephemeral=True)
+            return
+
+        footer_text = embed.footer.text
+        if not footer_text.startswith("LEDGER_ID:"):
+            await interaction.followup.send("❌ 장부 고유 번호를 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        lid = int(footer_text.replace("LEDGER_ID:", "").strip())
+        guild = interaction.guild
+        if guild.id not in LEDGER_RECORDS:
+            await fetch_database_from_channel(guild)
+
+        rec = LEDGER_RECORDS.get(guild.id, {}).get(lid)
+        if not rec:
+            await interaction.followup.send("⚠️ 이미 삭제되었거나 존재하지 않는 장부 번호입니다.", ephemeral=True)
+            return
+
+        if rec["status"] == "done":
+            await interaction.followup.send("✅ 이미 상환 완료 처리된 내역입니다.", ephemeral=True)
+            return
+
+        uid_str = str(interaction.user.id)
+        if not (is_admin_or_mod(interaction) or uid_str == rec["lender_id"] or uid_str == rec["author_id"]):
+            await interaction.followup.send("❌ **빌려준 사람 본인**, **등록자**, 또는 **관리진**만 상환 완료 처리를 할 수 있습니다!", ephemeral=True)
+            return
+
+        now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+        await log_ledger_action(guild, "done", {"id": lid, "date": now_str})
+
+        embed.color = discord.Color.green()
+        embed.title = f"✅ [대여 장부 #{lid} - 상환 완료]"
+        embed.add_field(name="상환 완료일", value=f"{now_str} ({interaction.user.display_name})", inline=False)
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.message.edit(embed=embed, view=self)
 
 # --- 🌱 [수습생 승급 & 1주 연장 버튼 UI] ---
 class PromoteView(discord.ui.View):
@@ -1131,7 +1254,7 @@ async def daily_voice_check():
         except Exception:
             await send_error_log(guild, f"daily_voice_check Loop Error ({guild.name})", traceback.format_exc())
 
-# --- 무기 및 직업 관리 ---
+# --- 무기 및 직업 관리 (원클릭 버튼 방식) ---
 WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
 JOBS = ["요리사", "대장장이", "낚시꾼", "연금술사"]
 
@@ -1212,45 +1335,48 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         ephemeral=True
     )
 
-class WeaponSelect(discord.ui.Select):
-    def __init__(self):
-        options = [discord.SelectOption(label=w, description=f"{w} 무기 선택") for w in WEAPONS]
-        super().__init__(placeholder="🗡️ 무기를 선택하세요", min_values=1, max_values=1, options=options, row=0, custom_id="loadout_weapon_select")
+class LoadoutButton(discord.ui.Button):
+    def __init__(self, category: str, item_name: str, label: str, style: discord.ButtonStyle, row: int, custom_id: str):
+        super().__init__(label=label, style=style, row=row, custom_id=custom_id)
+        self.category = category
+        self.item_name = item_name
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.selected_weapon = self.values[0]
-        await interaction.response.send_message(f"무기 **[{self.values[0]}]**(을)를 선택하셨습니다.", ephemeral=True)
-
-class JobSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="없음 (전투직)", description="생활직업 없음 (무기 태그 우선 적용)", value="없음 (전투직)")
-        ] + [discord.SelectOption(label=j, description=f"{j} 직업 선택", value=j) for j in JOBS]
-        super().__init__(placeholder="🛠️ 직업을 선택하세요", min_values=1, max_values=1, options=options, row=1, custom_id="loadout_job_select")
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view.selected_job = self.values[0]
-        await interaction.response.send_message(f"직업 **[{self.values[0]}]**(을)를 선택하셨습니다.", ephemeral=True)
-
-class LoadoutConfirmButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="✅ 선택 완료 및 적용", style=discord.ButtonStyle.success, row=2, custom_id="loadout_confirm_btn")
-
-    async def callback(self, interaction: discord.Interaction):
-        view: LoadoutSelectView = self.view
-        if not view.selected_weapon and not view.selected_job:
-            await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 드롭다운에서 선택해 주세요!", ephemeral=True)
-            return
-        await process_loadout_selection(interaction, view.selected_weapon, view.selected_job)
+        if self.category == "weapon":
+            await process_loadout_selection(interaction, weapon_name=self.item_name, job_name=None)
+        else:
+            await process_loadout_selection(interaction, weapon_name=None, job_name=self.item_name)
 
 class LoadoutSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.selected_weapon: Optional[str] = None
-        self.selected_job: Optional[str] = None
-        self.add_item(WeaponSelect())
-        self.add_item(JobSelect())
-        self.add_item(LoadoutConfirmButton())
+        for idx, w in enumerate(WEAPONS):
+            r_idx = 0 if idx < 3 else 1
+            self.add_item(LoadoutButton(
+                category="weapon",
+                item_name=w,
+                label=f"🗡️ {w}",
+                style=discord.ButtonStyle.primary,
+                row=r_idx,
+                custom_id=f"btn_loadout_weapon_{w}"
+            ))
+        for j in JOBS:
+            self.add_item(LoadoutButton(
+                category="job",
+                item_name=j,
+                label=f"🛠️ {j}",
+                style=discord.ButtonStyle.success,
+                row=2,
+                custom_id=f"btn_loadout_job_{j}"
+            ))
+        self.add_item(LoadoutButton(
+            category="job",
+            item_name="없음 (전투직)",
+            label="⚔️ 전투직(직업해제)",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+            custom_id="btn_loadout_job_none"
+        ))
 
 
 # --- 🛡️ [관리자 검토 & 직급 선택 승인 시스템] ---
@@ -1515,6 +1641,166 @@ class NoticePaginationView(discord.ui.View):
 
 
 # --- 슬래시 명령어 세트 ---
+
+# 📒 [대여 장부 명령어 4종 - 모든 길드원 사용 가능, 지정 채널 제한]
+@bot.tree.command(name="장부등록", description="빌려준 사람과 빌린 사람을 지정하여 대여 장부에 기록합니다.")
+@app_commands.describe(
+    빌려준사람="아이템이나 재화를 빌려준 멤버",
+    빌린사람="아이템이나 재화를 빌린(갚아야 할) 멤버",
+    품목="대여한 품목 또는 금액 (예: 500만 골드, 전설 도끼 1개)",
+    메모="상환 기한이나 추가 메모 (선택)"
+)
+async def add_ledger_entry(interaction: discord.Interaction, 빌려준사람: discord.Member, 빌린사람: discord.Member, 품목: str, 메모: Optional[str] = ""):
+    await interaction.response.defer()
+    guild = interaction.guild
+    if guild.id not in LEDGER_RECORDS:
+        await fetch_database_from_channel(guild)
+
+    lid = LEDGER_NEXT_ID.get(guild.id, 1)
+    LEDGER_NEXT_ID[guild.id] = lid + 1
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+
+    payload = {
+        "id": lid,
+        "lender_id": str(빌려준사람.id),
+        "lender_name": 빌려준사람.display_name,
+        "borrower_id": str(빌린사람.id),
+        "borrower_name": 빌린사람.display_name,
+        "item": 품목.strip(),
+        "memo": (메모 or "").strip(),
+        "date": now_str,
+        "author_id": str(interaction.user.id)
+    }
+    await log_ledger_action(guild, "add", payload)
+
+    embed = discord.Embed(
+        title=f"📒 [대여 장부 #{lid}] 신규 등록",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="📤 빌려준 사람", value=f"{빌려준사람.mention} (`{빌려준사람.display_name}`)", inline=True)
+    embed.add_field(name="📥 빌린 사람", value=f"{빌린사람.mention} (`{빌린사람.display_name}`)", inline=True)
+    embed.add_field(name="📦 대여 품목 / 금액", value=f"**{품목.strip()}**", inline=False)
+    if 메모 and 메모.strip():
+        embed.add_field(name="📝 메모 / 기한", value=메모.strip(), inline=False)
+    embed.add_field(name="📅 등록 일시", value=f"{now_str} (작성: {interaction.user.display_name})", inline=False)
+    embed.set_footer(text=f"LEDGER_ID:{lid}")
+
+    await interaction.followup.send(
+        content=f"{빌려준사람.mention} ➔ {빌린사람.mention}",
+        embed=embed,
+        view=LedgerDoneView()
+    )
+
+@bot.tree.command(name="장부목록", description="현재 대여 장부 내역을 조회합니다. (특정 유저 지정 시 빌려준/빌린 내역 분리 조회)")
+@app_commands.describe(
+    유저="특정 멤버와 관련된 장부만 조회할 경우 선택 (비워두면 전체 조회)",
+    완료포함="이미 상환 완료된 내역까지 함께 볼지 여부 (기본: 미상환만 표시)"
+)
+async def list_ledger_entries(interaction: discord.Interaction, 유저: Optional[discord.Member] = None, 완료포함: Optional[bool] = False):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if guild.id not in LEDGER_RECORDS:
+        await fetch_database_from_channel(guild)
+
+    records = list(LEDGER_RECORDS.get(guild.id, {}).values())
+    if not 완료포함:
+        records = [r for r in records if r["status"] == "active"]
+
+    records.sort(key=lambda r: int(r["id"]), reverse=True)
+
+    if 유저:
+        u_str = str(유저.id)
+        lent_lines = []
+        borrowed_lines = []
+        for r in records:
+            badge = "✅완료" if r["status"] == "done" else "⏳미상환"
+            memo_tag = f" *({r['memo']})*" if r.get("memo") else ""
+            if r["lender_id"] == u_str:
+                lent_lines.append(f"• **`#{r['id']}`** [{badge}] ➔ <@{r['borrower_id']}> : **{r['item']}**{memo_tag} (`{r['date'][:10]}`)")
+            if r["borrower_id"] == u_str:
+                borrowed_lines.append(f"• **`#{r['id']}`** [{badge}] ⬅ <@{r['lender_id']}> : **{r['item']}**{memo_tag} (`{r['date'][:10]}`)")
+
+        embed = discord.Embed(
+            title=f"📒 {유저.display_name} 님의 대여 장부 현황",
+            color=discord.Color.gold()
+        )
+        embed.add_field(
+            name=f"📤 빌려준 내역 (받을 것: {len(lent_lines)}건)",
+            value="\n".join(lent_lines[:20]) if lent_lines else "내역 없음",
+            inline=False
+        )
+        embed.add_field(
+            name=f"📥 빌린 내역 (갚을 것: {len(borrowed_lines)}건)",
+            value="\n".join(borrowed_lines[:20]) if borrowed_lines else "내역 없음",
+            inline=False
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    if not records:
+        await interaction.followup.send("✨ 현재 미상환 대여 장부 내역이 없습니다!", ephemeral=True)
+        return
+
+    lines = []
+    for r in records[:40]:
+        badge = "✅" if r["status"] == "done" else "⏳"
+        memo_tag = f" *({r['memo']})*" if r.get("memo") else ""
+        lines.append(f"{badge} **`#{r['id']}`** <@{r['lender_id']}> ➔ <@{r['borrower_id']}> : **{r['item']}**{memo_tag} (`{r['date'][:10]}`)")
+
+    embed = discord.Embed(
+        title=f"📒 길드 대여 장부 목록 ({'전체' if 완료포함 else '미상환'} 총 {len(records)}건)",
+        color=discord.Color.gold()
+    )
+    add_chunked_fields(embed, "장부 내역 (📤빌려준사람 ➔ 📥빌린사람)", lines)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="장부완료", description="장부 번호를 입력하여 대여 내역을 상환 완료 처리합니다.")
+@app_commands.describe(번호="상환 완료할 장부 번호 (예: 1)")
+async def complete_ledger_entry(interaction: discord.Interaction, 번호: int):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if guild.id not in LEDGER_RECORDS:
+        await fetch_database_from_channel(guild)
+
+    rec = LEDGER_RECORDS.get(guild.id, {}).get(번호)
+    if not rec:
+        await interaction.followup.send(f"❌ `#{번호}`번 장부 내역을 찾을 수 없습니다.", ephemeral=True)
+        return
+
+    if rec["status"] == "done":
+        await interaction.followup.send(f"⚠️ `#{번호}`번 장부는 이미 상환 완료 상태입니다.", ephemeral=True)
+        return
+
+    uid_str = str(interaction.user.id)
+    if not (is_admin_or_mod(interaction) or uid_str == rec["lender_id"] or uid_str == rec["author_id"]):
+        await interaction.followup.send("❌ **빌려준 사람 본인**, **등록자**, 또는 **관리진**만 상환 완료 처리를 할 수 있습니다!", ephemeral=True)
+        return
+
+    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    await log_ledger_action(guild, "done", {"id": 번호, "date": now_str})
+    await interaction.followup.send(f"✅ 장부 **`#{번호}`**번 (<@{rec['lender_id']}> ➔ <@{rec['borrower_id']}> : **{rec['item']}**) 내역이 **상환 완료** 처리되었습니다!", ephemeral=True)
+
+@bot.tree.command(name="장부삭제", description="잘못 등록된 장부 내역을 삭제합니다.")
+@app_commands.describe(번호="삭제할 장부 번호 (예: 1)")
+async def delete_ledger_entry(interaction: discord.Interaction, 번호: int):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if guild.id not in LEDGER_RECORDS:
+        await fetch_database_from_channel(guild)
+
+    rec = LEDGER_RECORDS.get(guild.id, {}).get(번호)
+    if not rec:
+        await interaction.followup.send(f"❌ `#{번호}`번 장부 내역을 찾을 수 없습니다.", ephemeral=True)
+        return
+
+    uid_str = str(interaction.user.id)
+    if not (is_admin_or_mod(interaction) or uid_str == rec["lender_id"] or uid_str == rec["author_id"]):
+        await interaction.followup.send("❌ **빌려준 사람 본인**, **등록자**, 또는 **관리진**만 장부를 삭제할 수 있습니다!", ephemeral=True)
+        return
+
+    await log_ledger_action(guild, "delete", {"id": 번호})
+    await interaction.followup.send(f"🗑️ 장부 **`#{번호}`**번 내역이 삭제되었습니다.", ephemeral=True)
+
 
 @bot.tree.command(name="수습기간설정", description="[관리자 전용] 수습생 기본 수습 기간 일수(기본 7일)를 변경합니다.")
 @app_commands.describe(일수="승급 알림이 울릴 기본 수습 기간 일수 (기본값: 7)")
@@ -2314,20 +2600,48 @@ async def set_voice_notice_channel(interaction: discord.Interaction, 채널: dis
     await log_voice_config(interaction.guild, 채널.id)
     await interaction.response.send_message(f"✅ 매주 월요일 자정 주간 미달자 결산 브리핑이 {채널.mention} 채널로 전송됩니다!", ephemeral=True)
 
-@bot.tree.command(name="무기직업선택", description="드롭다운 메뉴로 사용할 무기와 직업을 선택합니다.")
+@bot.tree.command(name="무기직업선택", description="버튼을 눌러 사용할 무기와 직업을 즉시 선택합니다.")
 async def select_weapon_and_job(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="⚔️ 무기 & 직업 선택",
+        title="⚔️ 무기 & 직업 원클릭 선택",
         description=(
-            "아래 드롭다운에서 **무기**와 **직업**을 선택한 뒤\n"
-            "**[선택 완료 및 적용]** 버튼을 눌러주세요!\n\n"
-            "🏷️ **태그 표기 규칙:**\n"
-            "• 직업이 있으면 **[직업]** 태그가 우선 표기됩니다.\n"
-            "• 직업이 없거나 **'없음 (전투직)'**을 선택하면 **[무기]** 태그가 표기됩니다."
+            "아래 버튼에서 원하는 **무기**와 **직업**을 클릭하면 즉시 적용됩니다!\n\n"
+            "• **1~2번째 줄 (파란색)** : 🗡️ 무기 선택 (`검`, `창`, `도끼`, `활`, `클로`, `메이스`)\n"
+            "• **3번째 줄 (초록/회색)** : 🛠️ 생활직업 선택 또는 `⚔️ 전투직(직업해제)`\n\n"
+            "🏷️ **닉네임 태그 규칙:**\n"
+            "• 생활직업이 있으면 **`[직업]`** 태그가 우선 표기됩니다.\n"
+            "• **`⚔️ 전투직(직업해제)`**를 누르면 **`[무기]`** 태그가 표기됩니다."
         ),
         color=discord.Color.blue()
     )
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView(), ephemeral=True)
+
+@bot.tree.command(name="무기직업패널전송", description="[관리자 전용] 채널에 누구나 상시 클릭할 수 있는 무기·직업 선택 버튼 패널을 설치합니다.")
+@app_commands.describe(채널="버튼 패널을 고정해 둘 텍스트 채널")
+async def send_loadout_panel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    if not is_admin_or_mod(interaction):
+        await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="⚔️ 길드원 무기 & 생활직업 선택",
+        description=(
+            "아래 버튼을 클릭하면 본인의 **무기/직업 역할과 닉네임 태그**가 즉시 변경됩니다!\n\n"
+            "• **🗡️ 파란색 버튼** : 주무기 선택 (`검` · `창` · `도끼` · `활` · `클로` · `메이스`)\n"
+            "• **🛠️ 초록색 버튼** : 생활직업 선택 (`요리사` · `대장장이` · `낚시꾼` · `연금술사`)\n"
+            "• **⚔️ 회색 버튼** : 생활직업 해제 (`전투직` - 무기 태그가 닉네임에 표시됨)"
+        ),
+        color=0x800020
+    )
+    if interaction.guild.icon:
+        embed.set_thumbnail(url=interaction.guild.icon.url)
+    embed.set_footer(text="원하는 버튼을 누르면 본인에게만 완료 안내가 표시됩니다.")
+
+    try:
+        await 채널.send(embed=embed, view=LoadoutSelectView())
+        await interaction.response.send_message(f"✅ {채널.mention} 채널에 무기/직업 상시 선택 버튼 패널을 전송했습니다!", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"⚠️ {채널.mention} 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
 
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
 @app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 연금술사, 또는 전투직)")
@@ -2521,6 +2835,7 @@ async def on_ready():
     bot.add_view(ApplyView())
     bot.add_view(ReviewView())
     bot.add_view(PromoteView())
+    bot.add_view(LedgerDoneView())
 
     if not daily_voice_check.is_running():
         daily_voice_check.start()
@@ -2564,10 +2879,15 @@ async def on_ready():
 COMMAND_CHANNEL_RULES = {
     "통화시간": 1569704533905383475,
     "경고확인": 1571529725241987232,
+    "장부등록": 1572248610614284348,
+    "장부목록": 1572248610614284348,
+    "장부완료": 1572248610614284348,
+    "장부삭제": 1572248610614284348,
 }
 COMMAND_ONLY_CHANNEL_IDS = {
-    1569704533905383475: "/통화시간",
-    1571529725241987232: "/경고확인",
+    1569704533905383475: ["통화시간"],
+    1571529725241987232: ["경고확인"],
+    1572248610614284348: ["장부등록", "장부목록", "장부완료", "장부삭제"],
 }
 
 async def restrict_command_channels(interaction: discord.Interaction) -> bool:
@@ -2589,17 +2909,17 @@ async def restrict_command_channels(interaction: discord.Interaction) -> bool:
             return False
 
     if ch_id in COMMAND_ONLY_CHANNEL_IDS:
-        allowed_cmd = COMMAND_ONLY_CHANNEL_IDS[ch_id].lstrip("/")
-        if cmd_name != allowed_cmd:
+        allowed_cmds = COMMAND_ONLY_CHANNEL_IDS[ch_id]
+        if cmd_name not in allowed_cmds:
+            cmd_labels = ", ".join(f"`/{c}`" for c in allowed_cmds)
             await interaction.response.send_message(
-                f"❌ 이 채널에서는 `{COMMAND_ONLY_CHANNEL_IDS[ch_id]}` 명령어만 사용할 수 있습니다!",
+                f"❌ 이 채널에서는 {cmd_labels} 명령어만 사용할 수 있습니다!",
                 ephemeral=True
             )
             return False
 
     return True
 
-# discord.py 2.7.1 호환 할당 방식
 bot.tree.interaction_check = restrict_command_channels
 
 @bot.event
@@ -2613,9 +2933,10 @@ async def on_message(message: discord.Message):
         if not is_mod:
             try:
                 await message.delete()
-                allowed_cmd = COMMAND_ONLY_CHANNEL_IDS[message.channel.id]
+                allowed_cmds = COMMAND_ONLY_CHANNEL_IDS[message.channel.id]
+                cmd_labels = ", ".join(f"`/{c}`" for c in allowed_cmds)
                 await message.channel.send(
-                    f"{message.author.mention} ❌ 이 채널은 **`{allowed_cmd}` 명령어 전용 채널**입니다. 일반 채팅은 입력할 수 없습니다!",
+                    f"{message.author.mention} ❌ 이 채널은 **{cmd_labels} 명령어 전용 채널**입니다. 일반 채팅은 입력할 수 없습니다!",
                     delete_after=4.0
                 )
             except discord.Forbidden:

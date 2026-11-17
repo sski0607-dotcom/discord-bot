@@ -2614,7 +2614,8 @@ async def select_weapon_and_job(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    await interaction.response.send_message(embed=embed, view=LoadoutSelectView(), ephemeral=True)
+    # 👇 여기서 ephemeral=True를 지우면 모든 사람에게 보입니다!
+    await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
 @bot.tree.command(name="무기직업패널전송", description="[관리자 전용] 채널에 누구나 상시 클릭할 수 있는 무기·직업 선택 버튼 패널을 설치합니다.")
 @app_commands.describe(채널="버튼 패널을 고정해 둘 텍스트 채널")

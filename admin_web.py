@@ -252,8 +252,13 @@ def init_admin_web(app, bot, b):
         members.sort(key=lambda x: (x['is_exempt'], -x['week_sec']))
         global_goal = b['VOICE_GLOBAL_GOALS'].get(guild_id)
         base = int(global_goal['target_sec']) if global_goal and global_goal.get('week_start') == b['get_current_week_monday'](now) else b['DEFAULT_WEEKLY_GOAL_SEC']
+
+        ledger_map = b.get('LEDGER_RECORDS', {}).get(guild_id, {})
+        ledger_list = sorted(ledger_map.values(), key=lambda r: int(r['id']), reverse=True)
+
         return {
             'members': members,
+            'ledger': ledger_list,
             'week_days': days,
             'week_goal_sec': base,
             'updated_at': now.strftime('%Y-%m-%d %H:%M:%S')
@@ -273,10 +278,23 @@ def init_admin_web(app, bot, b):
         guild = bot.get_guild(guild_id)
         if guild is None:
             raise ValueError('길드가 연결되어 있지 않습니다.')
+        now = datetime.now(b['KST'])
+
+        if action in ('ledger_done', 'ledger_delete'):
+            lid = int(value.get('ledger_id', 0))
+            rec = b.get('LEDGER_RECORDS', {}).get(guild_id, {}).get(lid)
+            if not rec:
+                raise ValueError(f'#{lid}번 장부 내역을 찾을 수 없습니다.')
+            if action == 'ledger_done':
+                await b['log_ledger_action'](guild, 'done', {'id': lid, 'date': now.strftime('%Y-%m-%d %H:%M')})
+                return {'ok': True, 'message': f'장부 #{lid}번이 상환 완료 처리되었습니다.'}
+            else:
+                await b['log_ledger_action'](guild, 'delete', {'id': lid})
+                return {'ok': True, 'message': f'장부 #{lid}번 내역이 삭제되었습니다.'}
+
         member = guild.get_member(uid) if uid else None
         if action != 'notice' and (not member or member.bot or not b['is_target_member'](member)):
             raise ValueError('관리 대상 길드원이 아닙니다.')
-        now = datetime.now(b['KST'])
 
         if action == 'warn_add':
             reason = str(value.get('reason', '')).strip()
@@ -398,7 +416,7 @@ def init_admin_web(app, bot, b):
             return jsonify(error='올바른 JSON 데이터가 아닙니다.'), 400
         action_type = data.get('action')
         try:
-            uid = int(data.get('user_id', 0)) if action_type != 'notice' else 0
+            uid = int(data.get('user_id', 0)) if action_type not in ('notice', 'ledger_done', 'ledger_delete') else 0
             if uid < 0:
                 raise ValueError('잘못된 사용자 ID')
             result = on_bot(run_action(action_type, uid, data, session.get('display', '관리자') + ' (' + str(session['uid']) + ')'))

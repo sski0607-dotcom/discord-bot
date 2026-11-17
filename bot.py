@@ -39,6 +39,9 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 # 🚨 [중요] 경고 및 영구 DB 채널 ID
 WARN_LOG_CHANNEL_ID = 1569705414839242884
 
+# 🧾 명령어 및 버튼 사용 실시간 로그 채널 ID
+COMMAND_LOG_CHANNEL_ID = 1572255298436206745
+
 # 📢 공지 확인 대상 채널 ID
 ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
@@ -1254,7 +1257,7 @@ async def daily_voice_check():
         except Exception:
             await send_error_log(guild, f"daily_voice_check Loop Error ({guild.name})", traceback.format_exc())
 
-# --- 무기 및 직업 관리 (원클릭 버튼 방식) ---
+# --- 무기 및 직업 관리 (원클릭 버튼 방식 + 실시간 로그 전송) ---
 WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
 JOBS = ["요리사", "대장장이", "낚시꾼", "연금술사"]
 
@@ -1334,6 +1337,31 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         f"✅ 설정 완료! ({', '.join(summary)})\n🏷️ 적용된 태그: **{prefix.strip() or '없음'}**\n{nickname_msg}",
         ephemeral=True
     )
+
+    # 🧾 무기/직업 버튼 클릭 시에도 지정된 로그 채널(1572255298436206745)로 실시간 전송
+    if COMMAND_LOG_CHANNEL_ID != 0:
+        log_ch = guild.get_channel(COMMAND_LOG_CHANNEL_ID)
+        if not log_ch:
+            try:
+                log_ch = await bot.fetch_channel(COMMAND_LOG_CHANNEL_ID)
+            except Exception:
+                log_ch = None
+        if log_ch:
+            clicked_item = f"무기 [{weapon_name}]" if weapon_name else f"직업 [{job_name}]"
+            log_embed = discord.Embed(
+                description=(
+                    f"⚔️ **[무기/직업 버튼 클릭]** {member.mention} (`{new_nickname}`)\n"
+                    f"• **클릭한 버튼:** `{clicked_item}`\n"
+                    f"• **현재 상태:** {', '.join(summary)}\n"
+                    f"• **채널:** {interaction.channel.mention if interaction.channel else '알 수 없음'}"
+                ),
+                color=discord.Color.blue(),
+                timestamp=datetime.now(KST)
+            )
+            try:
+                await log_ch.send(embed=log_embed)
+            except Exception:
+                pass
 
 class LoadoutButton(discord.ui.Button):
     def __init__(self, category: str, item_name: str, label: str, style: discord.ButtonStyle, row: int, custom_id: str):
@@ -2614,7 +2642,7 @@ async def select_weapon_and_job(interaction: discord.Interaction):
         ),
         color=discord.Color.blue()
     )
-    # 👇 여기서 ephemeral=True를 지우면 모든 사람에게 보입니다!
+    # 전체 사람에게 보이도록 ephemeral 제거 완료
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
 @bot.tree.command(name="무기직업패널전송", description="[관리자 전용] 채널에 누구나 상시 클릭할 수 있는 무기·직업 선택 버튼 패널을 설치합니다.")
@@ -2875,6 +2903,39 @@ async def on_ready():
             await send_error_log(guild, "on_ready Setup Error", traceback.format_exc())
             
     print(f"로그인 완료: {bot.user.name}")
+
+# --- 🧾 [모든 슬래시 명령어 실시간 사용 로그 전송 (1572255298436206745)] ---
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+    if not interaction.guild or COMMAND_LOG_CHANNEL_ID == 0:
+        return
+
+    log_ch = interaction.guild.get_channel(COMMAND_LOG_CHANNEL_ID)
+    if not log_ch:
+        try:
+            log_ch = await bot.fetch_channel(COMMAND_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    options_text = ""
+    if interaction.data and "options" in interaction.data:
+        opts = [f"{opt['name']}: {opt.get('value', '')}" for opt in interaction.data["options"]]
+        if opts:
+            options_text = f" (`{', '.join(opts)}`)"
+
+    embed = discord.Embed(
+        description=(
+            f"🧾 **[명령어 사용 로그]** {interaction.user.mention} (`{interaction.user.display_name}`)\n"
+            f"• **실행 명령어:** `/{command.name}`{options_text}\n"
+            f"• **사용 채널:** {interaction.channel.mention if interaction.channel else '알 수 없음'}"
+        ),
+        color=discord.Color.light_grey(),
+        timestamp=datetime.now(KST)
+    )
+    try:
+        await log_ch.send(embed=embed)
+    except Exception:
+        pass
 
 # --- 🔒 [명령어 전용 채널 제한 & 일반 채팅 자동 삭제] ---
 COMMAND_CHANNEL_RULES = {

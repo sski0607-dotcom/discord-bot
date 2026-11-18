@@ -1378,6 +1378,7 @@ class LoadoutButton(discord.ui.Button):
 class LoadoutSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        # 1~2번째 줄 (row 0, 1): 무기 6개 (3개씩 2줄)
         for idx, w in enumerate(WEAPONS):
             r_idx = 0 if idx < 3 else 1
             self.add_item(LoadoutButton(
@@ -1388,21 +1389,24 @@ class LoadoutSelectView(discord.ui.View):
                 row=r_idx,
                 custom_id=f"btn_loadout_weapon_{w}"
             ))
-        for j in JOBS:
+        # 3~4번째 줄 (row 2, 3): 직업 버튼 자동 줄바꿈 (한 줄에 최대 4개씩)
+        for idx, j in enumerate(JOBS):
+            r_idx = 2 if idx < 4 else 3
             self.add_item(LoadoutButton(
                 category="job",
                 item_name=j,
                 label=f"🛠️ {j}",
                 style=discord.ButtonStyle.success,
-                row=2,
+                row=r_idx,
                 custom_id=f"btn_loadout_job_{j}"
             ))
+        # 4번째 줄 (row 3): 전투직(직업해제) 버튼
         self.add_item(LoadoutButton(
             category="job",
             item_name="없음 (전투직)",
             label="⚔️ 전투직(직업해제)",
             style=discord.ButtonStyle.secondary,
-            row=2,
+            row=3,
             custom_id="btn_loadout_job_none"
         ))
 

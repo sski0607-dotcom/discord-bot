@@ -1259,7 +1259,7 @@ async def daily_voice_check():
 
 # --- 무기 및 직업 관리 (원클릭 버튼 방식 + 실시간 로그 전송) ---
 WEAPONS = ["검", "창", "도끼", "활", "클로", "메이스"]
-JOBS = ["요리사", "대장장이", "낚시꾼", "연금술사"]
+JOBS = ["요리사", "대장장이", "낚시꾼", "연금술사", "무직백수"]
 
 async def process_loadout_selection(interaction: discord.Interaction, weapon_name: Optional[str], job_name: Optional[str]):
     await interaction.response.defer(ephemeral=True)

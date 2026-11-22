@@ -42,6 +42,9 @@ WARN_LOG_CHANNEL_ID = 1569705414839242884
 # 🧾 명령어 및 버튼 사용 실시간 로그 채널 ID
 COMMAND_LOG_CHANNEL_ID = 1572255298436206745
 
+# 🚪 서버 입·퇴장(탈퇴/추방) 실시간 로그 채널 ID
+MEMBER_LOG_CHANNEL_ID = 1559201050643140669
+
 # 📢 공지 확인 대상 채널 ID
 ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
@@ -828,6 +831,51 @@ async def update_member_counter(guild: discord.Guild):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
+# 🚪 [서버 입·퇴장 실시간 로그 전송 함수 (1559201050643140669)]
+async def send_member_activity_log(member: discord.Member, is_join: bool):
+    if MEMBER_LOG_CHANNEL_ID == 0:
+        return
+    log_ch = member.guild.get_channel(MEMBER_LOG_CHANNEL_ID)
+    if not log_ch:
+        try:
+            log_ch = await bot.fetch_channel(MEMBER_LOG_CHANNEL_ID)
+        except Exception:
+            return
+
+    now = datetime.now(KST)
+    if is_join:
+        created_str = member.created_at.astimezone(KST).strftime("%Y-%m-%d %H:%M") if member.created_at else "알 수 없음"
+        embed = discord.Embed(
+            title="📥 [서버 입장 로그]",
+            description=f"{member.mention} (`{member.name}`) 님이 서버에 입장했습니다.",
+            color=discord.Color.green(),
+            timestamp=now
+        )
+        embed.add_field(name="유저 ID", value=f"`{member.id}`", inline=True)
+        embed.add_field(name="계정 생성일", value=created_str, inline=True)
+        embed.add_field(name="현재 서버 인원", value=f"{len([m for m in member.guild.members if not m.bot])}명", inline=True)
+    else:
+        roles_list = [r.name for r in member.roles if r.name != "@everyone"]
+        roles_str = ", ".join(roles_list) if roles_list else "없음"
+        joined_str = member.joined_at.astimezone(KST).strftime("%Y-%m-%d %H:%M") if member.joined_at else "알 수 없음"
+        embed = discord.Embed(
+            title="📤 [서버 퇴장 로그]",
+            description=f"**{member.display_name}** (`{member.name}`) 님이 서버를 나갔습니다.",
+            color=discord.Color.red(),
+            timestamp=now
+        )
+        embed.add_field(name="유저 ID", value=f"`{member.id}`", inline=True)
+        embed.add_field(name="서버 가입일", value=joined_str, inline=True)
+        embed.add_field(name="보유했던 역할", value=roles_str, inline=False)
+
+    if member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    try:
+        await log_ch.send(embed=embed)
+    except Exception:
+        pass
+
 # --- 📒 [대여 장부 상환 완료 버튼 UI] ---
 class LedgerDoneView(discord.ui.View):
     def __init__(self):
@@ -1053,7 +1101,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
     await update_member_counter(member.guild)
+    await send_member_activity_log(member, is_join=True)
 
     welcome_channel_id = WELCOME_CHANNELS.get(member.guild.id)
     channel = member.guild.get_channel(welcome_channel_id) if welcome_channel_id else member.guild.system_channel
@@ -1078,7 +1129,10 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    if member.bot:
+        return
     await update_member_counter(member.guild)
+    await send_member_activity_log(member, is_join=False)
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -1338,7 +1392,6 @@ async def process_loadout_selection(interaction: discord.Interaction, weapon_nam
         ephemeral=True
     )
 
-    # 🧾 무기/직업 버튼 클릭 시에도 지정된 로그 채널(1572255298436206745)로 실시간 전송
     if COMMAND_LOG_CHANNEL_ID != 0:
         log_ch = guild.get_channel(COMMAND_LOG_CHANNEL_ID)
         if not log_ch:
@@ -1378,7 +1431,7 @@ class LoadoutButton(discord.ui.Button):
 class LoadoutSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        # 1~2번째 줄 (row 0, 1): 무기 6개 (3개씩 2줄)
+        # 1~2번째 줄 (row 0, 1): 무기 6개
         for idx, w in enumerate(WEAPONS):
             r_idx = 0 if idx < 3 else 1
             self.add_item(LoadoutButton(
@@ -1389,7 +1442,7 @@ class LoadoutSelectView(discord.ui.View):
                 row=r_idx,
                 custom_id=f"btn_loadout_weapon_{w}"
             ))
-        # 3~4번째 줄 (row 2, 3): 직업 버튼 자동 줄바꿈 (한 줄에 최대 4개씩)
+        # 3~4번째 줄 (row 2, 3): 생활직업 버튼 (한 줄에 최대 4개씩 자동 줄바꿈)
         for idx, j in enumerate(JOBS):
             r_idx = 2 if idx < 4 else 3
             self.add_item(LoadoutButton(
@@ -2639,14 +2692,13 @@ async def select_weapon_and_job(interaction: discord.Interaction):
         description=(
             "아래 버튼에서 원하는 **무기**와 **직업**을 클릭하면 즉시 적용됩니다!\n\n"
             "• **1~2번째 줄 (파란색)** : 🗡️ 무기 선택 (`검`, `창`, `도끼`, `활`, `클로`, `메이스`)\n"
-            "• **3번째 줄 (초록/회색)** : 🛠️ 생활직업 선택 또는 `⚔️ 전투직(직업해제)`\n\n"
+            "• **3~4번째 줄 (초록/회색)** : 🛠️ 생활직업 선택 (`요리사`, `대장장이`, `낚시꾼`, `연금술사`, `무직백수`) 또는 `⚔️ 전투직(직업해제)`\n\n"
             "🏷️ **닉네임 태그 규칙:**\n"
             "• 생활직업이 있으면 **`[직업]`** 태그가 우선 표기됩니다.\n"
             "• **`⚔️ 전투직(직업해제)`**를 누르면 **`[무기]`** 태그가 표기됩니다."
         ),
         color=discord.Color.blue()
     )
-    # 전체 사람에게 보이도록 ephemeral 제거 완료
     await interaction.response.send_message(embed=embed, view=LoadoutSelectView())
 
 @bot.tree.command(name="무기직업패널전송", description="[관리자 전용] 채널에 누구나 상시 클릭할 수 있는 무기·직업 선택 버튼 패널을 설치합니다.")
@@ -2661,7 +2713,7 @@ async def send_loadout_panel(interaction: discord.Interaction, 채널: discord.T
         description=(
             "아래 버튼을 클릭하면 본인의 **무기/직업 역할과 닉네임 태그**가 즉시 변경됩니다!\n\n"
             "• **🗡️ 파란색 버튼** : 주무기 선택 (`검` · `창` · `도끼` · `활` · `클로` · `메이스`)\n"
-            "• **🛠️ 초록색 버튼** : 생활직업 선택 (`요리사` · `대장장이` · `낚시꾼` · `연금술사`)\n"
+            "• **🛠️ 초록색 버튼** : 생활직업 선택 (`요리사` · `대장장이` · `낚시꾼` · `연금술사` · `무직백수`)\n"
             "• **⚔️ 회색 버튼** : 생활직업 해제 (`전투직` - 무기 태그가 닉네임에 표시됨)"
         ),
         color=0x800020
@@ -2677,7 +2729,7 @@ async def send_loadout_panel(interaction: discord.Interaction, 채널: discord.T
         await interaction.response.send_message(f"⚠️ {채널.mention} 채널에 메시지를 보낼 권한이 없습니다.", ephemeral=True)
 
 @bot.tree.command(name="무기직업", description="무기와 직업을 직접 텍스트로 지정합니다.")
-@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 연금술사, 또는 전투직)")
+@app_commands.describe(무기="선택할 무기 (검, 창, 도끼, 활, 클로, 메이스)", 직업="선택할 직업 (요리사, 대장장이, 낚시꾼, 연금술사, 무직백수, 또는 전투직)")
 async def direct_set_loadout(interaction: discord.Interaction, 무기: Optional[str] = None, 직업: Optional[str] = None):
     if not 무기 and not 직업:
         await interaction.response.send_message("❌ 무기나 직업 중 최소 하나를 입력해 주세요!", ephemeral=True)

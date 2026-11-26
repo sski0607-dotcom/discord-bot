@@ -185,6 +185,7 @@ def init_admin_web(app, bot, b):
         base_prob_days = b['get_probation_days'](guild_id) if 'get_probation_days' in b else 7
         prob_recs = b.get('PROBATION_RECORDS', {}).get(guild_id, {})
         prob_map = b.get('PROBATION_ROLE_MAP', {})
+        raw_exempts = b.get('VOICE_EXEMPTIONS', {}).get(guild_id, {})
 
         members = []
         for m in guild.members:
@@ -196,8 +197,23 @@ def init_admin_web(app, bot, b):
             if sess and sess.get('active') and sess.get('guild_id') == guild_id and sess.get('start_time'):
                 daily[cur_weekday] += max(0, int((now - sess['start_time']).total_seconds()))
 
+            is_staff = b['is_staff_member'](m) if 'is_staff_member' in b else False
             target, reason = b['get_user_weekly_goal'](guild_id, m.id, now)
             ex = b['is_voice_exempt'](guild_id, m.id, now_date)
+
+            # 예약된 휴가(미래 시작일~종료일) 포함 여부 확인
+            raw_ex = raw_exempts.get(u_str)
+            has_vacation = False
+            vacation_desc = ''
+            if raw_ex:
+                try:
+                    u_dt = datetime.strptime(raw_ex['until'], '%Y-%m-%d').date()
+                    if now_date <= u_dt:
+                        has_vacation = True
+                        v_period = f"{raw_ex['start']}~{raw_ex['until']}" if raw_ex.get('start') else f"~{raw_ex['until']}"
+                        vacation_desc = f"{v_period} | {raw_ex['reason']}"
+                except Exception:
+                    pass
 
             daily_req = b['requires_daily_one_hour'](guild_id, m) if 'requires_daily_one_hour' in b else False
             join_dt = b['get_member_effective_join_date'](guild_id, m) if 'get_member_effective_join_date' in b else monday_dt
@@ -223,7 +239,7 @@ def init_admin_web(app, bot, b):
                 day_ex = b['is_voice_exempt'](guild_id, m.id, d_obj)
                 if not daily_req or idx > cur_weekday:
                     daily_flags.append('')
-                elif day_ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
+                elif is_staff or day_ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
                     daily_flags.append('exempt')
                 elif daily[idx] >= 3600:
                     daily_flags.append('ok')
@@ -246,8 +262,11 @@ def init_admin_web(app, bot, b):
                 'is_probation': is_prob,
                 'prob_desc': prob_desc,
                 'join_date': join_dt.strftime('%Y-%m-%d'),
-                'is_exempt': bool(ex),
-                'exempt_desc': (f"{exempt_period} | {ex['reason']}" if ex else ''),
+                'is_staff': is_staff,
+                'is_exempt': bool(ex) or is_staff,
+                'has_vacation': has_vacation,
+                'exempt_desc': (f"{exempt_period} | {ex['reason']}" if ex else ('🛡️ 관리진 자동 면제' if is_staff else vacation_desc)),
+                'vacation_desc': vacation_desc,
                 'voice': m.voice.channel.name if m.voice and m.voice.channel else None,
                 'warn_count': len(warnings.get(u_str, []))
             })

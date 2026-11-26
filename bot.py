@@ -192,15 +192,17 @@ def get_user_weekly_goal(guild_id: int, user_id: int, reference_dt: Optional[dat
 
     return DEFAULT_WEEKLY_GOAL_SEC, None
 
-def is_voice_exempt(guild_id: int, user_id: int) -> Optional[dict]:
+def is_voice_exempt(guild_id: int, user_id: int, target_date: Optional[date] = None) -> Optional[dict]:
     guild_exempts = VOICE_EXEMPTIONS.get(guild_id, {})
     exempt_info = guild_exempts.get(str(user_id))
     if not exempt_info:
         return None
     try:
         until_date = datetime.strptime(exempt_info["until"], "%Y-%m-%d").date()
-        today_date = datetime.now(KST).date()
-        if today_date <= until_date:
+        start_str = exempt_info.get("start")
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else date(2000, 1, 1)
+        check_date = target_date or datetime.now(KST).date()
+        if start_date <= check_date <= until_date:
             return exempt_info
     except Exception:
         pass
@@ -363,7 +365,11 @@ async def fetch_database_from_channel(guild: discord.Guild):
                         u_id = str(data["user_id"])
                         action = data.get("action", "add")
                         if action == "add":
-                            exempts[u_id] = {"until": data["until"], "reason": data["reason"]}
+                            exempts[u_id] = {
+                                "start": data.get("start", ""),
+                                "until": data["until"],
+                                "reason": data["reason"]
+                            }
                         elif action == "remove":
                             if u_id in exempts:
                                 del exempts[u_id]
@@ -614,7 +620,11 @@ async def log_voice_exempt_action(guild: discord.Guild, user_id: int, action: st
         VOICE_EXEMPTIONS[guild.id] = {}
     u_str = str(user_id)
     if action == "add":
-        VOICE_EXEMPTIONS[guild.id][u_str] = {"until": data["until"], "reason": data["reason"]}
+        VOICE_EXEMPTIONS[guild.id][u_str] = {
+            "start": data.get("start", ""),
+            "until": data["until"],
+            "reason": data["reason"]
+        }
     elif action == "remove" and u_str in VOICE_EXEMPTIONS[guild.id]:
         del VOICE_EXEMPTIONS[guild.id][u_str]
 
@@ -1255,7 +1265,7 @@ async def daily_voice_check():
                         past_7_strs = [d.strftime("%Y-%m-%d") for d in past_7_dates]
 
                         for member in target_members:
-                            if is_voice_exempt(guild.id, member.id):
+                            if is_voice_exempt(guild.id, member.id, yesterday_dt.date()):
                                 continue
 
                             u_str = str(member.id)
@@ -1270,7 +1280,7 @@ async def daily_voice_check():
                                 for idx, d_obj in enumerate(past_7_dates):
                                     if d_obj < join_dt or d_obj < DAILY_RULE_CUTOFF_DATE:
                                         continue
-                                    if idx in rec_excluded:
+                                    if idx in rec_excluded or is_voice_exempt(guild.id, member.id, d_obj):
                                         continue
                                     d_spent = guild_data.get(d_obj.strftime("%Y-%m-%d"), {}).get(u_str, 0)
                                     if d_spent < 3600:
@@ -1431,7 +1441,6 @@ class LoadoutButton(discord.ui.Button):
 class LoadoutSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        # 1~2번째 줄 (row 0, 1): 무기 6개
         for idx, w in enumerate(WEAPONS):
             r_idx = 0 if idx < 3 else 1
             self.add_item(LoadoutButton(
@@ -1442,7 +1451,6 @@ class LoadoutSelectView(discord.ui.View):
                 row=r_idx,
                 custom_id=f"btn_loadout_weapon_{w}"
             ))
-        # 3~4번째 줄 (row 2, 3): 생활직업 버튼 (한 줄에 최대 4개씩 자동 줄바꿈)
         for idx, j in enumerate(JOBS):
             r_idx = 2 if idx < 4 else 3
             self.add_item(LoadoutButton(
@@ -1453,7 +1461,6 @@ class LoadoutSelectView(discord.ui.View):
                 row=r_idx,
                 custom_id=f"btn_loadout_job_{j}"
             ))
-        # 4번째 줄 (row 3): 전투직(직업해제) 버튼
         self.add_item(LoadoutButton(
             category="job",
             item_name="없음 (전투직)",
@@ -2266,33 +2273,34 @@ async def reset_user_verification(interaction: discord.Interaction, 유저: disc
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="통화예외등록", description="[관리자 전용] 특정 유저를 지정한 날짜까지 통화 출결 체크에서 예외(면제) 처리합니다.")
-@app_commands.describe(유저="출결 예외 대상 멤버", 종료일="예외 인정 종료일 (형식: YYYY-MM-DD)", 사유="휴가 및 예외 사유")
-async def add_voice_exemption(interaction: discord.Interaction, 유저: discord.Member, 종료일: str, 사유: str):
+@bot.tree.command(name="통화예외등록", description="[관리자 전용] 특정 유저를 지정한 시작일부터 종료일까지 통화 출결 체크에서 예외(면제) 처리합니다.")
+@app_commands.describe(유저="출결 예외 대상 멤버", 시작일="예외 시작일 (형식: YYYY-MM-DD)", 종료일="예외 종료일 (형식: YYYY-MM-DD)", 사유="휴가 및 예외 사유")
+async def add_voice_exemption(interaction: discord.Interaction, 유저: discord.Member, 시작일: str, 종료일: str, 사유: str):
     await interaction.response.defer(ephemeral=True)
     if not is_admin_or_mod(interaction):
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
     try:
+        start_date = datetime.strptime(시작일.strip(), "%Y-%m-%d").date()
         until_date = datetime.strptime(종료일.strip(), "%Y-%m-%d").date()
     except ValueError:
-        await interaction.followup.send("❌ 날짜 형식이 올바르지 않습니다. 반드시 `YYYY-MM-DD` 형식으로 입력해 주세요. (예: 2026-11-20)", ephemeral=True)
+        await interaction.followup.send("❌ 날짜 형식이 올바르지 않습니다. 반드시 `YYYY-MM-DD` 형식으로 입력해 주세요. (예: 2026-11-26)", ephemeral=True)
         return
 
-    if until_date < datetime.now(KST).date():
-        await interaction.followup.send("❌ 종료일은 오늘 또는 미래 날짜여야 합니다.", ephemeral=True)
+    if until_date < start_date:
+        await interaction.followup.send("❌ 종료일은 시작일과 같거나 시작일보다 뒤여야 합니다.", ephemeral=True)
         return
 
-    payload = {"until": 종료일.strip(), "reason": 사유.strip()}
+    payload = {"start": 시작일.strip(), "until": 종료일.strip(), "reason": 사유.strip()}
     await log_voice_exempt_action(interaction.guild, 유저.id, "add", payload)
 
     embed = discord.Embed(
         title="🏖️ [통화 출결 예외(휴가) 등록 완료]",
-        description=f"{유저.mention} 님이 **{종료일.strip()}**까지 통화 출결 집계 및 미달자 태그에서 제외됩니다.",
+        description=f"{유저.mention} 님이 **{시작일.strip()} ~ {종료일.strip()}** 기간 동안 통화 출결 집계 및 미달자 태그에서 제외됩니다.",
         color=discord.Color.teal()
     )
-    embed.add_field(name="종료 예정일", value=f"`{종료일.strip()}` 자정까지", inline=True)
+    embed.add_field(name="예외 적용 기간", value=f"`{시작일.strip()}` ~ `{종료일.strip()}`", inline=True)
     embed.add_field(name="등록 사유", value=사유.strip(), inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -2304,14 +2312,14 @@ async def remove_voice_exemption(interaction: discord.Interaction, 유저: disco
         await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
-    if not is_voice_exempt(interaction.guild.id, 유저.id):
+    if str(유저.id) not in VOICE_EXEMPTIONS.get(interaction.guild.id, {}):
         await interaction.followup.send("⚠️ 해당 멤버는 현재 통화 예외자로 등록되어 있지 않습니다.", ephemeral=True)
         return
 
     await log_voice_exempt_action(interaction.guild, 유저.id, "remove", {})
     await interaction.followup.send(f"✅ {유저.mention} 님의 통화 출결 예외 상태가 해제되어 정상 집계됩니다.", ephemeral=True)
 
-@bot.tree.command(name="통화예외목록", description="[관리자 전용] 현재 통화 출결 체크에서 면제 중인 휴가자 명단을 조회합니다.")
+@bot.tree.command(name="통화예외목록", description="[관리자 전용] 현재 적용 중이거나 예약된 통화 출결 예외(휴가자) 명단을 조회합니다.")
 async def list_voice_exemptions(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     if not is_admin_or_mod(interaction):
@@ -2326,7 +2334,8 @@ async def list_voice_exemptions(interaction: discord.Interaction):
         try:
             u_date = datetime.strptime(info["until"], "%Y-%m-%d").date()
             if today <= u_date:
-                active_lines.append(f"• <@{uid}> - `{info['until']}`까지 ({info['reason']})")
+                period = f"{info['start']} ~ {info['until']}" if info.get("start") else f"~{info['until']}"
+                active_lines.append(f"• <@{uid}> - `{period}` ({info['reason']})")
         except Exception:
             continue
 
@@ -2553,7 +2562,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
-    exempt_info = is_voice_exempt(guild_id, target.id)
+    exempt_info = is_voice_exempt(guild_id, target.id, now.date())
     goal_sec, goal_reason = get_user_weekly_goal(guild_id, target.id, now)
     goal_label = format_hours_short(goal_sec)
     daily_req = requires_daily_one_hour(guild_id, target)
@@ -2576,7 +2585,10 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
         day_label = f"**{WEEKDAYS_KO[i]}요일**" + (" *(오늘)*" if i == current_weekday else "")
 
         if daily_req and i <= current_weekday:
-            icon = "✅" if day_spent >= 3600 else "⚠️"
+            if is_voice_exempt(guild_id, target.id, target_day.date()):
+                icon = "➖"
+            else:
+                icon = "✅" if day_spent >= 3600 else "⚠️"
             daily_breakdown.append(f"{icon} {day_label} : `{format_seconds(day_spent)}`")
         else:
             daily_breakdown.append(f"• {day_label} : `{format_seconds(day_spent)}`")
@@ -2602,7 +2614,8 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
     
     if exempt_info:
-        embed.add_field(name="🏖️ 출결 예외 상태", value=f"**{exempt_info['until']}**까지 면제 ({exempt_info['reason']})", inline=False)
+        period_str = f"{exempt_info['start']} ~ {exempt_info['until']}" if exempt_info.get("start") else f"~{exempt_info['until']}"
+        embed.add_field(name="🏖️ 출결 예외 상태", value=f"**{period_str}** 면제 ({exempt_info['reason']})", inline=False)
 
     embed.add_field(name="📊 이번 주 요일별 상세 기록", value="\n".join(daily_breakdown), inline=False)
     embed.add_field(name="📈 최근 7일 이동 합계", value=f"**{format_seconds(recent_7_sec)}**", inline=True)
@@ -2638,7 +2651,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         today_records = guild_data.get(today_str, {})
         current_weekday = now.weekday()
         for member in target_members:
-            if is_voice_exempt(guild.id, member.id):
+            if is_voice_exempt(guild.id, member.id, now.date()):
                 continue
             if not requires_daily_one_hour(guild.id, member):
                 continue
@@ -2656,7 +2669,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         current_weekday = now.weekday()
         this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(current_weekday + 1)]
         for member in target_members:
-            if is_voice_exempt(guild.id, member.id):
+            if is_voice_exempt(guild.id, member.id, now.date()):
                 continue
             goal_sec, goal_reason = get_user_weekly_goal(guild.id, member.id, now)
             spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in this_week_days)

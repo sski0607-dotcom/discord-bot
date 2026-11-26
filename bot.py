@@ -89,6 +89,12 @@ def is_target_member(member: discord.Member) -> bool:
 def is_probation_member(member: discord.Member) -> bool:
     return any(role.name in PROBATION_ROLE_MAP for role in member.roles)
 
+def is_staff_member(member: discord.Member) -> bool:
+    perms = member.guild_permissions
+    if perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members:
+        return True
+    return any("관리" in role.name for role in member.roles)
+
 def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
     if not channel:
         return False
@@ -145,6 +151,8 @@ def get_member_effective_join_date(guild_id: int, member: discord.Member) -> dat
     return datetime.now(KST).date()
 
 def requires_daily_one_hour(guild_id: int, member: discord.Member) -> bool:
+    if is_staff_member(member):
+        return False
     if not is_probation_member(member):
         return False
     join_dt = get_member_effective_join_date(guild_id, member)
@@ -209,8 +217,7 @@ def is_voice_exempt(guild_id: int, user_id: int, target_date: Optional[date] = N
     return None
 
 def is_admin_or_mod(interaction: discord.Interaction) -> bool:
-    perms = interaction.user.guild_permissions
-    return perms.administrator or perms.manage_guild or perms.moderate_members or perms.kick_members
+    return is_staff_member(interaction.user)
 
 def format_seconds(seconds: int) -> str:
     hrs = seconds // 3600
@@ -1265,7 +1272,7 @@ async def daily_voice_check():
                         past_7_strs = [d.strftime("%Y-%m-%d") for d in past_7_dates]
 
                         for member in target_members:
-                            if is_voice_exempt(guild.id, member.id, yesterday_dt.date()):
+                            if is_staff_member(member) or is_voice_exempt(guild.id, member.id, yesterday_dt.date()):
                                 continue
 
                             u_str = str(member.id)
@@ -1305,7 +1312,7 @@ async def daily_voice_check():
                             description=(
                                 "• **정식 길드원**: 주간 누적 11시간 기준 (일일 제한 없음)\n"
                                 "• **11/14 이후 가입 수습생**: 일일 최소 1시간 + 주간 누적 11시간 기준\n"
-                                "*(휴가자 제외 및 정기 요일 면제·중도 가입 감면 반영 완료)*"
+                                "*(관리진·휴가자 자동 면제 및 정기 요일·중도 가입 감면 반영 완료)*"
                             ),
                             color=discord.Color.dark_red() if weekly_failed else discord.Color.blue()
                         )
@@ -2562,6 +2569,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
             else:
                 current_status = "⏸️ 측정 대기 중"
 
+    staff_exempt = is_staff_member(target)
     exempt_info = is_voice_exempt(guild_id, target.id, now.date())
     goal_sec, goal_reason = get_user_weekly_goal(guild_id, target.id, now)
     goal_label = format_hours_short(goal_sec)
@@ -2600,8 +2608,11 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     past_7_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     recent_7_sec = sum(guild_data.get(d_str, {}).get(u_str, 0) for d_str in past_7_days) + cur_live_diff
 
-    goal_note = f" (기준: **{goal_label}** - {goal_reason})" if goal_reason else f" (기준: {goal_label})"
-    if daily_req:
+    goal_note = " *(🛡️ 관리진 자동 면제 / 시간 집계 중)*" if staff_exempt else (f" (기준: **{goal_label}** - {goal_reason})" if goal_reason else f" (기준: {goal_label})")
+    if staff_exempt:
+        today_sub = "*(🛡️ 관리진 자동 면제)*"
+        rule_desc = "📌 적용 규칙: **🛡️ 관리진 자동 면제** (시간 측정 및 랭킹 집계는 정상 유지)"
+    elif daily_req:
         today_sub = "✅ 일일 1시간 달성" if today_sec >= 3600 else "⚠️ 일일 1시간 미달 (신규 수습 기준)"
         rule_desc = "📌 적용 규칙: **일일 최소 1시간 + 주간 누적 11시간** (11/14 이후 가입 수습생)"
     else:
@@ -2611,7 +2622,7 @@ async def check_voice_time(interaction: discord.Interaction, 유저: Optional[di
     embed = discord.Embed(title=f"🎙️ {target.display_name} 님의 통화방 시간표", description=rule_desc, color=discord.Color.teal())
     embed.add_field(name="📅 오늘 참여 시간", value=f"**{format_seconds(today_sec)}**\n{today_sub}", inline=True)
     embed.add_field(name="🗓️ 이번 주 총합 (월~오늘)", value=f"**{format_seconds(this_week_sec)}**{goal_note}", inline=True)
-    embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}** (기준: 11시간)", inline=True)
+    embed.add_field(name="📜 지난주 기록 (월~일)", value=f"**{format_seconds(last_week_sec)}**", inline=True)
     
     if exempt_info:
         period_str = f"{exempt_info['start']} ~ {exempt_info['until']}" if exempt_info.get("start") else f"~{exempt_info['until']}"
@@ -2651,7 +2662,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         today_records = guild_data.get(today_str, {})
         current_weekday = now.weekday()
         for member in target_members:
-            if is_voice_exempt(guild.id, member.id, now.date()):
+            if is_staff_member(member) or is_voice_exempt(guild.id, member.id, now.date()):
                 continue
             if not requires_daily_one_hour(guild.id, member):
                 continue
@@ -2669,7 +2680,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         current_weekday = now.weekday()
         this_week_days = [(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(current_weekday + 1)]
         for member in target_members:
-            if is_voice_exempt(guild.id, member.id, now.date()):
+            if is_staff_member(member) or is_voice_exempt(guild.id, member.id, now.date()):
                 continue
             goal_sec, goal_reason = get_user_weekly_goal(guild.id, member.id, now)
             spent = sum(guild_data.get(d_str, {}).get(str(member.id), 0) for d_str in this_week_days)
@@ -2682,7 +2693,7 @@ async def list_voice_failed(interaction: discord.Interaction, 구분: app_comman
         title = f"📊 이번 주 목표 통화시간 미달자 ({len(failed_lines)}명)"
 
     if not failed_lines:
-        await interaction.followup.send("🎉 전원 기준 달성 완료! (휴가자 제외) 미달자가 없습니다.", ephemeral=True)
+        await interaction.followup.send("🎉 전원 기준 달성 완료! (관리진·휴가자 제외) 미달자가 없습니다.", ephemeral=True)
         return
 
     embed = discord.Embed(title=title, color=discord.Color.red())

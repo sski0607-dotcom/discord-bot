@@ -197,7 +197,7 @@ def init_admin_web(app, bot, b):
                 daily[cur_weekday] += max(0, int((now - sess['start_time']).total_seconds()))
 
             target, reason = b['get_user_weekly_goal'](guild_id, m.id, now)
-            ex = b['is_voice_exempt'](guild_id, m.id)
+            ex = b['is_voice_exempt'](guild_id, m.id, now_date)
 
             daily_req = b['requires_daily_one_hour'](guild_id, m) if 'requires_daily_one_hour' in b else False
             join_dt = b['get_member_effective_join_date'](guild_id, m) if 'get_member_effective_join_date' in b else monday_dt
@@ -220,9 +220,10 @@ def init_admin_web(app, bot, b):
             daily_flags = []
             missed_days = []
             for idx, d_obj in enumerate(day_objs):
+                day_ex = b['is_voice_exempt'](guild_id, m.id, d_obj)
                 if not daily_req or idx > cur_weekday:
                     daily_flags.append('')
-                elif ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
+                elif day_ex or d_obj < join_dt or d_obj < cutoff_date or idx in rec_excluded:
                     daily_flags.append('exempt')
                 elif daily[idx] >= 3600:
                     daily_flags.append('ok')
@@ -230,6 +231,7 @@ def init_admin_web(app, bot, b):
                     daily_flags.append('fail')
                     missed_days.append(weekdays_ko[idx])
 
+            exempt_period = (f"{ex['start']}~{ex['until']}" if ex.get('start') else f"~{ex['until']}") if ex else ''
             members.append({
                 'id': u_str,
                 'name': m.display_name,
@@ -245,7 +247,7 @@ def init_admin_web(app, bot, b):
                 'prob_desc': prob_desc,
                 'join_date': join_dt.strftime('%Y-%m-%d'),
                 'is_exempt': bool(ex),
-                'exempt_desc': (f"~{ex['until']} | {ex['reason']}" if ex else ''),
+                'exempt_desc': (f"{exempt_period} | {ex['reason']}" if ex else ''),
                 'voice': m.voice.channel.name if m.voice and m.voice.channel else None,
                 'warn_count': len(warnings.get(u_str, []))
             })
@@ -358,17 +360,19 @@ def init_admin_web(app, bot, b):
             return {'ok': True, 'message': f'수습 기간이 +{days}일 연장되었습니다.'}
 
         elif action == 'exempt_add':
-            until = str(value.get('until', ''))
+            start = str(value.get('start') or now.strftime('%Y-%m-%d')).strip()
+            until = str(value.get('until', '')).strip()
             try:
+                start_date = datetime.strptime(start, '%Y-%m-%d').date()
                 until_date = datetime.strptime(until, '%Y-%m-%d').date()
             except ValueError:
-                raise ValueError('종료일은 YYYY-MM-DD 형식이어야 합니다.')
-            if until_date < now.date() or (until_date - now.date()).days > 365:
-                raise ValueError('종료일은 오늘부터 365일 이내여야 합니다.')
+                raise ValueError('시작일과 종료일은 YYYY-MM-DD 형식이어야 합니다.')
+            if until_date < start_date or (until_date - start_date).days > 365:
+                raise ValueError('종료일은 시작일 이후 365일 이내여야 합니다.')
             reason = str(value.get('reason', '')).strip()
             if not 1 <= len(reason) <= 200:
                 raise ValueError('휴가 사유는 1~200자로 입력하세요.')
-            await b['log_voice_exempt_action'](guild, uid, 'add', {'until': until, 'reason': reason})
+            await b['log_voice_exempt_action'](guild, uid, 'add', {'start': start, 'until': until, 'reason': reason})
 
         elif action == 'exempt_remove':
             await b['log_voice_exempt_action'](guild, uid, 'remove', {})

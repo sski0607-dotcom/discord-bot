@@ -1972,6 +1972,63 @@ async def set_probation_period(interaction: discord.Interaction, 일수: int):
     await log_probation_config(interaction.guild, 일수)
     await interaction.followup.send(f"✅ 수습생 기본 수습 기간이 **{일수}일**로 설정되었습니다! (매일 낮 12시에 만료자를 자동 체크합니다)", ephemeral=True)
 
+@bot.tree.command(name="승급", description="[관리자 전용] 특정 수습생을 즉시 정식 길드원으로 승급시키고 축하 DM을 발송합니다.")
+@app_commands.describe(유저="정식 길드원으로 즉시 승급시킬 수습생")
+async def promote_member_command(interaction: discord.Interaction, 유저: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    if not is_admin_or_mod(interaction):
+        await interaction.followup.send("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    promoted_from = None
+    promoted_to = None
+
+    for role in list(유저.roles):
+        if role.name in PROBATION_ROLE_MAP:
+            promoted_from = role.name
+            promoted_to = PROBATION_ROLE_MAP[role.name]
+            try:
+                await 유저.remove_roles(role)
+            except discord.Forbidden:
+                await interaction.followup.send("❌ 봇의 역할 순위가 낮아 수습생 역할을 제거할 수 없습니다.", ephemeral=True)
+                return
+            new_role = discord.utils.get(guild.roles, name=promoted_to) or await guild.create_role(name=promoted_to)
+            if new_role:
+                try:
+                    await 유저.add_roles(new_role)
+                except discord.Forbidden:
+                    pass
+            break
+
+    if not promoted_to:
+        await interaction.followup.send("⚠️ 해당 멤버는 현재 수습생 역할(`월영/영월/은월 수습생`)을 가지고 있지 않습니다.", ephemeral=True)
+        return
+
+    await log_probation_action(guild, 유저.id, "promoted")
+
+    guild_label = promoted_to.split()[0]
+    dm_text = (
+        f"🌙 정식 길드원 승급을 진심으로 축하드립니다!\n\n"
+        f"수습 기간 동안 {guild_label}과 함께해 주셔서 감사합니다.\n\n"
+        f"이제 정식 **[{promoted_to}]**으로서 함께하게 되었습니다!\n\n"
+        f"함께해 주신 시간에 감사드리며, 앞으로도 서로 존중하고 배려하며 {guild_label}에서 더욱 즐겁고 소중한 추억을 만들어 나갔으면 좋겠습니다.\n\n"
+        f"✦ 정식 길드원 활동 기준\n\n"
+        f"• 일일 최소 활동 시간 제한 없음\n"
+        f"• 주간 활동 시간 11시간 이상 유지\n\n"
+        f"{guild_label}의 새로운 가족이 되신 것을 진심으로 환영합니다!"
+    )
+    dm_status = "✅ 축하 DM 발송 완료"
+    try:
+        await 유저.send(dm_text)
+    except Exception:
+        dm_status = "⚠️ 유저가 서버 멤버 DM을 차단해 두어 DM 발송은 건너뛰었습니다"
+
+    await interaction.followup.send(
+        f"🎉 {유저.mention} 님이 `{promoted_from}` ➔ **{promoted_to}**(으)로 즉시 승급되었습니다!\n({dm_status})",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="수습연장", description="[관리자 전용] 특정 수습생의 수습 기간을 1주일(+7일) 연장합니다.")
 @app_commands.describe(유저="수습 기간을 연장할 수습생", 일수="추가할 연장 일수 (기본 7일)")
 async def extend_member_probation(interaction: discord.Interaction, 유저: discord.Member, 일수: int = 7):

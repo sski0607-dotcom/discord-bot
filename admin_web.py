@@ -201,7 +201,6 @@ def init_admin_web(app, bot, b):
             target, reason = b['get_user_weekly_goal'](guild_id, m.id, now)
             ex = b['is_voice_exempt'](guild_id, m.id, now_date)
 
-            # 예약된 휴가(미래 시작일~종료일) 포함 여부 확인
             raw_ex = raw_exempts.get(u_str)
             has_vacation = False
             vacation_desc = ''
@@ -358,8 +357,20 @@ def init_admin_web(app, bot, b):
             if not promoted_to:
                 raise ValueError('해당 멤버는 현재 수습생 역할을 가지고 있지 않습니다.')
             await b['log_probation_action'](guild, uid, 'promoted')
+
+            guild_label = promoted_to.split()[0]
+            dm_text = (
+                f"🌙 정식 길드원 승급을 진심으로 축하드립니다!\n\n"
+                f"수습 기간 동안 {guild_label}과 함께해 주셔서 감사합니다.\n\n"
+                f"이제 정식 **[{promoted_to}]**으로서 함께하게 되었습니다!\n\n"
+                f"함께해 주신 시간에 감사드리며, 앞으로도 서로 존중하고 배려하며 {guild_label}에서 더욱 즐겁고 소중한 추억을 만들어 나갔으면 좋겠습니다.\n\n"
+                f"✦ 정식 길드원 활동 기준\n\n"
+                f"• 일일 최소 활동 시간 제한 없음\n"
+                f"• 주간 활동 시간 11시간 이상 유지\n\n"
+                f"{guild_label}의 새로운 가족이 되신 것을 진심으로 환영합니다!"
+            )
             try:
-                await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다!")
+                await member.send(dm_text)
             except Exception:
                 pass
             return {'ok': True, 'message': f'[{promoted_to}](으)로 정식 승급 완료되었습니다!'}

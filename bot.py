@@ -45,6 +45,9 @@ COMMAND_LOG_CHANNEL_ID = 1572255298436206745
 # 🚪 서버 입·퇴장(탈퇴/추방) 실시간 로그 채널 ID
 MEMBER_LOG_CHANNEL_ID = 1559201050643140669
 
+# 🏖️ 휴가(미접속) 신청 전용 채널 ID
+VACATION_CHANNEL_ID = 1569699404368052284
+
 # 📢 공지 확인 대상 채널 ID
 ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 
@@ -1002,8 +1005,19 @@ class PromoteView(discord.ui.View):
 
         await interaction.message.edit(embed=embed, view=self)
 
+        guild_label = promoted_to.split()[0]
+        dm_text = (
+            f"🌙 정식 길드원 승급을 진심으로 축하드립니다!\n\n"
+            f"수습 기간 동안 {guild_label}과 함께해 주셔서 감사합니다.\n\n"
+            f"이제 정식 **[{promoted_to}]**으로서 함께하게 되었습니다!\n\n"
+            f"함께해 주신 시간에 감사드리며, 앞으로도 서로 존중하고 배려하며 {guild_label}에서 더욱 즐겁고 소중한 추억을 만들어 나갔으면 좋겠습니다.\n\n"
+            f"✦ 정식 길드원 활동 기준\n\n"
+            f"• 일일 최소 활동 시간 제한 없음\n"
+            f"• 주간 활동 시간 11시간 이상 유지\n\n"
+            f"{guild_label}의 새로운 가족이 되신 것을 진심으로 환영합니다!"
+        )
         try:
-            await member.send(f"🎉 축하합니다! **{guild.name}** 서버에서 **[{promoted_to}]**(으)로 정식 승급되었습니다! (정식 길드원은 일일 최소 시간 제한 없이 주간 11시간 기준만 적용됩니다.)")
+            await member.send(dm_text)
         except Exception:
             pass
 
@@ -1740,6 +1754,48 @@ class NoticePaginationView(discord.ui.View):
 
 
 # --- 슬래시 명령어 세트 ---
+
+# 🏖️ [길드원 본인 휴가(미접속) 신청 명령어 - 지정 채널(1569699404368052284) 전체 공개]
+@bot.tree.command(name="휴가신청", description="미접속(휴가) 일정을 신청합니다. 등록 기간 동안 통화 시간 체크에서 자동 제외됩니다.")
+@app_commands.describe(
+    시작일="휴가 시작일 (형식: YYYY-MM-DD, 예: 2026-11-28)",
+    종료일="휴가 종료일 (형식: YYYY-MM-DD, 예: 2026-12-01)",
+    사유="미접속 및 휴가 사유"
+)
+async def apply_vacation(interaction: discord.Interaction, 시작일: str, 종료일: str, 사유: str):
+    await interaction.response.defer()
+    try:
+        start_date = datetime.strptime(시작일.strip(), "%Y-%m-%d").date()
+        until_date = datetime.strptime(종료일.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        await interaction.followup.send("❌ 날짜 형식이 올바르지 않습니다. 반드시 `YYYY-MM-DD` 형식으로 입력해 주세요. (예: `2026-11-28`)", ephemeral=True)
+        return
+
+    if until_date < start_date:
+        await interaction.followup.send("❌ 종료일은 시작일과 같거나 시작일보다 뒤여야 합니다.", ephemeral=True)
+        return
+
+    if (until_date - start_date).days > 180:
+        await interaction.followup.send("❌ 한 번에 최대 180일까지 신청할 수 있습니다.", ephemeral=True)
+        return
+
+    user = interaction.user
+    payload = {"start": 시작일.strip(), "until": 종료일.strip(), "reason": 사유.strip()}
+    await log_voice_exempt_action(interaction.guild, user.id, "add", payload)
+
+    schedule_str = f"`{시작일.strip()}` ~ `{종료일.strip()}`" if 시작일.strip() != 종료일.strip() else f"`{시작일.strip()}` (당일)"
+    embed = discord.Embed(
+        title="📅 휴가(미접속) 신청",
+        description=(
+            f"**신청자:** {user.mention}\n"
+            f"**일정:** {schedule_str}\n"
+            f"**사유:** {사유.strip()}"
+        ),
+        color=0x5865F2,
+        timestamp=datetime.now(KST)
+    )
+    embed.set_footer(text="해당 기간 동안 통화 시간 출결 집계에서 자동으로 면제됩니다.")
+    await interaction.followup.send(content=user.mention, embed=embed)
 
 # 📒 [대여 장부 명령어 4종 - 모든 길드원 사용 가능, 지정 채널 제한]
 @bot.tree.command(name="장부등록", description="빌려준 사람과 빌린 사람을 지정하여 대여 장부에 기록합니다.")
@@ -3021,6 +3077,7 @@ async def on_app_command_completion(interaction: discord.Interaction, command: a
 COMMAND_CHANNEL_RULES = {
     "통화시간": 1569704533905383475,
     "경고확인": 1571529725241987232,
+    "휴가신청": VACATION_CHANNEL_ID,
     "장부등록": 1572248610614284348,
     "장부목록": 1572248610614284348,
     "장부완료": 1572248610614284348,
@@ -3029,6 +3086,7 @@ COMMAND_CHANNEL_RULES = {
 COMMAND_ONLY_CHANNEL_IDS = {
     1569704533905383475: ["통화시간"],
     1571529725241987232: ["경고확인"],
+    VACATION_CHANNEL_ID: ["휴가신청"],
     1572248610614284348: ["장부등록", "장부목록", "장부완료", "장부삭제"],
 }
 

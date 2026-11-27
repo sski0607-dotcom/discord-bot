@@ -54,6 +54,10 @@ ANNOUNCEMENT_CHANNEL_ID = 1559080610335817779
 # 💤 시간 측정을 제외할 잠수방 음성 채널 ID
 AFK_VOICE_CHANNEL_ID = 1569698118004514836
 
+# ➕ 입장 시 통화방을 자동 생성할 트리거 음성 채널 ID (달의 회랑)
+JTC_TRIGGER_CHANNEL_ID = 1572255938457378886
+JTC_CREATED_CHANNELS: set[int] = set()
+
 # 한국 표준시(KST)
 KST = timezone(timedelta(hours=9))
 
@@ -106,6 +110,49 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
     if channel.guild.afk_channel and channel.id == channel.guild.afk_channel.id:
         return True
     return False
+
+def extract_pure_name(display_name: str) -> str:
+    cleaned = re.sub(r'^[\[【].*?[\]】]\s*', '', display_name).strip()
+    pure_name = cleaned.split('/')[0].strip()
+    return pure_name if pure_name else display_name
+
+async def handle_jtc_voice(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    guild = member.guild
+
+    if after.channel and JTC_TRIGGER_CHANNEL_ID != 0 and after.channel.id == JTC_TRIGGER_CHANNEL_ID:
+        pure_name = extract_pure_name(member.display_name)
+        channel_name = f"₍₍🔊⁾⁾┇ {pure_name}님의 정원"[:100]
+        category = after.channel.category
+
+        overwrites = dict(after.channel.overwrites)
+        overwrites[member] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            move_members=True
+        )
+
+        try:
+            new_vc = await guild.create_voice_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"{member.display_name} 님의 개인 통화방 자동 생성"
+            )
+            JTC_CREATED_CHANNELS.add(new_vc.id)
+            await member.move_to(new_vc)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    if before.channel and before.channel.id in JTC_CREATED_CHANNELS:
+        remaining = [m for m in before.channel.members if not m.bot]
+        if len(remaining) == 0:
+            JTC_CREATED_CHANNELS.discard(before.channel.id)
+            try:
+                await before.channel.delete(reason="빈 임시 통화방 자동 삭제")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
 # 서버별 설정 매핑
 VOICE_NOTICE_CHANNELS: Dict[int, int] = {}
@@ -1102,6 +1149,7 @@ async def update_voice_channel_members(channel: Optional[discord.VoiceChannel]):
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
         return
+    await handle_jtc_voice(member, before, after)
     now = datetime.now(KST)
     if before.channel and not after.channel:
         if member.id in VOICE_ACTIVE_SESSIONS:
@@ -2009,11 +2057,11 @@ async def promote_member_command(interaction: discord.Interaction, 유저: disco
 
     guild_label = promoted_to.split()[0]
     dm_text = (
-        f"🌙 정식 길드원 승급을 진심으로 축하드립니다!\n\n"
+        f"**🌙 정식 길드원 승급을 진심으로 축하드립니다!**\n\n"
         f"수습 기간 동안 {guild_label}과 함께해 주셔서 감사합니다.\n\n"
         f"이제 정식 **[{promoted_to}]**으로서 함께하게 되었습니다!\n\n"
         f"함께해 주신 시간에 감사드리며, 앞으로도 서로 존중하고 배려하며 {guild_label}에서 더욱 즐겁고 소중한 추억을 만들어 나갔으면 좋겠습니다.\n\n"
-        f"✦ 정식 길드원 활동 기준\n\n"
+        f"✦ **정식 길드원 활동 기준**\n\n"
         f"• 일일 최소 활동 시간 제한 없음\n"
         f"• 주간 활동 시간 11시간 이상 유지\n\n"
         f"{guild_label}의 새로운 가족이 되신 것을 진심으로 환영합니다!"

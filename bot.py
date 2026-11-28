@@ -111,44 +111,186 @@ def is_afk_channel(channel: Optional[discord.VoiceChannel]) -> bool:
         return True
     return False
 
+JTC_ROOM_OWNERS: Dict[int, int] = {}
+
 def extract_pure_name(display_name: str) -> str:
     cleaned = re.sub(r'^[\[【].*?[\]】]\s*', '', display_name).strip()
     pure_name = cleaned.split('/')[0].strip()
     return pure_name if pure_name else display_name
 
+class JtcRoomSettingsModal(discord.ui.Modal, title="🎛️ 통화방 이름 및 최대 인원 설정"):
+    room_name = discord.ui.TextInput(
+        label="통화방 이름",
+        placeholder="예: ₍₍🔊⁾⁾┇ 레이드팟 / 잡담방",
+        required=True,
+        max_length=95
+    )
+    max_users = discord.ui.TextInput(
+        label="최대 인원수 (0 또는 공백 = 제한 없음, 1~99)",
+        placeholder="예: 4 (무제한은 0 또는 비워두기)",
+        required=False,
+        max_length=2
+    )
+
+    def __init__(self, voice_channel_id: int, current_name: str, current_limit: int):
+        super().__init__()
+        self.voice_channel_id = voice_channel_id
+        self.room_name.default = current_name[:95]
+        self.max_users.default = "" if current_limit <= 0 else str(current_limit)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        vc = guild.get_channel(self.voice_channel_id) if guild else None
+        if not vc or not isinstance(vc, discord.VoiceChannel):
+            await interaction.response.send_message("❌ 이미 삭제되었거나 존재하지 않는 통화방입니다.", ephemeral=True)
+            return
+
+        new_name = self.room_name.value.strip()
+        if not new_name:
+            await interaction.response.send_message("❌ 통화방 이름을 비워둘 수 없습니다.", ephemeral=True)
+            return
+
+        raw_limit = self.max_users.value.strip()
+        if not raw_limit:
+            limit_val = 0
+        else:
+            if not raw_limit.isdigit():
+                await interaction.response.send_message("❌ 최대 인원수는 `0`부터 `99` 사이의 숫자만 입력해 주세요.", ephemeral=True)
+                return
+            limit_val = int(raw_limit)
+            if not (0 <= limit_val <= 99):
+                await interaction.response.send_message("❌ 최대 인원수는 `0`부터 `99` 사이로 입력해 주세요.", ephemeral=True)
+                return
+
+        try:
+            await vc.edit(name=new_name[:100], user_limit=limit_val)
+            limit_text = "제한 없음" if limit_val == 0 else f"최대 {limit_val}명"
+            await interaction.response.send_message(
+                f"✅ 통화방 설정이 변경되었습니다!\n• **방 이름:** **{new_name[:100]}**\n• **최대 인원:** **{limit_text}**",
+                ephemeral=True
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            await interaction.response.send_message(f"❌ 통화방 설정 변경에 실패했습니다: `{exc}`", ephemeral=True)
+
+class JtcRoomControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _resolve_target_vc(self, interaction: discord.Interaction) -> Optional[discord.VoiceChannel]:
+        guild = interaction.guild
+        if not guild:
+            return None
+
+        # 1) 현재 유저가 접속 중인 자동 생성 통화방 우선 확인
+        if interaction.user.voice and isinstance(interaction.user.voice.channel, discord.VoiceChannel):
+            cur_vc = interaction.user.voice.channel
+            if cur_vc.id in JTC_CREATED_CHANNELS:
+                return cur_vc
+
+        # 2) 패널 메시지의 embed footer에서 VOICE_ID 추출
+        if interaction.message and interaction.message.embeds:
+            footer_txt = interaction.message.embeds[0].footer.text or ""
+            if footer_txt.startswith("JTC_VOICE_ID:"):
+                try:
+                    vid = int(footer_txt.replace("JTC_VOICE_ID:", "").strip())
+                    vc = guild.get_channel(vid)
+                    if isinstance(vc, discord.VoiceChannel):
+                        return vc
+                except ValueError:
+                    pass
+        return None
+
+    async def _check_owner(self, interaction: discord.Interaction, vc: Optional[discord.VoiceChannel]) -> bool:
+        if not vc:
+            await interaction.response.send_message("❌ 대상 통화방을 찾을 수 없습니다. (이미 삭제되었을 수 있습니다.)", ephemeral=True)
+            return False
+        owner_id = JTC_ROOM_OWNERS.get(vc.id)
+        if owner_id and interaction.user.id != owner_id and not is_admin_or_mod(interaction):
+            await interaction.response.send_message("❌ 이 통화방의 **방 주인**만 조작할 수 있습니다!", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✏️ 이름/최대인원수 설정", style=discord.ButtonStyle.primary, custom_id="btn_jtc_settings")
+    async def open_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self._resolve_target_vc(interaction)
+        if not await self._check_owner(interaction, vc):
+            return
+        await interaction.response.send_modal(
+            JtcRoomSettingsModal(
+                voice_channel_id=vc.id,
+                current_name=vc.name,
+                current_limit=vc.user_limit or 0
+            )
+        )
+
+    @discord.ui.button(label="⚡ 바로 생성", style=discord.ButtonStyle.success, custom_id="btn_jtc_create_now")
+    async def create_room_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        member = interaction.user
+        if not guild or not isinstance(member, discord.Member):
+            return
+
+        trigger_ch = guild.get_channel(JTC_TRIGGER_CHANNEL_ID) if JTC_TRIGGER_CHANNEL_ID != 0 else None
+        category = trigger_ch.category if isinstance(trigger_ch, discord.VoiceChannel) else None
+        if not category and member.voice and isinstance(member.voice.channel, discord.VoiceChannel):
+            category = member.voice.channel.category
+
+        await spawn_jtc_room(guild, member, category, base_overwrites=trigger_ch.overwrites if isinstance(trigger_ch, discord.VoiceChannel) else None)
+        await interaction.followup.send("✅ 새 통화방을 바로 생성하고 이동시켰습니다!", ephemeral=True)
+
+async def spawn_jtc_room(guild: discord.Guild, member: discord.Member, category: Optional[discord.CategoryChannel], base_overwrites=None):
+    pure_name = extract_pure_name(member.display_name)
+    channel_name = f"₍₍🔊⁾⁾┇ {pure_name}님의 정원"[:100]
+
+    overwrites = dict(base_overwrites) if base_overwrites else {}
+    overwrites[member] = discord.PermissionOverwrite(
+        view_channel=True,
+        connect=True,
+        speak=True,
+        manage_channels=True,
+        move_members=True
+    )
+
+    try:
+        new_vc = await guild.create_voice_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"{member.display_name} 님의 개인 통화방 자동 생성"
+        )
+        JTC_CREATED_CHANNELS.add(new_vc.id)
+        JTC_ROOM_OWNERS[new_vc.id] = member.id
+        await member.move_to(new_vc)
+
+        panel_embed = discord.Embed(
+            title=f"🎛️ {channel_name}",
+            description=(
+                f"**방 주인:** {member.mention}\n"
+                "• **✏️ 이름/최대인원수 설정**: 방 이름과 최대 접속 인원(`1~99`, `0`=무제한)을 바로 변경합니다.\n"
+                "• **⚡ 바로 생성**: 기본 이름(`₍₍🔊⁾⁾┇ [이름]님의 정원`)으로 새 통화방을 하나 더 즉시 생성합니다."
+            ),
+            color=discord.Color.blurple()
+        )
+        panel_embed.set_footer(text=f"JTC_VOICE_ID:{new_vc.id}")
+        try:
+            await new_vc.send(content=member.mention, embed=panel_embed, view=JtcRoomControlView())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
 async def handle_jtc_voice(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     guild = member.guild
 
     if after.channel and JTC_TRIGGER_CHANNEL_ID != 0 and after.channel.id == JTC_TRIGGER_CHANNEL_ID:
-        pure_name = extract_pure_name(member.display_name)
-        channel_name = f"₍₍🔊⁾⁾┇ {pure_name}님의 정원"[:100]
-        category = after.channel.category
-
-        overwrites = dict(after.channel.overwrites)
-        overwrites[member] = discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            manage_channels=True,
-            move_members=True
-        )
-
-        try:
-            new_vc = await guild.create_voice_channel(
-                name=channel_name,
-                category=category,
-                overwrites=overwrites,
-                reason=f"{member.display_name} 님의 개인 통화방 자동 생성"
-            )
-            JTC_CREATED_CHANNELS.add(new_vc.id)
-            await member.move_to(new_vc)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+        await spawn_jtc_room(guild, member, after.channel.category, base_overwrites=after.channel.overwrites)
 
     if before.channel and before.channel.id in JTC_CREATED_CHANNELS:
         remaining = [m for m in before.channel.members if not m.bot]
         if len(remaining) == 0:
             JTC_CREATED_CHANNELS.discard(before.channel.id)
+            JTC_ROOM_OWNERS.pop(before.channel.id, None)
             try:
                 await before.channel.delete(reason="빈 임시 통화방 자동 삭제")
             except (discord.Forbidden, discord.HTTPException):
@@ -3106,6 +3248,7 @@ async def on_ready():
     bot.add_view(ReviewView())
     bot.add_view(PromoteView())
     bot.add_view(LedgerDoneView())
+    bot.add_view(JtcRoomControlView())
 
     if not daily_voice_check.is_running():
         daily_voice_check.start()
